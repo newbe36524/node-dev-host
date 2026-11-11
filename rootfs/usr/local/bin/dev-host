@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# node-dev-host: Caddy + a source->dist build loop in one container.
+#   dev-host run       (default) start Caddy and the build loop
+#   dev-host rebuild   ask the running loop to rebuild now
+#   dev-host status    print the last build status as JSON
+set -uo pipefail
+
+WORKSPACE="${WORKSPACE:-/workspace}"
+DIST_DIR="${DIST_DIR:-dist}"
+INSTALL_CMD="${INSTALL_CMD:-}"
+BUILD_CMD="${BUILD_CMD:-pnpm build}"
+POLL_INTERVAL="${POLL_INTERVAL:-2}"
+HTTP_PORT="${HTTP_PORT:-8080}"
+SPA="${SPA:-true}"
+API_PATH="${API_PATH:-/api/*}"
+API_UPSTREAM="${API_UPSTREAM:-}"
+STATE_DIR="${STATE_DIR:-/var/lib/dev-host}"
+STATUS_FILE="$STATE_DIR/status.json"
+TRIGGER_FILE="$STATE_DIR/rebuild"
+
+log() { printf '[dev-host %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+
+write_status() { # state, extra json fields (optional)
+  local tmp="$STATUS_FILE.tmp"
+  printf '{"state":"%s","builds":%d,"failures":%d,"lastExitCode":%s,"finishedAt":"%s"%s}\n' \
+    "$1" "$BUILDS" "$FAILURES" "${LAST_EXIT:-null}" "$(date -u +%FT%TZ)" "${2:-}" > "$tmp" \
+    && mv "$tmp" "$STATUS_FILE"
+}
+
+# Hash of all source files; build output and tool caches are ignored.
+source_sig() {
+  find "$WORKSPACE" \
+    \( -name node_modules -o -name .git -o -name dist -o -name .vite -o -name .turbo \
+       -o -name .cache -o -name coverage -o -name .pnpm-store -o -path "$WORKSPACE/$DIST_DIR" \) -prune \
+    -o -type f -printf '%P %T@ %s\n' 2>/dev/null | sort | sha1sum | cut -d' ' -f1
+}
+
+# Hash of the files that decide whether dependencies must be reinstalled.
+deps_sig() {
+  find "$WORKSPACE" -name node_modules -prune -o -type f \
+    \( -name package.json -o -name pnpm-lock.yaml -o -name pnpm-workspace.yaml -o -name .npmrc -o -name .pnpmfile.cjs \) \
+    -printf '%P %T@ %s\n' 2>/dev/null | sort | sha1sum | cut -d' ' -f1
+}
+
+write_caddyfile() {
+  local root="$WORKSPACE/$DIST_DIR" file="$STATE_DIR/Caddyfile"
+  {
+    echo "{"
+    echo "  admin off"
+    echo "  auto_https off"
+    echo "}"
+    echo ":$HTTP_PORT {"
+    echo "  encode zstd gzip"
+    echo "  handle /__dev-host/status.json {"
+    echo "    header Cache-Control no-store"
+    echo "    rewrite * /status.json"
+    echo "    root * $STATE_DIR"
+    echo "    file_server"
+    echo "  }"
+    if [ -n "$API_UPSTREAM" ]; then
+      echo "  handle $API_PATH {"
+      echo "    reverse_proxy $API_UPSTREAM"
+      echo "  }"
+    fi
+    echo "  handle {"
+    echo "    root * $root"
+    [ "$SPA" = "true" ] && echo "    try_files {path} /index.html"
+    echo "    header Cache-Control no-cache"
+    echo "    file_server"
+    echo "  }"
+    echo "}"
+  } > "$file"
+}
+
+run_build() {
+  local reason="$1" start rc=0
+  write_status building ',"reason":"'"$reason"'"'
+  start=$(date +%s)
+  cd "$WORKSPACE" || return 1
+  if [ ! -f package.json ]; then
+    log "no package.json in $WORKSPACE, waiting for source"
+    LAST_EXIT=null; write_status waiting; return 0
+  fi
+  if [ ! -d node_modules ] || [ "$(deps_sig)" != "$DEPS_SIG" ]; then
+    local icmd="$INSTALL_CMD"
+    if [ -z "$icmd" ]; then
+      if [ -f pnpm-lock.yaml ]; then icmd="pnpm install --frozen-lockfile"; else icmd="pnpm install"; fi
+    fi
+    log "install: $icmd"
+    bash -c "$icmd" || rc=$?
+    DEPS_SIG="$(deps_sig)"
+  fi
+  if [ "$rc" -eq 0 ]; then
+    log "build ($reason): $BUILD_CMD"
+    bash -c "$BUILD_CMD" || rc=$?
+  fi
+  BUILDS=$((BUILDS + 1)); LAST_EXIT=$rc
+  if [ "$rc" -eq 0 ]; then
+    log "build ok in $(( $(date +%s) - start ))s"; write_status ok
+  else
+    FAILURES=$((FAILURES + 1)); log "build FAILED (exit $rc), serving the previous dist"; write_status failed
+  fi
+}
+
+build_loop() {
+  local sig prev
+  BUILDS=0; FAILURES=0; LAST_EXIT=null; DEPS_SIG=""
+  run_build initial
+  prev="$(source_sig)"
+  while sleep "$POLL_INTERVAL"; do
+    if [ -f "$TRIGGER_FILE" ]; then
+      rm -f "$TRIGGER_FILE"; run_build manual; prev="$(source_sig)"; continue
+    fi
+    sig="$(source_sig)"
+    [ "$sig" = "$prev" ] && continue
+    # Wait for the change to settle (editors and git write in bursts).
+    sleep "$POLL_INTERVAL"; prev="$(source_sig)"
+    [ "$prev" != "$sig" ] && continue
+    run_build "source changed"
+    # Files the build itself writes (tsbuildinfo, generated code) must not retrigger it.
+    prev="$(source_sig)"
+  done
+}
+
+cmd="${1:-run}"
+case "$cmd" in
+  rebuild) mkdir -p "$STATE_DIR" && touch "$TRIGGER_FILE" && echo "rebuild requested"; exit 0 ;;
+  status)  cat "$STATUS_FILE"; exit 0 ;;
+  run) ;;
+  *) echo "usage: dev-host [run|rebuild|status]" >&2; exit 2 ;;
+esac
+
+mkdir -p "$STATE_DIR" "$WORKSPACE/$DIST_DIR"
+if [ -f "${CADDYFILE:-}" ]; then
+  cp "$CADDYFILE" "$STATE_DIR/Caddyfile"
+else
+  write_caddyfile
+fi
+BUILDS=0; FAILURES=0; LAST_EXIT=null
+write_status starting
+
+log "caddy on :$HTTP_PORT, serving $WORKSPACE/$DIST_DIR"
+caddy run --config "$STATE_DIR/Caddyfile" --adapter caddyfile &
+CADDY_PID=$!
+build_loop &
+LOOP_PID=$!
+
+trap 'kill "$CADDY_PID" "$LOOP_PID" 2>/dev/null; wait; exit 0' TERM INT
+# If either child dies, stop the container so the orchestrator can restart it.
+wait -n "$CADDY_PID" "$LOOP_PID"
+log "a child process exited, shutting down"
+kill "$CADDY_PID" "$LOOP_PID" 2>/dev/null
+wait
+exit 1
