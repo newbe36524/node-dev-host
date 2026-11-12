@@ -502,3 +502,61 @@ test('control API guards writes, persists nodes, and creates only registered con
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(calls.filter((call) => call.startsWith('POST /containers/create')).length, createsBeforeReadonly);
 });
+
+test('console npm registry setting is guarded, validated and saved in the node store', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'node-control-settings-'));
+  const socket = path.join(dir, 'docker.sock');
+  const dockerServer = http.createServer((req, res) => {
+    if (req.url === '/_ping') return json(res, 200, 'OK');
+    if (req.url.startsWith('/containers/json')) return json(res, 200, []);
+    return json(res, 404, { message: 'not found' });
+  });
+  await new Promise((resolve) => dockerServer.listen(socket, resolve));
+  t.after(() => new Promise((resolve) => dockerServer.close(resolve)));
+  const portServer = net.createServer();
+  await new Promise((resolve) => portServer.listen(0, '127.0.0.1', resolve));
+  const port = portServer.address().port;
+  await new Promise((resolve) => portServer.close(resolve));
+  const base = `http://127.0.0.1:${port}`;
+  const dataDir = path.join(dir, 'data');
+  const child = spawn(process.execPath, [path.resolve('rootfs/usr/local/lib/dev-host/control/server.mjs')], {
+    cwd: process.cwd(),
+    env: { ...process.env, HTTP_PORT: String(port), DOCKER_SOCKET: socket, CONTROL_DATA_DIR: dataDir },
+    stdio: 'ignore',
+  });
+  t.after(async () => {
+    child.kill('SIGTERM');
+    await new Promise((resolve) => child.once('exit', resolve));
+  });
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      if ((await fetch(`${base}/__dev-host/status.json`)).status === 200) break;
+    } catch {}
+    if (attempt > 100) throw new Error('control server did not start');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  const save = (body, headers = { Origin: base, 'X-Dev-Host-Control': '1' }) => fetch(`${base}/api/settings`, {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  });
+  assert.equal((await save({ npmRegistry: 'http://mirror.test/' }, {})).status, 403);
+  assert.equal((await save({ npmRegistry: 'ftp://mirror.test/' })).status, 400);
+  assert.equal((await save({ npmRegistry: 'http://u:p@mirror.test/' })).status, 400);
+  assert.equal((await save({ npmRegistry: 'http://mirror.test/', other: 1 })).status, 400);
+  assert.equal((await save('{bad json')).status, 400);
+  assert.equal((await fetch(`${base}/api/settings`)).status, 405);
+
+  const set = await save({ npmRegistry: ' http://mirror.test:4873/ ' });
+  assert.equal(set.status, 200);
+  assert.deepEqual((await set.json()).settings, { npmRegistry: 'http://mirror.test:4873/' });
+  const stored = JSON.parse(await fs.readFile(path.join(dataDir, 'nodes.json'), 'utf8'));
+  assert.equal(stored.settings.npmRegistry, 'http://mirror.test:4873/');
+
+  const list = await (await fetch(`${base}/api/containers`)).json();
+  assert.deepEqual(list.settings, { npmRegistry: 'http://mirror.test:4873/' });
+
+  assert.equal((await save({ npmRegistry: '' })).status, 200);
+  assert.deepEqual((await (await fetch(`${base}/api/containers`)).json()).settings, { npmRegistry: null });
+});

@@ -5,6 +5,7 @@ import { toast } from "sonner"
 import { CommandPalette } from "@/components/CommandPalette"
 import { BulkBar } from "@/components/BulkBar"
 import { AddNodeDialog } from "@/components/AddNodeDialog"
+import { NpmRegistryDialog } from "@/components/NpmRegistryDialog"
 import { ContainerTable } from "@/components/ContainerTable"
 import { FleetRibbon, TILE_LIMIT } from "@/components/FleetRibbon"
 import { FleetToolbar } from "@/components/FleetToolbar"
@@ -77,6 +78,7 @@ function Dashboard() {
   const [logs, setLogs] = useState<{ name: string; open: boolean }>()
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [addNodeOpen, setAddNodeOpen] = useState(false)
+  const [registryOpen, setRegistryOpen] = useState(false)
   const [startName, setStartName] = useState<string>()
   const [scanResult, setScanResult] = useState<ScanResult>()
   const searchRef = useRef<HTMLInputElement>(null)
@@ -286,6 +288,9 @@ function Dashboard() {
           </p>
         </div>
         <div className="flex items-center gap-3">
+          <Button size="sm" variant="outline" disabled={!list?.persistence?.writable || list.readOnly} onClick={() => setRegistryOpen(true)}>
+            npm registry
+          </Button>
           <Button size="sm" variant="outline" disabled={!list?.persistence?.writable || list.readOnly} onClick={() => setAddNodeOpen(true)}>
             <Plus aria-hidden="true" />
             Add node
@@ -437,6 +442,13 @@ function Dashboard() {
         refresh={refresh}
       />
       <BulkBar selected={tickedContainers} readOnly={list?.readOnly ?? false} onRun={bulk} onClear={clearTicks} />
+      <NpmRegistryDialog
+        open={registryOpen}
+        onOpenChange={setRegistryOpen}
+        current={list?.settings?.npmRegistry ?? null}
+        disabled={!list?.persistence?.writable || (list?.readOnly ?? true)}
+        onSaved={afterChange}
+      />
       <AddNodeDialog
         open={addNodeOpen}
         onOpenChange={setAddNodeOpen}

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { afterEach, test } from 'node:test';
 import { createDockerClient } from '../../../rootfs/usr/local/lib/dev-host/control/docker.mjs';
 import { createOperationTracker } from '../../../rootfs/usr/local/lib/dev-host/control/operations.mjs';
-import { createBody, DEFAULT_ALLOWED_IMAGES, nextPort, parseAllowedImages, parseWorkspaceRoots, validateNode } from '../../../rootfs/usr/local/lib/dev-host/control/nodes.mjs';
+import { createBody, DEFAULT_ALLOWED_IMAGES, nextPort, parseAllowedImages, parseWorkspaceRoots, validateNode, validateNpmRegistry } from '../../../rootfs/usr/local/lib/dev-host/control/nodes.mjs';
 import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from '../../../rootfs/usr/local/lib/dev-host/control/schedule.mjs';
 import { createStore } from '../../../rootfs/usr/local/lib/dev-host/control/store.mjs';
 import { createDiscovery } from '../../../rootfs/usr/local/lib/dev-host/control/discovery.mjs';
@@ -321,4 +321,42 @@ test('networks on add are validated as user-defined names and attached through t
   assert.throws(() => validateNode({ ...input, networks: ['host'] }, options), /user-defined/);
   assert.throws(() => validateNode({ ...input, networks: ['bad name'] }, options), /invalid network name/);
   assert.throws(() => validateNode({ ...input, networks: ['a', 'b', 'c', 'd', 'e'] }, options), /at most 4/);
+});
+
+test('npm registry is validated, applied by default and overridden by a node env', async () => {
+  assert.equal(validateNpmRegistry(undefined), null);
+  assert.equal(validateNpmRegistry('   '), null);
+  assert.equal(validateNpmRegistry(' http://mirror.test:4873/ '), 'http://mirror.test:4873/');
+  assert.equal(validateNpmRegistry('https://registry.example/npm/'), 'https://registry.example/npm/');
+  for (const bad of [42, 'ftp://mirror.test/', 'mirror.test', 'https://user:secret@mirror.test/', 'http://a b/', 'https://m.test/?x=1']) {
+    assert.throws(() => validateNpmRegistry(bad), (err) => err.status === 400, `expected rejection of ${JSON.stringify(bad)}`);
+  }
+
+  const input = { name: 'nd-npm', workspace: '/home/me/repos/site', port: 43197, image: 'node-dev-host:latest' };
+  const options = { allowedImages: ['node-dev-host'], workspaceRoots: [] };
+  const plain = validateNode(input, options);
+  const envOf = (body) => Object.fromEntries(body.Env.map((entry) => entry.split(/=(.*)/s).slice(0, 2)));
+  assert.equal(createBody(plain).Env.length, 0);
+  assert.equal(envOf(createBody(plain, { npmRegistry: 'http://mirror.test/' })).NPM_REGISTRY, 'http://mirror.test/');
+
+  const own = validateNode({ ...input, env: { NPM_REGISTRY: 'https://own.test/' } }, options);
+  assert.equal(envOf(createBody(own, { npmRegistry: 'http://mirror.test/' })).NPM_REGISTRY, 'https://own.test/');
+  assert.equal(envOf(createBody(own, { npmRegistry: null })).NPM_REGISTRY, 'https://own.test/');
+});
+
+test('console settings persist beside the nodes and survive node updates', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'node-settings-'));
+  temporary.add(dir);
+  const store = createStore({ dir });
+  assert.deepEqual(await store.getSettings(), {});
+  await store.update((document) => {
+    document.settings = { npmRegistry: 'http://mirror.test/' };
+    return document;
+  });
+  await store.update((document) => {
+    document.nodes.push({ name: 'nd-later' });
+    return document;
+  });
+  assert.deepEqual(await store.getSettings(), { npmRegistry: 'http://mirror.test/' });
+  assert.equal((await store.getNodes()).length, 1);
 });

@@ -13,7 +13,31 @@ const USER_KEYS = new Set(['name', 'workspace', 'port', 'image', 'env', 'network
 const NETWORK_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const RESERVED_NETWORKS = new Set(['bridge', 'host', 'none']);
 const MAX_NETWORKS = 4;
+// Read by dev-host inside each node container: the npm and pnpm package registry (see README "npm registry").
+export const NPM_REGISTRY_ENV = 'NPM_REGISTRY';
+const MAX_REGISTRY_LENGTH = 2048;
 const invalid = (message) => { throw new HttpError(400, message); };
+
+// Returns the trimmed registry URL, or null to clear it. The URL must not carry credentials: the value is
+// saved in nodes.json and returned by the API. Put registry credentials in the workspace .npmrc instead.
+export function validateNpmRegistry(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string') invalid('npmRegistry must be a string or null');
+  const text = value.trim();
+  if (!text) return null;
+  if (text.length > MAX_REGISTRY_LENGTH) invalid(`npmRegistry must be at most ${MAX_REGISTRY_LENGTH} characters`);
+  if (/\s/.test(text)) invalid('npmRegistry must not contain whitespace');
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    invalid('npmRegistry must be an absolute http or https URL');
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') invalid('npmRegistry must use http or https');
+  if (url.username || url.password) invalid('npmRegistry must not contain credentials; put them in the workspace .npmrc');
+  if (url.search || url.hash) invalid('npmRegistry must not contain a query or fragment');
+  return text;
+}
 
 function repository(image) {
   const withoutDigest = image.split('@', 1)[0];
@@ -86,14 +110,16 @@ export function validateNode(input, {
   };
 }
 
-export function createBody(record, { httpPort = DEFAULT_HTTP_PORT } = {}) {
+// npmRegistry is the console-wide default. The node's own env wins, so one node can still use another registry.
+export function createBody(record, { httpPort = DEFAULT_HTTP_PORT, npmRegistry = null } = {}) {
   const portKey = `${httpPort}/tcp`;
   const binds = ['node-dev-host-pnpm:/var/lib/dev-host/pnpm'];
   if (record.workspace) binds.unshift(`${record.workspace}:/workspace:ro`);
+  const env = { ...(npmRegistry ? { [NPM_REGISTRY_ENV]: npmRegistry } : {}), ...(record.env || {}) };
   const body = {
     Image: record.image,
     ExposedPorts: { [portKey]: {} },
-    Env: Object.entries(record.env || {}).map(([key, value]) => `${key}=${value}`),
+    Env: Object.entries(env).map(([key, value]) => `${key}=${value}`),
     Labels: { [PORT_LABEL]: String(record.port), [NAME_LABEL]: record.name },
     HostConfig: {
       Binds: binds,

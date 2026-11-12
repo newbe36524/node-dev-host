@@ -83,6 +83,13 @@ export function createStore({
     return structuredClone(current.nodes);
   }
 
+  // Console-wide settings live beside the nodes in nodes.json; update() keeps them when it saves nodes.
+  async function getSettings() {
+    await serial;
+    const current = await load();
+    return structuredClone(current.settings ?? {});
+  }
+
   async function status() {
     await load();
     let writable = false;
@@ -98,7 +105,7 @@ export function createStore({
     return { dir, writable, mounted, warning };
   }
 
-  return { dir, file, load, getNodes, update, status };
+  return { dir, file, load, getNodes, getSettings, update, status };
 }
 
 export { DEFAULT_DATA_DIR };

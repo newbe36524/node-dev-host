@@ -61,11 +61,17 @@ export interface Persistence {
   warning: string | null
 }
 
+// Console-wide defaults. npmRegistry is passed to node containers as NPM_REGISTRY on create and recreate.
+export interface ControlSettings {
+  npmRegistry: string | null
+}
+
 export interface ContainerList {
   readOnly: boolean
   containers: ContainerInfo[]
   persistence: Persistence
   nextPort: number | null
+  settings?: ControlSettings
 }
 
 export type ContainerAction = "start" | "stop" | "restart" | "rebuild"
@@ -137,6 +143,11 @@ export async function recreateContainer(name: string): Promise<void> {
 
 export async function addNode(node: NodeInput): Promise<void> {
   await request("POST", "/api/nodes", node)
+}
+
+export async function saveSettings(settings: ControlSettings): Promise<ControlSettings> {
+  const res = await request("POST", "/api/settings", settings)
+  return ((await res.json()) as { settings: ControlSettings }).settings
 }
 
 export async function deleteNode(name: string): Promise<void> {

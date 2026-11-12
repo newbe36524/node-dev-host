@@ -48,7 +48,7 @@ export async function runStartupPass({
             warning = result.warning;
             if (warning) setWarning(warning);
             setPhase('creating');
-            await createContainer(record.name, createBody(record));
+            await createContainer(record.name, await createBody(record));
           }
           setPhase('starting');
           await startContainer(record.name);

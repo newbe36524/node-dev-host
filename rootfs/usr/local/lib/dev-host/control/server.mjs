@@ -15,7 +15,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { createDiscovery } from './discovery.mjs';
 import { createDockerClient, DockerUnavailable, dockerMessage, HttpError } from './docker.mjs';
-import { addNodeRecord, createBody, deleteNodeRecord, nextPort, parseAllowedImages, parseWorkspaceRoots, validateNode } from './nodes.mjs';
+import { addNodeRecord, createBody, deleteNodeRecord, nextPort, parseAllowedImages, parseWorkspaceRoots, validateNode, validateNpmRegistry } from './nodes.mjs';
 import { createOperationTracker } from './operations.mjs';
 import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from './schedule.mjs';
 import { createStore } from './store.mjs';
@@ -111,7 +111,7 @@ async function labelledSummaries() {
 
 async function listContainers() {
   const summaries = await labelledSummaries();
-  const [records, persistence] = await Promise.all([store.getNodes(), store.status()]);
+  const [records, persistence, settings] = await Promise.all([store.getNodes(), store.status(), store.getSettings()]);
   const byName = new Map(records.map((record) => [record.name, record]));
 
   const rows = await Promise.all(summaries.map(async (c) => {
@@ -171,6 +171,7 @@ async function listContainers() {
       warning: persistence.warning || (persistence.mounted ? null : `node records are not on a separate mount at ${DATA_DIR}`),
     },
     nextPort: nextPort(records, summaries),
+    settings: { npmRegistry: settings.npmRegistry ?? null },
   };
 }
 
@@ -216,6 +217,11 @@ async function ensureStoreWritable() {
   }
 }
 
+// The console-wide npm registry that new and recreated node containers receive as NPM_REGISTRY.
+async function npmRegistrySetting() {
+  return (await store.getSettings()).npmRegistry ?? null;
+}
+
 // A network named in an add request must already exist, so a typo fails at add time, not at start.
 async function ensureNetworkExists(network) {
   const r = await dockerRaw('GET', `/networks/${enc(network)}`);
@@ -240,7 +246,8 @@ async function createFromRecord(record, context, pullCache) {
   const pulled = await pullCache.get(record.image);
   if (pulled.warning) context.setWarning(pulled.warning);
   context.setPhase('creating');
-  await docker.createContainer(record.name, createBody(record, { httpPort: nodeHttpPort(record) }));
+  const npmRegistry = await npmRegistrySetting();
+  await docker.createContainer(record.name, createBody(record, { httpPort: nodeHttpPort(record), npmRegistry }));
   context.setPhase('starting');
   await startContainer(record.name);
   return { warning: pulled.warning };
@@ -274,7 +281,8 @@ async function lifecycle(name, action, body = {}) {
         if (removed.status !== 204 && removed.status !== 404) throw new HttpError(500, dockerMessage(removed));
       }
       context.setPhase('creating');
-      await docker.createContainer(name, createBody(record, { httpPort: nodeHttpPort(record) }));
+      const npmRegistry = await npmRegistrySetting();
+      await docker.createContainer(name, createBody(record, { httpPort: nodeHttpPort(record), npmRegistry }));
       context.setPhase('starting');
       await startContainer(name);
       return { warning: pulled.warning };
@@ -464,6 +472,21 @@ async function serveApi(req, res, url) {
     return sendJson(res, 200, { readOnly: READONLY, ...list });
   }
 
+  if (parts.length === 2 && parts[1] === 'settings') {
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'POST' });
+    const body = await readJsonBody(req);
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => key !== 'npmRegistry')) {
+      throw new HttpError(400, 'settings body may contain only npmRegistry');
+    }
+    const npmRegistry = validateNpmRegistry(body.npmRegistry);
+    await ensureStoreWritable();
+    await store.update((document) => {
+      document.settings = { ...(document.settings ?? {}), npmRegistry };
+      return document;
+    });
+    return sendJson(res, 200, { ok: true, settings: { npmRegistry } });
+  }
+
   if (parts.length === 2 && parts[1] === 'nodes') {
     if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'POST' });
     const body = await readJsonBody(req);
@@ -599,7 +622,7 @@ server.listen(PORT, '0.0.0.0', () => {
           resolveContainer: inspectContainer,
           pullImage: docker.pullImage,
           createContainer: docker.createContainer,
-          createBody: (record) => createBody(record, { httpPort: nodeHttpPort(record) }),
+          createBody: async (record) => createBody(record, { httpPort: nodeHttpPort(record), npmRegistry: await npmRegistrySetting() }),
           startContainer,
           log,
         });

@@ -18,6 +18,12 @@ DEBOUNCE_SECONDS="${DEBOUNCE_SECONDS:-3}"
 MIN_BUILD_INTERVAL="${MIN_BUILD_INTERVAL:-10}"
 # Build anyway when a change has been pending this long, even if edits never stop.
 MAX_WAIT_SECONDS="${MAX_WAIT_SECONDS:-60}"
+# Package registry for pnpm and npm, for example a local mirror. Empty keeps the registry from .npmrc or the defaults.
+# pnpm reads PNPM_CONFIG_REGISTRY and npm reads npm_config_registry; both win over the workspace .npmrc.
+NPM_REGISTRY="${NPM_REGISTRY:-}"
+if [ -n "$NPM_REGISTRY" ]; then
+  export PNPM_CONFIG_REGISTRY="$NPM_REGISTRY" npm_config_registry="$NPM_REGISTRY"
+fi
 HTTP_PORT="${HTTP_PORT:-8080}"
 SPA="${SPA:-true}"
 API_PATH="${API_PATH:-/api/*}"
@@ -181,6 +187,18 @@ case "$cmd" in
   control) exec node /usr/local/lib/dev-host/control/server.mjs ;;
   *) echo "usage: dev-host [run|rebuild|status|control]" >&2; exit 2 ;;
 esac
+
+# Fail at start, not on the first build, when the registry is not an http(s) URL without credentials.
+if [ -n "$NPM_REGISTRY" ]; then
+  case "$NPM_REGISTRY" in
+    http://*|https://*) ;;
+    *) echo "[dev-host] NPM_REGISTRY must start with http:// or https://" >&2; exit 2 ;;
+  esac
+  case "$NPM_REGISTRY" in
+    *[[:space:]]*|*://*@*) echo "[dev-host] NPM_REGISTRY must not contain whitespace or credentials" >&2; exit 2 ;;
+  esac
+  log "npm registry: $NPM_REGISTRY"
+fi
 
 mkdir -p "$STATE_DIR" "$SERVE_DIR"
 if [ -f "${CADDYFILE:-}" ]; then
