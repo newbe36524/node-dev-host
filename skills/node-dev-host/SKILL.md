@@ -219,7 +219,7 @@ Every request is checked in order. The `Host` header must be `127.0.0.1`, `local
 | `POST /api/containers/<name>/rebuild` | 202. Runs `dev-host rebuild` in the container. 409 when the container is stopped. |
 | `POST /api/containers/<name>/recreate` | 202. Pulls the latest image and recreates a registered node from its record. |
 | `DELETE /api/containers/<name>` | 200. Removes the container and frees its port; a registered node record stays. |
-| `POST /api/nodes` | 201. Saves a node record without creating a container. |
+| `POST /api/nodes` | 201. Saves a node record without creating a container. The body may list `networks`. |
 | `DELETE /api/nodes/<name>` | 200. Removes the container if present, then deletes the record. |
 | `POST /api/nodes/<name>/auto-start` | 200. Extends auto-start to seven days from now. |
 | `DELETE /api/nodes/<name>/auto-start` | 200. Clears the auto-start expiry without stopping a running node. |
@@ -247,11 +247,13 @@ curl -fsS -X POST -H "Origin: $CONTROL" -H 'X-Dev-Host-Control: 1' \
   "$CONTROL/api/containers/nd-api-demo/start"
 ```
 
+Optional `"networks": ["nd-console_default"]` attaches the container to user-defined networks instead of the default bridge (up to four names, each must exist). Use it when the control node has to reach the container, for example `nd-console_default` so the control node can read its build state; the control node is on `nd-console_default`. Without it the container is on the default bridge and the control node shows its build state as `unknown`.
+
 The list provides `nextPort` and `persistence`; adding saves a node and leaves it `not created`, and Start queues pull and creation. Poll `GET /api/containers` until the row is running or contains an error.
 
 | Status | Meaning |
 | --- | --- |
-| `400` | Invalid node fields or JSON. |
+| `400` | Invalid node fields or JSON, or a network that does not exist or is `bridge`, `host` or `none`. |
 | `403` | Guard rejected the request or read-only mode is on. |
 | `409` | Duplicate name or port is already in use. |
 | `413` / `415` | Body exceeds 16 KB / content type is not JSON. |
@@ -316,7 +318,7 @@ Dependencies are reinstalled when `package.json`, `pnpm-lock.yaml`, `pnpm-worksp
 - **Memory use.** An idle container uses about 14 MiB of RAM (Caddy plus the polling loop). Memory peaks during `pnpm install` and the build, which exit when done. Use `--memory` to cap a large build on a small host.
 - **Polling cost.** Each poll walks the source tree (not `node_modules`). Measured at about 50 ms of CPU for 10,000 source files. Raise `POLL_INTERVAL` on very large trees.
 - **Not a production server.** The image is for development previews and local work. Deploy the built `dist` with the project's own hosting.
-- **Control node: user-defined networks.** The control node reads each container's build state from the container's IP address. A running container on a user-defined network that the control node has not joined shows build state `unknown`. Join the control node to that network with `docker network connect <network> nd-control`.
+- **Control node: user-defined networks.** The control node reads each container's build state from the container's IP address. A running container on a user-defined network that the control node has not joined shows build state `unknown`. Join the control node to that network with `docker network connect <network> nd-control`, or add the node through the API with `"networks": ["<network>"]` so the container joins it from the start.
 - **Control node: the socket is root-equivalent.** The control node mounts the Docker socket, so its process can run any Docker command on the host. A compromised control node means a compromised host. Keep the port on loopback, add to `CONTROL_ALLOWED_HOSTS` only the names the user needs, and run the control node only on a machine the user controls. The API has no authentication beyond the Host and Origin checks.
 - **Control node: Docker Desktop (macOS and Windows).** Docker Desktop runs these Linux images in its Linux VM. Mount the socket and publish on loopback as on Linux. This is documented guidance; CI does not test control mode on those hosts. When the list answers 503, read the `error` message in the response first.
 

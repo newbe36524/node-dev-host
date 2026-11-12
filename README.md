@@ -161,11 +161,13 @@ curl -fsS -X POST -H "Origin: $CONTROL" -H 'X-Dev-Host-Control: 1' \
   "$CONTROL/api/containers/nd-api-demo/start"
 ```
 
+The optional `networks` field (for example `["nd-console_default"]`) attaches the container to user-defined networks; each must exist, and up to four are allowed. Without it the container uses the default bridge, and the control node cannot read its build state when it sits on a different network.
+
 The initial list returns `nextPort` and `persistence`; adding saves the node and leaves it `not created`, and the follow-up Start queues image pull and creation. Poll `GET /api/containers` until it is running or its row has an error.
 
 | Status | Meaning |
 | --- | --- |
-| `400` | Invalid node fields or JSON. |
+| `400` | Invalid node fields or JSON, or a network that does not exist or is `bridge`, `host` or `none`. |
 | `403` | Guard rejected the request or read-only mode is on. |
 | `409` | Duplicate name or port is already in use. |
 | `413` / `415` | Body exceeds 16 KB / content type is not JSON. |
