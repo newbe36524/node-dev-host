@@ -1,6 +1,6 @@
 ---
 name: node-dev-host
-description: "Run, configure and operate the node-dev-host Docker image (ghcr.io/newbe36524/node-dev-host). It copies a mounted source tree into a private build directory, builds it there, and serves the output with Caddy inside one long-lived container, rebuilding on every change without writing to the mounted project. Use when the user wants to preview or serve a Node, TypeScript, Vite or pnpm project in Docker without restarting the container, choose the host, demo or Alpine variant, set BUILD_CMD, INSTALL_CMD, DIST_DIR, HTTP_PORT, SPA or API_UPSTREAM, proxy an API path, read build status, force a rebuild, or fix a container that serves stale or missing files. Keywords: node-dev-host, dev-host, live rebuild, 容器内构建, 本地预览, Caddy, dist, 热重载."
+description: "Run, configure and operate the node-dev-host Docker image (ghcr.io/newbe36524/node-dev-host). It copies a mounted source tree into a private build directory, builds it there, and serves the output with Caddy inside one long-lived container, rebuilding on every change without writing to the mounted project. The same image can also run a control node: a dashboard and API that list those containers and start, stop, restart, rebuild, remove or show the logs of them, through the mounted Docker socket. Use when the user wants to preview or serve a Node, TypeScript, Vite or pnpm project in Docker without restarting the container, choose the host, demo or Alpine variant, set BUILD_CMD, INSTALL_CMD, DIST_DIR, HTTP_PORT, SPA or API_UPSTREAM, proxy an API path, read build status, force a rebuild, fix a container that serves stale or missing files, or run and configure the control node dashboard (CONTROL_READONLY, CONTROL_ALLOWED_HOSTS, DOCKER_SOCKET). Keywords: node-dev-host, dev-host, live rebuild, 容器内构建, 本地预览, Caddy, dist, 热重载, control node, dashboard, Docker socket."
 ---
 
 # node-dev-host
@@ -19,6 +19,8 @@ Inside the image: Node 24, `pnpm`, `typescript` (`tsc`), `tsx`, `git`, `curl`, `
 | `ghcr.io/newbe36524/node-dev-host:demo-alpine` | The demo on Alpine. |
 
 Use an exact version tag (`1.2.3`, `1.2.3-demo`, `1.2.3-alpine` or `1.2.3-demo-alpine`) when the user needs a pinned image. All variants run `linux/amd64` and `linux/arm64`. The Debian tags are the default; choose Alpine only on request or when the image size matters.
+
+All four tags support control mode on both architectures (`linux/amd64` and `linux/arm64`). The same image starts the control node when it is run with the argument `control`. See [Control node](#control-node).
 
 ## Choose the host port
 
@@ -39,6 +41,8 @@ Procedure:
 4. **Run** with the port on loopback and the two labels, as in [Run it](#run-it).
 5. **If `docker run` fails**, run `docker rm -f nd-<project>` first. A failed start can leave a container that still holds the label, and the same port would be picked again. Then go back to step 2. Stop after 5 tries and report the error.
 6. **Tell the user** the address `http://127.0.0.1:<PORT>`.
+
+**The control node** takes its port from the same range, with the name `nd-control`. It carries the label `node-dev-host.role=control` and no `node-dev-host.port` label. So `docker ps -a --filter label=node-dev-host.port` does not list it, and `pick_port` cannot read its port back: while the control node runs, `pick_port nd-control` returns a different port, because the port is taken. Remove it first, then pick again: `docker rm -f nd-control`, then `PORT=$(pick_port nd-control)`. Without a container, `pick_port` returns the port derived from the name, the same on every run while it is free. A stopped control node does not reserve its port, so another container may take it.
 
 ```sh
 pick_port() {
@@ -167,6 +171,61 @@ Responses for `dist` carry the build that produced them:
 
 Both are blank until this container completes a build. A failed build leaves them unchanged, because the served `dist` is still the earlier one. A custom `CADDYFILE` does not get these headers unless it adds them itself with `header X-Build-Time "{file./var/lib/dev-host/build-time}"`.
 
+## Control node
+
+The control node is the same image started with the argument `control`. It lists the node-dev-host containers on the Docker host, shows their build state, runs a fixed set of actions on them, and serves a dashboard. It builds nothing and mounts no project. It needs the Docker socket.
+
+### Run it
+
+Use the same shape as `test_control_runtime` in `tests/integration/run.sh`. `<PORT>` comes from `pick_port nd-control`, as in [Choose the host port](#choose-the-host-port):
+
+```sh
+docker run -d --name nd-control \
+  -p 127.0.0.1:<PORT>:8080 \
+  --label node-dev-host.role=control \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  [-e VAR=value ...] \
+  ghcr.io/newbe36524/node-dev-host:latest control
+```
+
+Rules:
+
+- Publish on loopback only. The container port `8080` is the default `HTTP_PORT`. If `HTTP_PORT` changes, change the container side of `-p` too.
+- It is healthy when `docker inspect -f '{{.State.Health.Status}}' nd-control` prints `healthy` (about 20 s after start). `curl -s http://127.0.0.1:<PORT>/__dev-host/status.json` answers `{"state":"ok","role":"control"}`.
+- Without the socket mount, `status.json` answers 503 and its message names the missing mount (`Mount it with -v /var/run/docker.sock:/var/run/docker.sock`). The list answers 503 too. Recreate the container with the mount.
+- The variables in [Configuration](#configuration) apply to project hosts. The control node reads only the variables below.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HTTP_PORT` | `8080` | Port the control node listens on inside the container. |
+| `CONTROL_READONLY` | `false` | `true` (also `1`, `yes` or `on`) rejects every POST and DELETE with 403. The dashboard shows read-only mode and disables the actions. Logs and the list still work. |
+| `CONTROL_ALLOWED_HOSTS` | empty | Comma-separated extra Host names the guard accepts, for example `devbox.local`. Add only the names the user opens the dashboard with. |
+| `DOCKER_SOCKET` | `/var/run/docker.sock` | Socket path inside the container. Change it only when the socket is mounted at another path. |
+
+### Guards and API
+
+Every request is checked in order. The `Host` header must be `127.0.0.1`, `localhost`, `[::1]` or in `CONTROL_ALLOWED_HOSTS`, or the answer is 403. POST and DELETE also need an `Origin` that matches the `Host` and the header `X-Dev-Host-Control: 1`, or 403. Read-only mode then rejects them with 403. There is no authentication beyond these checks.
+
+| Request | Result |
+| --- | --- |
+| `GET /api/containers` | `{"readOnly":…,"containers":[…]}`, each row with `name`, `port`, `state`, `health` and `build` |
+| `GET /api/containers/<name>/logs?tail=N` | Plain text. `N` defaults to 200 and is capped at 1000. |
+| `POST /api/containers/<name>/start`, `stop`, `restart` | 200 |
+| `POST /api/containers/<name>/rebuild` | 202. Runs `dev-host rebuild` in the container. 409 when the container is stopped. |
+| `DELETE /api/containers/<name>` | 200. Force removes the container and frees its port. |
+
+Only containers with the `node-dev-host.port` label are listed and actionable. Any other name is refused with 403, and a name that does not exist with 404. The control node itself has no port label, so it is refused too.
+
+### Operate it
+
+```sh
+curl -s http://127.0.0.1:<PORT>/api/containers
+curl -s -X POST -H "Origin: http://127.0.0.1:<PORT>" -H "X-Dev-Host-Control: 1" \
+  http://127.0.0.1:<PORT>/api/containers/<name>/rebuild
+```
+
+The dashboard's Build column shows `starting`, `building`, `ok`, `failed`, `waiting` or `unknown`. A stopped container shows `stopped` there, and its API build state is `unknown`.
+
 ## Configuration
 
 All variables are optional.
@@ -206,6 +265,9 @@ Dependencies are reinstalled when `package.json`, `pnpm-lock.yaml`, `pnpm-worksp
 - **Memory use.** An idle container uses about 14 MiB of RAM (Caddy plus the polling loop). Memory peaks during `pnpm install` and the build, which exit when done. Use `--memory` to cap a large build on a small host.
 - **Polling cost.** Each poll walks the source tree (not `node_modules`). Measured at about 50 ms of CPU for 10,000 source files. Raise `POLL_INTERVAL` on very large trees.
 - **Not a production server.** The image is for development previews and local work. Deploy the built `dist` with the project's own hosting.
+- **Control node: user-defined networks.** The control node reads each container's build state from the container's IP address. A running container on a user-defined network that the control node has not joined shows build state `unknown`. Join the control node to that network with `docker network connect <network> nd-control`.
+- **Control node: the socket is root-equivalent.** The control node mounts the Docker socket, so its process can run any Docker command on the host. A compromised control node means a compromised host. Keep the port on loopback, add to `CONTROL_ALLOWED_HOSTS` only the names the user needs, and run the control node only on a machine the user controls. The API has no authentication beyond the Host and Origin checks.
+- **Control node: Docker Desktop (macOS and Windows).** Docker Desktop runs these Linux images in its Linux VM. Mount the socket and publish on loopback as on Linux. This is documented guidance; CI does not test control mode on those hosts. When the list answers 503, read the `error` message in the response first.
 
 ## Build the image locally
 
@@ -220,9 +282,11 @@ Build args: `NODE_VERSION` (24), `CADDY_VERSION` (2), `PNPM_VERSION`, `TYPESCRIP
 
 ## Files in this repo
 
-- `Dockerfile`: Debian targets `base`, `demo`, `host`; Alpine targets `base-alpine`, `demo-alpine`, `host-alpine`. `host` stays last so a bare `docker build .` produces the Debian host image.
-- `rootfs/usr/local/bin/dev-host`: the entrypoint script with `run`, `rebuild`, and `status` commands.
+- `Dockerfile`: Debian targets `base`, `demo`, `host`; Alpine targets `base-alpine`, `demo-alpine`, `host-alpine`. `host` stays last so a bare `docker build .` produces the Debian host image. A `control-ui` stage builds the dashboard on `$BUILDPLATFORM`, and `base` and `base-alpine` copy its output to `/usr/local/lib/dev-host/control/ui`.
+- `rootfs/usr/local/bin/dev-host`: the entrypoint script with `run`, `rebuild`, `status`, and `control` commands.
+- `rootfs/usr/local/lib/dev-host/control/server.mjs`: the control node server (`dev-host control`). It has the routes, guards and config in [Control node](#control-node). It uses no npm packages.
+- `control-ui/`: the React dashboard, a pnpm project with `dev`, `build`, `test` and `typecheck` scripts. `pnpm dev` proxies `/api` to `CONTROL_URL` (default `http://127.0.0.1:43180`).
 - `demo/`: the demo project copied into the `demo` image.
-- `.github/workflows/publish.yml`: publishes all four variants on push to `main`, on `v*` tags, weekly, and on manual dispatch.
-- `.github/workflows/integration.yml`: builds all four targets and runs the integration tests against each one. It runs on pull requests and on pushes to `main` that touch the image, the demo or the tests, and on manual dispatch.
-- `tests/integration/run.sh`: the integration tests. `run.sh <image> <target>` starts real containers from a fixture project and checks what they build and serve. Run it locally after `docker build -t node-dev-host:test-host --target host .`.
+- `.github/workflows/publish.yml`: publishes all four variants for `linux/amd64` and `linux/arm64`, on push to `main`, on `v*` tags, weekly, and on manual dispatch. After each publish it checks that every platform's image contains the dashboard's `index.html`.
+- `.github/workflows/integration.yml`: a `control-ui` job runs the dashboard's `pnpm install --frozen-lockfile`, `pnpm test` and `pnpm build`. The `integration` job builds all four targets and runs the integration tests against each one, on a native amd64 runner (`ubuntu-latest`) and a native arm64 runner (`ubuntu-24.04-arm`). It runs on pull requests and on pushes to `main` that touch the image, the demo, the control dashboard or the tests, and on manual dispatch.
+- `tests/integration/run.sh`: the integration tests. `run.sh <image> <target>` starts real containers from a fixture project and checks what they build and serve, including the control node scenarios (`test_control_runtime`, `test_control_dashboard_api`, `test_control_actions`). Run it locally after `docker build -t node-dev-host:test-host --target host .`.
