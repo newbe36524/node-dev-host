@@ -1,6 +1,6 @@
 ---
 name: node-dev-host
-description: Run, configure and operate the node-dev-host Docker image (ghcr.io/newbe36524/node-dev-host). It builds a mounted source tree into dist and serves it with Caddy inside one long-lived container, rebuilding on every change. Use when the user wants to preview or serve a Node, TypeScript, Vite or pnpm project in Docker without restarting the container, choose the host or demo variant, set BUILD_CMD, INSTALL_CMD, DIST_DIR, HTTP_PORT, SPA or API_UPSTREAM, proxy an API path, read build status, force a rebuild, or fix a container that serves stale or missing files. Keywords: node-dev-host, dev-host, live rebuild, 容器内构建, 本地预览, Caddy, dist, 热重载.
+description: "Run, configure and operate the node-dev-host Docker image (ghcr.io/newbe36524/node-dev-host). It builds a mounted source tree into dist and serves it with Caddy inside one long-lived container, rebuilding on every change. Use when the user wants to preview or serve a Node, TypeScript, Vite or pnpm project in Docker without restarting the container, choose the host or demo variant, set BUILD_CMD, INSTALL_CMD, DIST_DIR, HTTP_PORT, SPA or API_UPSTREAM, proxy an API path, read build status, force a rebuild, or fix a container that serves stale or missing files. Keywords: node-dev-host, dev-host, live rebuild, 容器内构建, 本地预览, Caddy, dist, 热重载."
 ---
 
 # node-dev-host
