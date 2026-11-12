@@ -1,0 +1,60 @@
+name: integration
+
+# Builds every image variant and runs tests/integration/run.sh against it. Each test starts real
+# containers, waits for dev-host to build a fixture project, and checks what Caddy serves: builds,
+# rebuilds, failed builds, the read-only workspace, the /api proxy, custom Caddyfiles and the shared
+# pnpm store volume. Nothing is pushed; the publish workflow still builds and pushes the images.
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "rootfs/**"
+      - "demo/**"
+      - "tests/integration/**"
+      - ".github/workflows/integration.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "rootfs/**"
+      - "demo/**"
+      - "tests/integration/**"
+      - ".github/workflows/integration.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: integration (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [host, demo, host-alpine, demo-alpine]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the ${{ matrix.target }} image for testing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          load: true
+          tags: node-dev-host:test-${{ matrix.target }}
+          cache-from: type=gha,scope=it-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=it-${{ matrix.target }}
+
+      - name: Run integration tests
+        run: tests/integration/run.sh node-dev-host:test-${{ matrix.target }} ${{ matrix.target }}
