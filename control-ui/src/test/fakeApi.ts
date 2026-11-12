@@ -60,3 +60,23 @@ export function setViewport(wide: boolean) {
     window.matchMedia = previous
   }
 }
+
+/**
+ * A host at its limit: 50 containers named nd-site-01 to nd-site-50.
+ * 03, 17 and 41 have failed, 08 and 22 are building, 12 and 33 are stopped; the other 43 are ok.
+ */
+export function fleet50(): { readOnly: boolean; containers: ContainerInfo[] } {
+  const failed = new Set([3, 17, 41])
+  const building = new Set([8, 22])
+  const stopped = new Set([12, 33])
+  const containers = Array.from({ length: 50 }, (_, i) => {
+    const n = i + 1
+    const label = String(n).padStart(2, "0")
+    const base = container({ name: `nd-site-${label}`, id: `id${label}`, port: 43100 + n })
+    if (stopped.has(n)) return { ...base, state: "exited" as const, health: null }
+    if (failed.has(n)) return { ...base, build: { state: "failed" as const, builds: 1, failures: 1, finishedAt: null } }
+    if (building.has(n)) return { ...base, build: { state: "building" as const, builds: 1, failures: 0, finishedAt: null } }
+    return base
+  })
+  return { readOnly: false, containers }
+}

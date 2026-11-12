@@ -129,3 +129,117 @@
     @apply font-sans;
     }
 }
+/* ---------------------------------------------------------------------------------------------
+   Console motion and browser surfaces. Everything here either carries state (a change happened,
+   a fault appeared) or themes a part of the page the browser would otherwise draw by itself.
+   --------------------------------------------------------------------------------------------- */
+
+:root {
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+::selection {
+  background: color-mix(in oklch, var(--foreground) 18%, transparent);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--foreground) 28%, transparent) transparent;
+}
+
+input,
+textarea {
+  caret-color: var(--foreground);
+}
+
+time,
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* A dashed ring around a badge that has just changed. It settles in and fades; it never moves layout. */
+.state-ring {
+  position: relative;
+  display: inline-flex;
+}
+.state-ring::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 9999px;
+  border: 1px dashed var(--foreground);
+  opacity: 0;
+  pointer-events: none;
+  animation: ring-settle 2.6s var(--ease-out) both;
+}
+@keyframes ring-settle {
+  0% { opacity: 0.9; transform: scale(1.35); }
+  25% { opacity: 0.9; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1); }
+}
+
+/* One expanding ring when a container turns failed. It plays once and is gone; the segment stays loud on its own. */
+.fault-ping::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  border: 2px solid var(--destructive);
+  opacity: 0;
+  pointer-events: none;
+  animation: fault-ping 1.4s var(--ease-out) 1 both;
+}
+@keyframes fault-ping {
+  0% { opacity: 0.9; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1.12, 1.5); }
+}
+
+/* Shared-element morphs between table and logs sheet, and between old and new badge. Only the named
+   badges animate; the page itself swaps at once. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+::view-transition-group(*) {
+  animation-duration: 320ms;
+  animation-timing-function: var(--ease-out);
+}
+
+/* The one authored moment for a long list: when a refresh moves a state, the rows slide to their new
+   place in the triage order. Rows carry a transition name only while that runs (<html data-vt="fleet">),
+   so opening the logs sheet never captures fifty rows above its backdrop. */
+[data-vt="fleet"] [data-row] {
+  view-transition-name: var(--row-vt);
+}
+
+/* Keyboard moves and "go to" scroll a row into view clear of the sticky toolbar and header, and the batch bar. */
+[data-row] {
+  scroll-margin-block: 6.5rem 5rem;
+}
+
+/* The batch bar rises into place once; it is the answer to a tick, so it should feel attached to it. */
+.bulk-bar {
+  animation: bulk-in 240ms var(--ease-out) both;
+}
+@keyframes bulk-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bulk-bar {
+    animation: none;
+  }
+  .state-ring::after {
+    animation-name: ring-fade;
+    animation-duration: 2s;
+  }
+  @keyframes ring-fade {
+    0% { opacity: 0.9; }
+    100% { opacity: 0; }
+  }
+  .fault-ping::after {
+    animation: none;
+  }
+}

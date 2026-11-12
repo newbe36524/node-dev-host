@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { toast } from "sonner"
+import { MoreHorizontal } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
   AlertDialog,
@@ -18,14 +18,9 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { type PendingAction, useCommands } from "@/hooks/useCommands"
 import { useMediaQuery } from "@/hooks/useMediaQuery"
-import {
-  type ContainerAction,
-  type ContainerInfo,
-  errorText,
-  removeContainer,
-  runContainerAction,
-} from "@/lib/api"
+import type { ContainerAction, ContainerInfo } from "@/lib/api"
 import { LogsSheet } from "./LogsSheet"
 
 /** Tailwind's md breakpoint. Below it the row actions collapse into a menu. */
@@ -35,9 +30,18 @@ interface ContainerActionsProps {
   container: ContainerInfo
   readOnly: boolean
   onChanged: () => void
+  /** Told when an action starts (with the action) and when it fails (with null), so the row can say what is in flight. */
+  onPending?: (name: string, action: PendingAction | null) => void
+  /** When given, Logs asks the page to open its one shared sheet. Without it the row owns a sheet of its own. */
+  onShowLogs?: (name: string) => void
+  /**
+   * For a long list: wide rows keep Logs and fold the rest into a menu. Five buttons on each of fifty
+   * rows is two hundred and fifty buttons, and a red Remove on every line.
+   */
+  dense?: boolean
 }
 
-export function ContainerActions({ container, readOnly, onChanged }: ContainerActionsProps) {
+export function ContainerActions({ container, readOnly, onChanged, onPending, onShowLogs, dense = false }: ContainerActionsProps) {
   const [busy, setBusy] = useState(false)
   const [logsOpen, setLogsOpen] = useState(false)
   const [removeOpen, setRemoveOpen] = useState(false)
@@ -48,29 +52,18 @@ export function ContainerActions({ container, readOnly, onChanged }: ContainerAc
   // The menu stays enabled in read-only mode so Logs can still be opened; mutating items are disabled.
   const lifecycle: ContainerAction[] = running ? ["rebuild", "restart", "stop"] : ["start"]
 
-  async function run(action: ContainerAction) {
+  const commands = useCommands({ onPending, onChanged })
+
+  async function run(action: PendingAction) {
     setBusy(true)
     try {
-      await runContainerAction(name, action)
-      onChanged()
-    } catch (err) {
-      toast.error(`${name}: ${action} failed. ${errorText(err)}`)
+      await commands.run(name, action)
     } finally {
       setBusy(false)
     }
   }
 
-  async function remove() {
-    setBusy(true)
-    try {
-      await removeContainer(name)
-      onChanged()
-    } catch (err) {
-      toast.error(`${name}: remove failed. ${errorText(err)}`)
-    } finally {
-      setBusy(false)
-    }
-  }
+  const showLogs = () => (onShowLogs ? onShowLogs(name) : setLogsOpen(true))
 
   const label: Record<ContainerAction, string> = {
     start: "Start",
@@ -81,7 +74,7 @@ export function ContainerActions({ container, readOnly, onChanged }: ContainerAc
 
   return (
     <>
-      {wide ? (
+      {wide && !dense ? (
         <div className="flex flex-wrap gap-1">
           {lifecycle.map((action) => (
             <Button
@@ -94,7 +87,7 @@ export function ContainerActions({ container, readOnly, onChanged }: ContainerAc
               {label[action]}
             </Button>
           ))}
-          <Button size="sm" variant="ghost" onClick={() => setLogsOpen(true)}>
+          <Button size="sm" variant="ghost" onClick={showLogs}>
             Logs
           </Button>
           <Button size="sm" variant="destructive" disabled={disabled} onClick={() => setRemoveOpen(true)}>
@@ -102,11 +95,23 @@ export function ContainerActions({ container, readOnly, onChanged }: ContainerAc
           </Button>
         </div>
       ) : (
+        <div className="flex items-center gap-1">
+        {wide && (
+          <Button size="sm" variant="ghost" onClick={showLogs}>
+            Logs
+          </Button>
+        )}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button size="sm" variant="outline" aria-label={`Actions for ${name}`}>
-              Actions
-            </Button>
+            {wide ? (
+              <Button size="icon-sm" variant="outline" aria-label={`Actions for ${name}`}>
+                <MoreHorizontal aria-hidden="true" />
+              </Button>
+            ) : (
+              <Button size="sm" variant="outline" aria-label={`Actions for ${name}`}>
+                Actions
+              </Button>
+            )}
           </DropdownMenuTrigger>
           <DropdownMenuContent
             align="end"
@@ -119,15 +124,16 @@ export function ContainerActions({ container, readOnly, onChanged }: ContainerAc
               </DropdownMenuItem>
             ))}
             <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={() => setLogsOpen(true)}>Logs</DropdownMenuItem>
+            <DropdownMenuItem onSelect={showLogs}>Logs</DropdownMenuItem>
             <DropdownMenuItem variant="destructive" disabled={disabled} onSelect={() => setRemoveOpen(true)}>
               Remove
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
+        </div>
       )}
 
-      <LogsSheet name={name} open={logsOpen} onOpenChange={setLogsOpen} />
+      {!onShowLogs && <LogsSheet name={name} open={logsOpen} onOpenChange={setLogsOpen} />}
 
       <AlertDialog open={removeOpen} onOpenChange={setRemoveOpen}>
         <AlertDialogContent>
@@ -139,7 +145,7 @@ export function ContainerActions({ container, readOnly, onChanged }: ContainerAc
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction variant="destructive" onClick={remove}>
+            <AlertDialogAction variant="destructive" onClick={() => run("remove")}>
               Remove
             </AlertDialogAction>
           </AlertDialogFooter>

@@ -1,15 +1,16 @@
 import { Badge } from "@/components/ui/badge"
-import type { BuildStateName } from "@/lib/api"
+import type { CSSProperties } from "react"
+import type { BuildBadgeState } from "@/lib/fleet"
 
-/** Build states plus "stopped" for containers that are not running. */
-export type BuildBadgeState = BuildStateName | "stopped"
+export type { BuildBadgeState }
 
 const LOOK: Record<
   BuildBadgeState,
   { variant: "default" | "secondary" | "destructive" | "outline"; className?: string }
 > = {
-  ok: { variant: "default", className: "bg-emerald-600 hover:bg-emerald-600/90" },
-  building: { variant: "default", className: "bg-sky-600 hover:bg-sky-600/90" },
+  // The 700 steps keep white 12px text above 4.5:1 (about 5.4:1 and 5.9:1).
+  ok: { variant: "default", className: "bg-emerald-700 hover:bg-emerald-700/90" },
+  building: { variant: "default", className: "bg-sky-700 hover:bg-sky-700/90" },
   failed: { variant: "destructive" },
   starting: { variant: "secondary" },
   waiting: { variant: "outline" },
@@ -17,10 +18,16 @@ const LOOK: Record<
   stopped: { variant: "outline", className: "border-dashed text-muted-foreground" },
 }
 
-export function StateBadge({ state }: { state: BuildBadgeState }) {
+/** `transitionName` lets the badge morph between places (table row and logs sheet) through a View Transition. */
+export function StateBadge({ state, transitionName }: { state: BuildBadgeState; transitionName?: string }) {
   const look = LOOK[state]
   return (
-    <Badge variant={look.variant} className={look.className} data-state={state}>
+    <Badge
+      variant={look.variant}
+      className={look.className}
+      data-state={state}
+      style={transitionName ? ({ viewTransitionName: transitionName } as CSSProperties) : undefined}
+    >
       {state}
     </Badge>
   )
