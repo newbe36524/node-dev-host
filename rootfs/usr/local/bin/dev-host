@@ -79,7 +79,10 @@ write_caddyfile() {
     echo "    file_server"
     echo "  }"
     if [ -n "$API_UPSTREAM" ]; then
-      echo "  handle $API_PATH {"
+      # API_PATH lists one or more path matchers, separated by spaces or commas: "/api/* /grpc/* /hubs/*".
+      local matcher="${API_PATH//,/ }"
+      echo "  @api path $matcher"
+      echo "  handle @api {"
       echo "    reverse_proxy $API_UPSTREAM"
       echo "  }"
     fi
