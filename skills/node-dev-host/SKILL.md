@@ -184,6 +184,7 @@ docker run -d --name nd-control \
   -p 127.0.0.1:<PORT>:8080 \
   --label node-dev-host.role=control \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  -v node-dev-host-control:/var/lib/dev-host/control \
   [-e VAR=value ...] \
   ghcr.io/newbe36524/node-dev-host:latest control
 ```
@@ -201,6 +202,9 @@ Rules:
 | `CONTROL_READONLY` | `false` | `true` (also `1`, `yes` or `on`) rejects every POST and DELETE with 403. The dashboard shows read-only mode and disables the actions. Logs and the list still work. |
 | `CONTROL_ALLOWED_HOSTS` | empty | Comma-separated extra Host names the guard accepts, for example `devbox.local`. Add only the names the user opens the dashboard with. |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Socket path inside the container. Change it only when the socket is mounted at another path. |
+| `CONTROL_DATA_DIR` | `/var/lib/dev-host/control` | Directory containing `nodes.json`. Mount a persistent volume there to keep node records across control-container recreation. |
+| `CONTROL_ALLOWED_IMAGES` | `ghcr.io/newbe36524/node-dev-host,node-dev-host` | Comma-separated allowed image repositories for node creation. Tags may vary. |
+| `CONTROL_WORKSPACE_ROOTS` | empty | Comma-separated absolute host path roots allowed for workspaces. Empty allows any absolute path without `..` segments. |
 
 ### Guards and API
 
@@ -208,13 +212,58 @@ Every request is checked in order. The `Host` header must be `127.0.0.1`, `local
 
 | Request | Result |
 | --- | --- |
-| `GET /api/containers` | `{"readOnly":…,"containers":[…]}`, each row with `name`, `port`, `state`, `health` and `build` |
+| `GET /api/containers` | `{"readOnly":…,"containers":[…],"persistence":…,"nextPort":…}`. Each row also has `registered`, `schedule`, `operation`, `error` and `warning`; a saved node without a container is `not created`. |
 | `GET /api/containers/<name>/logs?tail=N` | Plain text. `N` defaults to 200 and is capped at 1000. |
 | `POST /api/containers/<name>/start`, `stop`, `restart` | 200 |
+| `POST /api/containers/<name>/start` with `{"autoStart":true}` | Saves a seven-day auto-start expiry, then starts; a missing container is created from its record. |
 | `POST /api/containers/<name>/rebuild` | 202. Runs `dev-host rebuild` in the container. 409 when the container is stopped. |
-| `DELETE /api/containers/<name>` | 200. Force removes the container and frees its port. |
+| `POST /api/containers/<name>/recreate` | 202. Pulls the latest image and recreates a registered node from its record. |
+| `DELETE /api/containers/<name>` | 200. Removes the container and frees its port; a registered node record stays. |
+| `POST /api/nodes` | 201. Saves a node record without creating a container. |
+| `DELETE /api/nodes/<name>` | 200. Removes the container if present, then deletes the record. |
+| `POST /api/nodes/<name>/auto-start` | 200. Extends auto-start to seven days from now. |
+| `DELETE /api/nodes/<name>/auto-start` | 200. Clears the auto-start expiry without stopping a running node. |
+| `POST /api/scan` | 200 with `{imported, skipped}` for labelled containers not yet registered. |
 
-Only containers with the `node-dev-host.port` label are listed and actionable. Any other name is refused with 403, and a name that does not exist with 404. The control node itself has no port label, so it is refused too.
+Labelled containers and saved nodes are listed and actionable. Unlabelled containers without a node record are refused with 403, and an unknown name returns 404. A registered node without a container accepts Start, Recreate and Delete node only. The control node has no port label or node record, so it is refused too.
+
+### Add a node through the API
+
+Use the API for scripts and agents too; do not add managed nodes by editing a Compose file. `curl` supplies `Host` from the URL. For every POST or DELETE, send an `Origin` equal to that URL's origin and `X-Dev-Host-Control: 1`; `POST /api/nodes` also requires `Content-Type: application/json`. These guards are not authentication, so keep the port on loopback.
+
+```sh
+CONTROL=http://127.0.0.1:43190
+WORKSPACE="$PWD"
+IMAGE=node-dev-host:latest
+NEXT_PORT=$(curl -fsS "$CONTROL/api/containers" |
+  node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(String(JSON.parse(s).nextPort)))')
+BODY=$(node -e 'console.log(JSON.stringify({name:"nd-api-demo",workspace:process.argv[1],port:Number(process.argv[2]),image:process.argv[3]}))' \
+  "$WORKSPACE" "$NEXT_PORT" "$IMAGE")
+curl -fsS "$CONTROL/api/containers" |
+  node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s).persistence;console.log(JSON.stringify(p));if(!p.mounted)process.exitCode=1})'
+curl -fsS -X POST -H "Origin: $CONTROL" -H 'X-Dev-Host-Control: 1' \
+  -H 'Content-Type: application/json' --data "$BODY" "$CONTROL/api/nodes"
+curl -fsS -X POST -H "Origin: $CONTROL" -H 'X-Dev-Host-Control: 1' \
+  "$CONTROL/api/containers/nd-api-demo/start"
+```
+
+The list provides `nextPort` and `persistence`; adding saves a node and leaves it `not created`, and Start queues pull and creation. Poll `GET /api/containers` until the row is running or contains an error.
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Invalid node fields or JSON. |
+| `403` | Guard rejected the request or read-only mode is on. |
+| `409` | Duplicate name or port is already in use. |
+| `413` / `415` | Body exceeds 16 KB / content type is not JSON. |
+| `503` | Node store is not writable or Docker is unreachable. |
+
+Every error response is JSON with an `error` message. Scan imports reproducible labelled containers and reports skipped containers with extra mounts, a non-loopback published port, privileged mode, or no `/workspace` bind on a non-demo image. Imported nodes have no auto-start window. After import the console owns the record; Recreate uses that record and the new container will not retain Compose labels.
+
+### Node records and scheduled startup
+
+Node records live in `CONTROL_DATA_DIR/nodes.json`; mount a persistent volume at the data directory as in [Run it](#run-it). Add saves a record but creates nothing. Start without a container pulls its image, creates the fixed container shape and starts it. Recreate pulls the latest image; Remove container keeps the record; Delete node removes both.
+
+When manually starting a node without an active schedule, choose Start only or Start and auto-start for seven days. On each control-node startup, active records are started in the background; there is no daily timer, and read-only mode skips both discovery and scheduled startup. Extend 7 days renews the expiry. Stop auto-start clears it without stopping the node. Stop alone is temporary: an active node starts again on a later control-node startup.
 
 ### Operate it
 

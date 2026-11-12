@@ -68,6 +68,7 @@ The same image can run a control node instead of a project host. `dev-host contr
 docker run -d --name nd-control -p 127.0.0.1:43190:8080 \
   --label node-dev-host.role=control \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  -v node-dev-host-control:/var/lib/dev-host/control \
   ghcr.io/newbe36524/node-dev-host:latest control
 # open http://127.0.0.1:43190
 ```
@@ -78,22 +79,25 @@ Pick its port with the same procedure as the project containers, from the skill'
 
 ### What the dashboard shows
 
-The dashboard lists each container that carries the `node-dev-host.port` label, running or stopped. For each one it shows the name, port, image, state, health, build state, time of the last build, and an **Open** link to its port on the same host. Containers without the label are not listed, and neither is the control node.
+The dashboard lists each container that carries the `node-dev-host.port` label, running or stopped, and each saved node that has no container (`not created`). For each it shows the name, port, image, state, health, build state, time of the last build, auto-start window and an **Open** link to its port on the same host. Containers without the label are not listed, and neither is the control node. The control node saves node records in `CONTROL_DATA_DIR`; mount a volume there or the records disappear when the control container is recreated. The dashboard warns when that directory is not a separate mount or is not writable.
 
 Build states: `starting`, `building`, `ok`, `failed`, `waiting` and `unknown`. A stopped container shows `stopped`. `unknown` also appears when the status cannot be read within 2 seconds, and for a container on a user-defined network that the control node has not joined.
 
 ### What the dashboard does
 
-- **Rebuild, Restart and Stop** for a running container, and **Start** for a stopped one. Rebuild runs `dev-host rebuild` inside the container. It is refused for a stopped container.
+- **Rebuild, Restart and Stop** for a running container, and **Start** for a stopped or not-created node. Starting a missing node pulls the image and creates it from its saved record. **Recreate** pulls the latest image and replaces a registered node's container while keeping its record.
 - **Logs** shows the last 200 lines of the container's log.
-- **Remove** force-removes the container after a confirmation, and frees its port.
+- **Remove container** force-removes the container after a confirmation and keeps a registered node as `not created`; for an unregistered container its row disappears.
+- **Delete node** removes both the container and its saved record after confirmation.
+- **Extend 7 days** renews the auto-start window. **Stop auto-start** clears it; Stop only stops the current container and does not opt out.
+- **Add node** saves a node without creating its container. **Scan** imports labelled containers the control node can reproduce safely.
 
 Around the table the dashboard adds:
 
 - **Fleet ribbon:** one segment per container with its state word, and totals with faults first. Past 12 containers it becomes a dense matrix (50 cells fit in two rows) that keeps the host's order, so a cell never moves; hover or focus a cell to read its name, state and port.
 - **Live rows:** a badge morphs when its state changes, and "Last build" is a ticking relative time. An action shows `rebuilding…` and the like until the next refresh.
 - **Session timeline:** the state changes this browser tab has seen since it was opened. The control node keeps no history, so nothing earlier is shown.
-- **Shortcuts:** `j` and `k` select a row, `L` opens its logs, `R` rebuilds it, and `Ctrl K` (`Cmd K` on macOS) opens a command palette. In read-only mode the palette hides commands that change a container. Logs follow the tail every 3 seconds, and Pause freezes them.
+- **Shortcuts:** `j` and `k` select a row, `L` opens its logs, `R` rebuilds it, `S` starts a stopped node through the same auto-start prompt, and `Ctrl K` (`Cmd K` on macOS) opens a command palette. In read-only mode the palette hides commands that change a container. Logs follow the tail every 3 seconds, and Pause freezes them.
 
 Working a large fleet (the host limit is 50 containers):
 
@@ -102,6 +106,8 @@ Working a large fleet (the host limit is 50 containers):
 - **Batches:** tick rows (checkbox, `x`, Shift-click for a range, or the header checkbox for everything shown) and a bar offers Rebuild, Restart, Stop and Start, each with how many of the selection it applies to. Stop and Restart of several ask first. At most 4 containers are acted on at once, and one message reports the result. A batch only reaches rows the filter shows, and Remove is never batched.
 - **Moving fast:** `f` jumps to the next failed row, and the palette opens on group commands (`Rebuild 3 failed`, `Start 2 stopped`, `Show only building`). Type a name to go to a container, read its logs or change it.
 - **Quiet rows:** past 12 containers each row keeps `Logs` and folds the other actions into a menu.
+
+On the first manual start with no active auto-start window, the dashboard asks whether to start the node only or to auto-start it for seven days. The control node checks that absolute expiry on its own startup; there is no daily timer. Read-only mode disables node changes and skips both import and scheduled startup.
 
 Actions reach only labelled containers. Any other name is refused.
 
@@ -131,6 +137,41 @@ The control node reads these variables. The variables in the skill's Configurati
 | `CONTROL_READONLY` | `false` | `true` (also `1`, `yes` or `on`) rejects every change. The dashboard then shows read-only mode and disables the actions. Logs still work. |
 | `CONTROL_ALLOWED_HOSTS` | empty | Comma-separated extra Host names to accept, for example `devbox.local`. Add only the names you open the dashboard with. |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Socket path inside the container. Change it only when the socket is mounted at another path. |
+| `CONTROL_DATA_DIR` | `/var/lib/dev-host/control` | Directory containing `nodes.json`. Mount a persistent volume here to keep node records across control-container recreation. |
+| `CONTROL_ALLOWED_IMAGES` | `ghcr.io/newbe36524/node-dev-host,node-dev-host` | Comma-separated allowed image repositories for node creation. Tags may vary. |
+| `CONTROL_WORKSPACE_ROOTS` | empty | Comma-separated absolute host path roots allowed for workspaces. Empty allows any absolute path without `..` segments. |
+
+### Add a node through the API
+
+Scripts and agents use the same `POST /api/nodes` route as the dashboard; do not add managed nodes by editing a Compose file. `curl` supplies `Host` from the URL. Mutating calls also need a matching `Origin`, `X-Dev-Host-Control: 1`, and `Content-Type: application/json`. These guards are not authentication; keep the control port on loopback.
+
+```sh
+CONTROL=http://127.0.0.1:43190
+WORKSPACE="$PWD"
+IMAGE=node-dev-host:latest
+NEXT_PORT=$(curl -fsS "$CONTROL/api/containers" |
+  node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(String(JSON.parse(s).nextPort)))')
+BODY=$(node -e 'console.log(JSON.stringify({name:"nd-api-demo",workspace:process.argv[1],port:Number(process.argv[2]),image:process.argv[3]}))' \
+  "$WORKSPACE" "$NEXT_PORT" "$IMAGE")
+curl -fsS "$CONTROL/api/containers" |
+  node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s).persistence;console.log(JSON.stringify(p));if(!p.mounted)process.exitCode=1})'
+curl -fsS -X POST -H "Origin: $CONTROL" -H 'X-Dev-Host-Control: 1' \
+  -H 'Content-Type: application/json' --data "$BODY" "$CONTROL/api/nodes"
+curl -fsS -X POST -H "Origin: $CONTROL" -H 'X-Dev-Host-Control: 1' \
+  "$CONTROL/api/containers/nd-api-demo/start"
+```
+
+The initial list returns `nextPort` and `persistence`; adding saves the node and leaves it `not created`, and the follow-up Start queues image pull and creation. Poll `GET /api/containers` until it is running or its row has an error.
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Invalid node fields or JSON. |
+| `403` | Guard rejected the request or read-only mode is on. |
+| `409` | Duplicate name or port is already in use. |
+| `413` / `415` | Body exceeds 16 KB / content type is not JSON. |
+| `503` | Node store is not writable or Docker is unreachable. |
+
+Every error response is JSON with an `error` message. A scan imports labelled containers that the control node can reproduce. It skips containers with extra mounts, a non-loopback published port, privileged mode, or (for non-demo images) no `/workspace` bind, and reports each reason. Imported nodes have no auto-start window. Once imported, the console owns that record; Recreate builds from it and the resulting container will not retain Compose labels.
 
 ### Docker Desktop (macOS and Windows)
 

@@ -160,13 +160,13 @@ A restrained neutral grey ramp with three signal hues. The palette is shadcn "ne
 
 A single centred column, `max-w-6xl` (72rem), padded 16px on small screens and 24px from the `md` breakpoint (768px). Sections are stacked with a 16px rhythm. Top to bottom the order is fixed and follows the order of importance for observation:
 
-1. **Header strip:** title and the live count on the left; the Commands button, theme toggle, read-only badge and refresh indicator on the right. This strip is the panel's own health readout and wraps rather than truncates.
-2. **Alerts:** the stale-data alert and the read-only alert, directly above the data they qualify.
+1. **Header strip:** title and the live count on the left; Add node, Scan, Commands, theme toggle, read-only badge and refresh indicator on the right. This strip is the panel's own health readout and wraps rather than truncates.
+2. **Alerts:** the stale-data alert, read-only alert and persistence alerts, directly above the data they qualify.
 3. **Fleet ribbon:** one band for the whole host, a segment per container, with the totals above it, faults first.
-4. **Container table:** the instrument cluster. Columns run from identity to state to action: Name, Port, Image, State, Health, Build, Last build, Open, Actions.
+4. **Container table:** the instrument cluster. Columns run from identity to state to action: Name, Port, Image, State, Health, Build, Last build, Auto-start, Open, Actions.
 5. **Session timeline:** what this tab has seen change since it was opened. It sits below the table because it is context, not the reading.
 
-Below `md` the table becomes a stack of cards. Image, Health and Last build drop out of view first (`hidden md:table-cell`), and the name takes a full line. State, Build, Open and Actions always stay, because they are the observation and the response. The header row stays in the DOM for screen readers (`sr-only`). Row actions collapse into a menu on narrow screens so the row stays one glance tall.
+Below `md` the table becomes a stack of cards. Image, Health, Last build and Auto-start drop out of view first (`hidden md:table-cell`), and the name takes a full line. State, Build, Open and Actions always stay, because they are the observation and the response. Row errors and warnings remain inside the card. The header row stays in the DOM for screen readers (`sr-only`). Row actions collapse into a menu on narrow screens so the row stays one glance tall.
 
 Data refreshes by polling every 3 seconds, scheduled after each attempt finishes so requests never pile up. The layout must not move when data refreshes: row identity is the container id, widths come from content that is stable (fixed-width figures, short state words).
 
@@ -197,6 +197,8 @@ The most important component. A pill with the build state as its text, `h-5` (20
 ### Container state badge
 A neutral outline pill showing the Docker state (`running`, `exited`, ...). It is deliberately uncoloured. Lifecycle is context; the build state beside it is the signal. Do not give it a hue.
 
+The registered-node state `not created` uses a dashed quiet-text outline, like `stopped`; its build badge is also `stopped`. It is a useful state, not an error.
+
 ### Refresh indicator
 Right side of the header: a small icon plus "Updated hh:mm:ss" in quiet text. While a request is in flight the icon becomes a spinner with the label "Refreshing". Before the first response it reads "Waiting for first update". This is the answer to "can I trust what I see right now".
 
@@ -206,8 +208,11 @@ A bordered card with Fault Red text, announced as an alert, shown when the lates
 ### Read-only badge and alert
 When the control server rejects changes, a "Read-only" secondary badge appears in the header and an alert sits above the table. Action buttons are disabled; Logs stays available because observation is never blocked.
 
+### Persistence alerts
+When node records are not on a separate mount, a neutral alert says they can be lost when the control container is recreated and names the data directory. When the store is not writable, a Fault Red alert says node changes cannot be saved and Add node is disabled. Neither alert uses a signal hue as decoration.
+
 ### Container table
-The primary data surface. Bordered, 8px radius, horizontal scroll as a safety net, one row per container. Port in tabular figures. Image truncates with the full value on hover. "Last build" renders a `<time>` element with the ISO value, and an em dash when no build has finished. Row order is the server's; the table does not reorder under the operator on its own.
+The primary data surface. Bordered, 8px radius, horizontal scroll as a safety net, one row per labelled container or saved node. Port in tabular figures. Image truncates with the full value on hover. "Last build" renders a `<time>` element with the ISO value, and an em dash when no build has finished. Auto-start is quiet text after Last build: an active window shows its expiry in a `<time>` and days left, an ended window says it ended with the date, and an unset or unregistered row shows an em dash. Row order is the server's; the table does not reorder under the operator on its own.
 
 ### Fleet ribbon
 A flex-wrapped band of status cells, one per container, each printing the container name and its state word. Fill follows the three signals (ok green, building blue); failed is a soft red cell with a 2px inset outline, and it is the only cell that pings, once, when a container turns failed during the session. Neutral states stay outlined, `stopped` dashed. Pressing a cell moves the keyboard cursor to that row. The totals above it read `1 failed 2 ok 1 stopped`, only non-zero states, failed first.
@@ -219,10 +224,19 @@ Rows react without moving. A refresh that changes a state is applied inside a sa
 One lane per container: a track whose segments are the states this tab has seen, the current state as a word at the lane's end, and the last five changes spelled out below ("nd-docs went from building to ok"). The window is at least two minutes and at most an hour, ending now. It is client-side only and the caption says so: "The server keeps no history, so earlier changes are not shown." A container that disappears keeps its lane and ends in a dashed `removed` segment. Empty: "No state changes since you opened this page."
 
 ### Command palette and shortcuts
-`Ctrl K` (`Cmd K` on macOS) opens a palette: Logs, Open, Rebuild, Restart, Stop or Start per container, Refresh now, and the theme. Words filter it in any order. Remove is left out because it needs the row's confirmation. In read-only mode commands that change a container are hidden and a line says why. Single-letter shortcuts act on the keyboard cursor row: `j` and `k` move it, `L` opens logs, `R` rebuilds, `Esc` clears it. They stay quiet while typing and while any dialog, menu or sheet is open.
+`Ctrl K` (`Cmd K` on macOS) opens a palette: Logs, Open, Rebuild, Restart, Stop or Start, Recreate, Extend 7 days, Stop auto-start, Scan, Refresh now, and the theme. Start uses the same prompt as the row action when its window is not active. Words filter it in any order. Remove container and Delete node are left out because they need confirmation. In read-only mode commands that change a node are hidden and a line says why. Single-letter shortcuts act on the keyboard cursor row: `j` and `k` move it, `L` opens logs, `R` rebuilds, `S` starts a stopped node through the shared prompt, `Esc` clears it. They stay quiet while typing and while any dialog, menu or sheet is open.
 
 ### Container actions
-Rebuild, Restart and Stop for a running container, Start for a stopped one, Logs and Remove. Quiet outline and ghost buttons so they sit behind the state. Remove is destructive and always asks for confirmation. Failure of any action raises a toast that names the container and the action.
+Rebuild, Restart and Stop for a running container, Start for a stopped or not-created node, Logs, Recreate, Extend 7 days, Stop auto-start, Remove container and Delete node. Quiet outline and ghost buttons so they sit behind the state. Remove container and Delete node are destructive and always ask for confirmation; Delete node says the record is deleted too. New lifecycle actions are hidden for unregistered containers and disabled in read-only mode. Failure of any action raises a toast that names the node and action.
+
+### Add node dialog
+A shadcn dialog with name, workspace, port, image and environment fields. The port starts at the server's `nextPort`; the image starts at the default allowed repository. A rejected request leaves the dialog open, keeps all entered values and shows the server's validation message beside the form.
+
+### Start prompt
+When a node has no active auto-start window, Start asks whether to start only, start and auto-start for seven days, or cancel. Cancel sends no request. A node with an active window starts without asking, and the prompt is shared by the row, `S` shortcut and command palette.
+
+### Operation details
+While the control node pulls, creates or starts a node, a quiet `pulling…`, `creating…` or `starting…` word stays beside the state on both wide and narrow rows. A failed operation stays as a Fault Red line until a later operation succeeds. A local-image fallback is a quiet warning line. These are row-level status, not decoration.
 
 ### Logs sheet
 A side sheet with the last 200 log lines in a muted monospace block, the observability tool of last resort. It opens from the row, in place, with no navigation away from the panel, and the row's state badge travels into the sheet header through a shared View Transition name. It follows the tail every 3 seconds while the reader is at the bottom and leaves them alone once they scroll up; Pause freezes it. If a later refresh fails it keeps the last lines and says so in red. It has its own loading, empty ("(no log lines)") and error states.
@@ -243,6 +257,7 @@ A dashed-border block with one instruction sentence: containers carrying the `no
 - **Do** show `unknown` or an em dash when a value cannot be read. Never invent a state, never leave a blank cell.
 - **Do** keep layout stable across polls: fixed-width figures, content-driven widths, rows keyed by container id.
 - **Do** keep Logs reachable in every mode, including read-only and for stopped containers.
+- **Do** keep auto-start text, operation labels and warnings neutral; the schedule is not a build signal.
 - **Do** keep the status hues to their three meanings (green ok, blue building, red failed) in both themes.
 - **Do** check any new status colour in light and dark for 4.5:1 text contrast before shipping it.
 
@@ -257,4 +272,5 @@ A dashed-border block with one instruction sentence: containers carrying the `no
 - **Don't** add a second motion moment: the badge morph, the settle ring and the one-time fault ping are the whole budget.
 - **Don't** let actions outrank status. Action buttons stay quiet and sit last in the row.
 - **Don't** colour the Docker container state badge. It is context, and the build badge is the signal.
+- **Don't** use a signal hue for Auto-start, a persistence warning, an operation word or a pull-fallback note.
 - **Don't** add a custom font, a second accent colour or a bespoke component where a shadcn primitive already fits.
