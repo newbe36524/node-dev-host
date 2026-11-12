@@ -17,6 +17,9 @@ API_UPSTREAM="${API_UPSTREAM:-}"
 STATE_DIR="${STATE_DIR:-/var/lib/dev-host}"
 STATUS_FILE="$STATE_DIR/status.json"
 TRIGGER_FILE="$STATE_DIR/rebuild"
+# Read by Caddy on every request (X-Build-Time / X-Build-Duration headers).
+BUILD_TIME_FILE="$STATE_DIR/build-time"
+BUILD_DURATION_FILE="$STATE_DIR/build-duration"
 
 log() { printf '[dev-host %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
@@ -66,6 +69,8 @@ write_caddyfile() {
     echo "    root * $root"
     [ "$SPA" = "true" ] && echo "    try_files {path} /index.html"
     echo "    header Cache-Control no-cache"
+    echo "    header X-Build-Time \"{file.$BUILD_TIME_FILE}\""
+    echo "    header X-Build-Duration \"{file.$BUILD_DURATION_FILE}\""
     echo "    file_server"
     echo "  }"
     echo "}"
@@ -89,6 +94,10 @@ run_build() {
     log "install: $icmd"
     bash -c "$icmd" || rc=$?
     DEPS_SIG="$(deps_sig)"
+    # Each dependency change adds packages to the pnpm store; drop the ones no project uses any more.
+    if [ "$rc" -eq 0 ] && command -v pnpm >/dev/null 2>&1; then
+      pnpm store prune >/dev/null 2>&1 || log "pnpm store prune failed (ignored)"
+    fi
   fi
   if [ "$rc" -eq 0 ]; then
     log "build ($reason): $BUILD_CMD"
@@ -96,7 +105,11 @@ run_build() {
   fi
   BUILDS=$((BUILDS + 1)); LAST_EXIT=$rc
   if [ "$rc" -eq 0 ]; then
-    log "build ok in $(( $(date +%s) - start ))s"; write_status ok
+    local secs=$(( $(date +%s) - start ))
+    # Only a successful build changes the headers: the served dist is then the one they describe.
+    printf '%s' "$(date -u +%FT%TZ)" > "$BUILD_TIME_FILE.tmp" && mv "$BUILD_TIME_FILE.tmp" "$BUILD_TIME_FILE"
+    printf '%s' "$secs" > "$BUILD_DURATION_FILE.tmp" && mv "$BUILD_DURATION_FILE.tmp" "$BUILD_DURATION_FILE"
+    log "build ok in ${secs}s"; write_status ok
   else
     FAILURES=$((FAILURES + 1)); log "build FAILED (exit $rc), serving the previous dist"; write_status failed
   fi
@@ -137,6 +150,9 @@ else
   write_caddyfile
 fi
 BUILDS=0; FAILURES=0; LAST_EXIT=null
+# Start empty: the headers stay blank until this container completes a build. The file must exist,
+# or Caddy logs an error for every request.
+: > "$BUILD_TIME_FILE"; : > "$BUILD_DURATION_FILE"
 write_status starting
 
 log "caddy on :$HTTP_PORT, serving $WORKSPACE/$DIST_DIR"
