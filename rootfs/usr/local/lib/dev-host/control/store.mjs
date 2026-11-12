@@ -1,0 +1,96 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+const DEFAULT_DATA_DIR = '/var/lib/dev-host/control';
+
+export function createStore({ dir = process.env.CONTROL_DATA_DIR || DEFAULT_DATA_DIR, fsApi = fs.promises, log = console.warn } = {}) {
+  const file = path.join(dir, 'nodes.json');
+  let state = { version: 1, nodes: [] };
+  let warning = null;
+  let loaded = false;
+  let serial = Promise.resolve();
+
+  async function load() {
+    if (loaded) return structuredClone(state);
+    await fsApi.mkdir(dir, { recursive: true });
+    try {
+      const text = await fsApi.readFile(file, 'utf8');
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed?.version !== 1 || !Array.isArray(parsed.nodes)) throw new Error('invalid node store shape');
+        state = parsed;
+      } catch (err) {
+        const damaged = `${file}.corrupt-${Date.now()}`;
+        await fsApi.rename(file, damaged);
+        warning = `node store could not be parsed; preserved at ${damaged}: ${err.message}`;
+        log(warning);
+        state = { version: 1, nodes: [] };
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+    loaded = true;
+    return structuredClone(state);
+  }
+
+  async function save(next) {
+    await fsApi.mkdir(dir, { recursive: true });
+    const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+    let handle;
+    try {
+      handle = await fsApi.open(temp, 'wx', 0o600);
+      await handle.writeFile(`${JSON.stringify(next, null, 2)}\n`, 'utf8');
+      await handle.sync();
+      await handle.close();
+      handle = null;
+      await fsApi.rename(temp, file);
+    } catch (err) {
+      await handle?.close().catch(() => {});
+      await fsApi.unlink(temp).catch(() => {});
+      throw err;
+    }
+  }
+
+  function update(mutator) {
+    const result = serial.then(async () => {
+      await load();
+      const current = structuredClone(state);
+      const next = await mutator(current);
+      const document = next ?? current;
+      if (document.version !== 1 || !Array.isArray(document.nodes)) {
+        throw new TypeError('node store update must return a version 1 document with a nodes array');
+      }
+      await save(document);
+      state = document;
+      warning = null;
+      return structuredClone(state);
+    });
+    serial = result.catch(() => {});
+    return result;
+  }
+
+  async function getNodes() {
+    await serial;
+    const current = await load();
+    return structuredClone(current.nodes);
+  }
+
+  async function status() {
+    await load();
+    let writable = false;
+    let mounted = false;
+    try {
+      const [dirStat, rootStat] = await Promise.all([fsApi.stat(dir), fsApi.stat('/')]);
+      mounted = dirStat.dev !== rootStat.dev;
+      writable = (dirStat.mode & 0o222) !== 0;
+      if (writable) await fsApi.access(dir, fs.constants.W_OK);
+    } catch {
+      writable = false;
+    }
+    return { dir, writable, mounted, warning };
+  }
+
+  return { dir, file, load, getNodes, update, status };
+}
+
+export { DEFAULT_DATA_DIR };
