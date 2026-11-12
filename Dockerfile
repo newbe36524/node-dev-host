@@ -17,7 +17,7 @@ ARG TSX_VERSION=4.23.15
 # earlier layer. So each RUN removes what it created, and caches live in build-time
 # cache mounts that never enter a layer.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git tini curl \
+ && apt-get install -y --no-install-recommends ca-certificates git tini curl rsync \
  && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig \
            /usr/share/doc /usr/share/man /usr/share/info /usr/share/lintian /usr/share/bug
 
@@ -30,7 +30,8 @@ RUN --mount=type=cache,target=/root/.npm \
 
 COPY rootfs/ /
 ENV WORKSPACE=/workspace \
-    PNPM_HOME=/pnpm-store-home \
+    PNPM_HOME=/var/lib/dev-host/pnpm \
+    PNPM_CONFIG_STORE_DIR=/var/lib/dev-host/pnpm/store \
     CI=true
 WORKDIR /workspace
 EXPOSE 8080
@@ -40,11 +41,9 @@ ENTRYPOINT ["/usr/bin/tini", "--", "dev-host"]
 CMD ["run"]
 
 # ---- demo: same image plus a ready-to-run source tree in /workspace ----
+# Dependencies are installed when the container starts, in the build copy (see dev-host), not here.
 FROM base AS demo
 COPY demo/ /workspace/
-RUN --mount=type=cache,target=/root/.cache \
-    pnpm install --frozen-lockfile && pnpm build \
- && rm -rf /tmp/*
 
 # ---- alpine base: the same tools on Alpine (musl libc, smaller). Tags: alpine, demo-alpine ----
 FROM node:${NODE_VERSION}-alpine AS base-alpine
@@ -56,7 +55,7 @@ ARG TYPESCRIPT_VERSION=7.0.2
 ARG TSX_VERSION=4.23.15
 
 # bash, findutils and coreutils: dev-host needs bash and GNU `find -printf` (busybox has neither).
-RUN apk add --no-cache ca-certificates git tini curl bash findutils coreutils
+RUN apk add --no-cache ca-certificates git tini curl rsync bash findutils coreutils
 
 COPY --from=caddy /usr/bin/caddy /usr/local/bin/caddy
 RUN --mount=type=cache,target=/root/.npm \
@@ -67,7 +66,8 @@ RUN --mount=type=cache,target=/root/.npm \
 
 COPY rootfs/ /
 ENV WORKSPACE=/workspace \
-    PNPM_HOME=/pnpm-store-home \
+    PNPM_HOME=/var/lib/dev-host/pnpm \
+    PNPM_CONFIG_STORE_DIR=/var/lib/dev-host/pnpm/store \
     CI=true
 WORKDIR /workspace
 EXPOSE 8080
@@ -76,12 +76,9 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=20s \
 ENTRYPOINT ["/sbin/tini", "--", "dev-host"]
 CMD ["run"]
 
-# ---- demo-alpine: alpine base plus the demo project, built in the image ----
+# ---- demo-alpine: alpine base plus the demo project in /workspace ----
 FROM base-alpine AS demo-alpine
 COPY demo/ /workspace/
-RUN --mount=type=cache,target=/root/.cache \
-    pnpm install --frozen-lockfile && pnpm build \
- && rm -rf /tmp/*
 
 # ---- host-alpine: the plain alpine variant ----
 FROM base-alpine AS host-alpine
