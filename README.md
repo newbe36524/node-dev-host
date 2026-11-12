@@ -84,6 +84,17 @@ The image is kept small on purpose: each build step removes what it creates, and
 
 Build args: `NODE_VERSION`, `CADDY_VERSION`, `PNPM_VERSION`, `TYPESCRIPT_VERSION`, `TSX_VERSION`.
 
+## Integration tests
+
+`tests/integration/run.sh <image> <target>` runs real containers against a built image and checks what they build and serve: the read-only workspace, rebuilds on edit, failed builds, the `/api` proxy, a custom `CADDYFILE` and the shared pnpm store volume. It needs Docker and curl.
+
+```sh
+docker build --target host -t node-dev-host:test-host .
+tests/integration/run.sh node-dev-host:test-host host
+```
+
+The `integration` workflow runs the same script for all four variants on pull requests that change the image, the demo or the tests.
+
 ## License
 
 MIT

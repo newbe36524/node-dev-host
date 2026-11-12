@@ -174,3 +174,5 @@ Build args: `NODE_VERSION` (24), `CADDY_VERSION` (2), `PNPM_VERSION`, `TYPESCRIP
 - `rootfs/usr/local/bin/dev-host`: the entrypoint script with `run`, `rebuild`, and `status` commands.
 - `demo/`: the demo project copied into the `demo` image.
 - `.github/workflows/publish.yml`: publishes both variants on push to `main`, on `v*` tags, weekly, and on manual dispatch.
+- `.github/workflows/integration.yml`: builds all four targets and runs the integration tests against each one. It runs on pull requests that touch the image, the demo or the tests.
+- `tests/integration/run.sh`: the integration tests. `run.sh <image> <target>` starts real containers from a fixture project and checks what they build and serve. Run it locally after `docker build -t node-dev-host:test-host --target host .`.
