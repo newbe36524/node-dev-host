@@ -532,7 +532,10 @@ test_control_nodes() {
 
   check "recreate answers 202" [ "$(guarded_code nodes-ctrl POST "/api/containers/$node_name/recreate")" = 202 ]
   check "recreate returns the node to running" poll 420 row_is nodes-ctrl lifecycle running ok
-  check "Remove container answers 200" [ "$(guarded_code nodes-ctrl DELETE "/api/containers/$node_name")" = 200 ]
+  remove_reply="$(guarded_reply nodes-ctrl DELETE "/api/containers/$node_name" -w '\n%{http_code}')"
+  remove_status="${remove_reply##*$'\n'}"
+  [ "$remove_status" = 200 ] || printf '  Remove container answered %s: %s\n' "$remove_status" "${remove_reply%$'\n'*}"
+  check "Remove container answers 200" [ "$remove_status" = 200 ]
   check "Remove container keeps the saved node record" poll 60 row_is nodes-ctrl lifecycle "not created" unknown
 
   ended_name="$(cn lifecycle-ended)"
