@@ -26,6 +26,8 @@ RUN="$$"
 VOLUME="ndit-$RUN-pnpm"
 CONTAINERS=()
 API_PID=""
+REG_PID=""
+SLOW_VOLUME=""
 FAILS=0
 
 case "$TARGET" in
@@ -49,7 +51,9 @@ cleanup() {
   fi
   for c in "${CONTAINERS[@]}"; do docker rm -f "$c" >/dev/null 2>&1; done
   docker volume rm "$VOLUME" >/dev/null 2>&1
+  [ -n "$SLOW_VOLUME" ] && docker volume rm "$SLOW_VOLUME" >/dev/null 2>&1
   [ -n "$API_PID" ] && kill "$API_PID" 2>/dev/null
+  [ -n "$REG_PID" ] && kill "$REG_PID" 2>/dev/null
   rm -rf "$WORK"
   if [ "$FAILS" -gt 0 ]; then
     printf '\n%s check(s) failed for %s\n' "$FAILS" "$TARGET"
@@ -100,12 +104,14 @@ start() {
   # (it still holds the label) and pick again, as the skill describes.
   for _ in 1 2 3 4 5; do
     port="$(pick_port "$name")" || { fail "no free port for $name"; return 1; }
-    if docker run -d --name "$name" -p "127.0.0.1:$port:8080" \
+    local err
+    if err="$(docker run -d --name "$name" -p "127.0.0.1:$port:8080" \
          --label "node-dev-host.port=$port" --label "node-dev-host.name=$name" \
-         "$@" "$IMAGE" >/dev/null 2>&1; then
+         "$@" "$IMAGE" 2>&1 >/dev/null)"; then
       check "port $port for $name is in 43100-43299" in_range "$port"
       return 0
     fi
+    printf '        docker run on port %s failed: %s\n' "$port" "$err"
     docker rm -f "$name" >/dev/null 2>&1
   done
   fail "could not start $name after 5 tries"
@@ -274,11 +280,13 @@ start_control() {
   CONTAINERS+=("$name")
   for _ in 1 2 3 4 5; do
     port="$(pick_port "$name")" || { fail "no free port for $name"; return 1; }
-    if docker run -d --name "$name" -p "127.0.0.1:$port:8080" \
-         --label node-dev-host.role=control "$@" "$IMAGE" control >/dev/null 2>&1; then
+    local err
+    if err="$(docker run -d --name "$name" -p "127.0.0.1:$port:8080" \
+         --label node-dev-host.role=control "$@" "$IMAGE" control 2>&1 >/dev/null)"; then
       check "port $port for $name is in 43100-43299" in_range "$port"
       return 0
     fi
+    printf '        docker run on port %s failed: %s\n' "$port" "$err"
     docker rm -f "$name" >/dev/null 2>&1
   done
   fail "could not start $name after 5 tries"
@@ -300,13 +308,44 @@ body_any()  { curl -s "$(url "$1" "$2")" | grep -q -- "$3"; }
 extra_host_ok() { [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: devbox.local:$(port "$1")" "$(url "$1" /__dev-host/status.json)")" = 200 ]; }
 # rows SHORT: one line per row the control node lists: "name docker-state build-state".
 rows() {
-  curl -fsS "$(url "$1" /api/containers)" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const c of JSON.parse(s).containers)console.log(c.name,c.state,c.build.state)})'
+  curl -fsS "$(url "$1" /api/containers)" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const c of JSON.parse(s).containers)console.log(c.name,c.state,c.build.state)})' 2>/dev/null
 }
 row_is()     { local out; out="$(rows "$1")" && grep -qx -- "$(cn "$2") $3 $4" <<<"$out"; }
-not_listed() { local out; out="$(rows "$1")" && ! grep -q -- "$(cn "$2")" <<<"$out"; }
+not_listed() { local out; out="$(rows "$1")" && awk -v name="$(cn "$2")" '$1 == name { found=1 } END { if (found) exit 1; exit 0 }' <<<"$out"; }
+row_registered() {
+  curl -fsS "$(url "$1" /api/containers)" |
+    node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s).containers.find(c=>c.name===process.argv[1]);process.exit(r&&r.registered===(process.argv[2]==="true")?0:1)})' \
+      "$(cn "$2")" "$3"
+}
+row_schedule_is() {
+  curl -fsS "$(url "$1" /api/containers)" |
+    node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s).containers.find(c=>c.name===process.argv[1]);process.exit(r?.schedule?.state===process.argv[2]?0:1)})' \
+      "$(cn "$2")" "$3"
+}
+# row_phase_is SHORT NAME PHASE: the row's operation is in PHASE (pulling, creating, starting or removing).
+row_phase_is() {
+  curl -fsS "$(url "$1" /api/containers)" |
+    node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s).containers.find(c=>c.name===process.argv[1]);process.exit(r?.operation?.phase===process.argv[2]?0:1)})' \
+      "$(cn "$2")" "$3"
+}
+# row_failed_is SHORT NAME: the row is not created, has no operation in progress, and keeps an error.
+row_failed_is() {
+  curl -fsS "$(url "$1" /api/containers)" |
+    node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s).containers.find(c=>c.name===process.argv[1]);process.exit(r&&r.state==="not created"&&!r.operation&&typeof r.error==="string"&&r.error.length>0?0:1)})' \
+      "$(cn "$2")"
+}
+scan_skipped() {
+  local result
+  result="$(guarded_reply "$1" POST /api/scan)" &&
+    node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s);process.exit(v.skipped.some(x=>x.name===process.argv[1]&&x.reason===process.argv[2])?0:1)})' \
+      "$(cn "$2")" "$3" <<<"$result"
+}
 paused_message_is_shown() { guarded_reply act-ctrl POST "/api/containers/$(cn "$1")/start" | grep -q paused; }
 gone() { local names; names="$(docker ps -a --format '{{.Names}}')"; ! grep -qx -- "$(cn "$1")" <<<"$names"; }
 no_port_label() { local names; names="$(docker ps -a --filter label=node-dev-host.port --format '{{.Names}}')"; ! grep -qx -- "$(cn "$1")" <<<"$names"; }
+json_error_has() {
+  node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s);process.exit(typeof v.error==="string"&&v.error.includes(process.argv[1])?0:1)})' "$2" <<<"$1"
+}
 
 test_control_runtime() {
   log "control: starts in control mode, answers health, and refuses bad requests before any Docker call"
@@ -340,18 +379,31 @@ test_control_dashboard_api() {
   fresh_project dash
   start dash-a -v "$WORK/dash:/workspace:ro"
   start dash-b -v "$WORK/dash:/workspace:ro"
+  local extra_name extra_port
+  extra_name="$(cn dash-extra)"
+  extra_port="$(pick_port "$extra_name")"
+  CONTAINERS+=("$extra_name")
+  docker create --name "$extra_name" -p "127.0.0.1:$extra_port:8080" \
+    --label "node-dev-host.port=$extra_port" --label "node-dev-host.name=$extra_name" \
+    -v "$WORK/dash:/workspace:ro" -v /etc:/etc:ro "$IMAGE" >/dev/null
   check "dash-a reaches state ok" poll 300 state_is dash-a ok
   check "dash-b reaches state ok" poll 300 state_is dash-b ok
   docker stop "$(cn dash-b)" >/dev/null
-  CONTAINERS+=("$(cn plain)")
-  docker run -d --name "$(cn plain)" --entrypoint sleep "$IMAGE" 600 >/dev/null
+  CONTAINERS+=("$(cn dash-plain)")
+  docker run -d --name "$(cn dash-plain)" --entrypoint sleep "$IMAGE" 600 >/dev/null
   start_control dash-ctrl -v /var/run/docker.sock:/var/run/docker.sock
 
   check "the list shows the running labelled container with build state ok" poll 60 row_is dash-ctrl dash-a running ok
   check "the list shows the stopped labelled container as exited, build state unknown" row_is dash-ctrl dash-b exited unknown
-  check "the unlabelled container is not listed" not_listed dash-ctrl plain
+  check "the unlabelled container is not listed" not_listed dash-ctrl dash-plain
   check "the control container does not list itself" not_listed dash-ctrl dash-ctrl
   check "the list reports readOnly false" body_has dash-ctrl /api/containers '"readOnly":false'
+  check "the startup scan imports a labelled container without an auto-start window" \
+    poll 60 row_registered dash-ctrl dash-a true
+  check "the imported node starts unscheduled" row_schedule_is dash-ctrl dash-a none
+  check "a labelled container with an /etc bind stays listed but is not imported" \
+    row_registered dash-ctrl dash-extra false
+  check "the scan reports the unsupported /etc mount" scan_skipped dash-ctrl dash-extra "unsupported mount: /etc"
 
   touch "$WORK/dash/BREAK"
   check "a failed build shows as failed in the list" poll 180 row_is dash-ctrl dash-a running failed
@@ -434,6 +486,177 @@ test_control_actions() {
   check "the list still shows the container" poll 60 row_is act-ro act-a running ok
 }
 
+test_control_nodes() {
+  log "control: add nodes through the guarded API, create and recreate containers, and persist records"
+  docker volume create "$VOLUME" >/dev/null
+  fresh_project node-workspace
+  start_control nodes-ctrl \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$VOLUME:/var/lib/dev-host/control"
+  check "the control node lists its data directory" poll 60 body_any nodes-ctrl /api/containers '"persistence"'
+  check "the default data directory is reported" body_any nodes-ctrl /api/containers '"dir":"/var/lib/dev-host/control"'
+
+  local control_url next_port node_port node_name body invalid_body invalid_response
+  local ended_name ended_port ended_body readonly_name readonly_port readonly_body
+  control_url="$(url nodes-ctrl "")"
+  next_port="$(curl -fsS "$control_url/api/containers" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(String(JSON.parse(s).nextPort)))')"
+  node_port="$next_port"
+  if [ "$node_port" = "$(port nodes-ctrl)" ]; then
+    node_port=$((node_port + 1))
+    [ "$node_port" -le 43299 ] || node_port=43100
+  fi
+  node_name="$(cn lifecycle)"
+  body="$(node -e 'console.log(JSON.stringify({name:process.argv[1],workspace:process.argv[2],port:Number(process.argv[3]),image:process.argv[4]}))' \
+    "$node_name" "$WORK/node-workspace" "$node_port" "$IMAGE")"
+
+  check "an add without Origin is rejected (403)" \
+    [ "$(code nodes-ctrl POST /api/nodes -H 'X-Dev-Host-Control: 1' -H 'Content-Type: application/json' --data "$body")" = 403 ]
+  check "an add without the control header is rejected (403)" \
+    [ "$(code nodes-ctrl POST /api/nodes -H "Origin: $control_url" -H 'Content-Type: application/json' --data "$body")" = 403 ]
+  check "an add with the wrong content type is rejected (415)" \
+    [ "$(guarded_code nodes-ctrl POST /api/nodes -H 'Content-Type: text/plain' --data "$body")" = 415 ]
+
+  invalid_body="$(node -e 'const body=JSON.parse(process.argv[1]);body.name += "-invalid";body.port=43300;console.log(JSON.stringify(body))' "$body")"
+  invalid_response="$(guarded_reply nodes-ctrl POST /api/nodes -H 'Content-Type: application/json' --data "$invalid_body")"
+  check "an out-of-range port answers 400" [ "$(guarded_code nodes-ctrl POST /api/nodes -H 'Content-Type: application/json' --data "$invalid_body")" = 400 ]
+  check "the out-of-range port response is JSON with an error" json_error_has "$invalid_response" "43100-43299"
+
+  check "the documented guarded add answers 201" \
+    [ "$(guarded_code nodes-ctrl POST /api/nodes -H 'Content-Type: application/json' --data "$body")" = 201 ]
+  check "a repeated add is rejected (409)" \
+    [ "$(guarded_code nodes-ctrl POST /api/nodes -H 'Content-Type: application/json' --data "$body")" = 409 ]
+  check "Start with autoStart answers 202" \
+    [ "$(guarded_code nodes-ctrl POST "/api/containers/$node_name/start" -H 'Content-Type: application/json' --data '{"autoStart":true}')" = 202 ]
+  check "Start with autoStart saves an active window" poll 30 body_any nodes-ctrl /api/containers '"state":"active"'
+  check "start creates and builds a container from the local test image" poll 420 row_is nodes-ctrl lifecycle running ok
+
+  check "recreate answers 202" [ "$(guarded_code nodes-ctrl POST "/api/containers/$node_name/recreate")" = 202 ]
+  check "recreate returns the node to running" poll 420 row_is nodes-ctrl lifecycle running ok
+  check "Remove container answers 200" [ "$(guarded_code nodes-ctrl DELETE "/api/containers/$node_name")" = 200 ]
+  check "Remove container keeps the saved node record" poll 60 row_is nodes-ctrl lifecycle "not created" unknown
+
+  ended_name="$(cn lifecycle-ended)"
+  ended_port="$(curl -fsS "$(url nodes-ctrl /api/containers)" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(String(JSON.parse(s).nextPort)))')"
+  ended_body="$(node -e 'console.log(JSON.stringify({name:process.argv[1],workspace:process.argv[2],port:Number(process.argv[3]),image:process.argv[4]}))' \
+    "$ended_name" "$WORK/node-workspace" "$ended_port" "$IMAGE")"
+  check "an additional node can be recorded for an ended startup window" \
+    [ "$(guarded_code nodes-ctrl POST /api/nodes -H 'Content-Type: application/json' --data "$ended_body")" = 201 ]
+  docker exec "$(cn nodes-ctrl)" node -e \
+    'const fs=require("node:fs");const p=process.argv[1];const name=process.argv[2];const data=JSON.parse(fs.readFileSync(p,"utf8"));const node=data.nodes.find((item)=>item.name===name);if(!node)process.exit(1);node.autoStartUntil=new Date(Date.now()-60000).toISOString();fs.writeFileSync(p,JSON.stringify(data))' \
+    /var/lib/dev-host/control/nodes.json "$ended_name"
+
+  docker rm -f "$(cn nodes-ctrl)" >/dev/null
+  start_control nodes-ctrl \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$VOLUME:/var/lib/dev-host/control"
+  check "the record survives control-container recreation and its active window starts the node" \
+    poll 420 row_is nodes-ctrl lifecycle running ok
+  check "a node with an ended startup window stays uncreated" \
+    row_is nodes-ctrl lifecycle-ended "not created" unknown
+  check "the ended window remains ended" row_schedule_is nodes-ctrl lifecycle-ended ended
+  check "startup does not create the ended node's container" gone lifecycle-ended
+
+  readonly_name="$(cn readonly-active)"
+  readonly_port="$(curl -fsS "$(url nodes-ctrl /api/containers)" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(String(JSON.parse(s).nextPort)))')"
+  readonly_body="$(node -e 'console.log(JSON.stringify({name:process.argv[1],workspace:process.argv[2],port:Number(process.argv[3]),image:process.argv[4]}))' \
+    "$readonly_name" "$WORK/node-workspace" "$readonly_port" "$IMAGE")"
+  check "an active but uncreated node can be recorded" \
+    [ "$(guarded_code nodes-ctrl POST /api/nodes -H 'Content-Type: application/json' --data "$readonly_body")" = 201 ]
+  check "the second node gets an active startup window" \
+    [ "$(guarded_code nodes-ctrl POST "/api/nodes/$readonly_name/auto-start")" = 200 ]
+  start_control nodes-readonly -e CONTROL_READONLY=true \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$VOLUME:/var/lib/dev-host/control"
+  check "read-only control node becomes ready" poll 60 body_any nodes-readonly /api/containers '"readOnly":true'
+  check "read-only startup leaves an active node uncreated" \
+    row_is nodes-readonly readonly-active "not created" unknown
+  check "read-only startup preserves the active window" row_schedule_is nodes-readonly readonly-active active
+  check "read-only startup does not create the active node's container" gone readonly-active
+  check "Delete node answers 200" [ "$(guarded_code nodes-ctrl DELETE "/api/nodes/$node_name")" = 200 ]
+  check "Delete node removes the container and its saved record" poll 60 not_listed nodes-ctrl lifecycle
+  check "Delete node removes an ended record without a container" \
+    [ "$(guarded_code nodes-ctrl DELETE "/api/nodes/$ended_name")" = 200 ]
+  check "Delete node removes the active record left untouched by read-only startup" \
+    [ "$(guarded_code nodes-ctrl DELETE "/api/nodes/$readonly_name")" = 200 ]
+
+  check "read-only mode rejects node creation (403)" \
+    [ "$(guarded_code nodes-readonly POST /api/nodes -H 'Content-Type: application/json' --data "$readonly_body")" = 403 ]
+  check "read-only mode rejects extending auto-start (403)" \
+    [ "$(guarded_code nodes-readonly POST "/api/nodes/$readonly_name/auto-start")" = 403 ]
+  check "read-only mode rejects stopping auto-start (403)" \
+    [ "$(guarded_code nodes-readonly DELETE "/api/nodes/$readonly_name/auto-start")" = 403 ]
+
+  start_control nodes-readonly-store \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$VOLUME:/var/lib/dev-host/control:ro"
+  check "control node with read-only storage becomes ready" poll 60 body_any nodes-readonly-store /api/containers '"readOnly":false'
+  check "a non-writable node store rejects creation with 503" \
+    [ "$(guarded_code nodes-readonly-store POST /api/nodes -H 'Content-Type: application/json' --data "$readonly_body")" = 503 ]
+}
+
+test_control_startup_pull() {
+  log "control: a slow pull at startup does not block health, and a failed pull leaves the other node running"
+  local reg_port ctrl slow_name good_name slow_port good_port slow_body good_body
+  reg_port="$(node -e 'const s=require("node:net").createServer().listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')"
+  # Docker treats localhost as an insecure registry. The manifest request waits, then reports the image as unknown,
+  # so the startup pull is slow and then fails, with no network access needed.
+  cat > "$WORK/slow-registry.mjs" <<'EOF'
+import http from 'node:http';
+const port = Number(process.argv[2]);
+const delay = Number(process.argv[3]);
+http.createServer((req, res) => {
+  const headers = { 'Docker-Distribution-Api-Version': 'registry/2.0', 'content-type': 'application/json' };
+  if (req.url === '/v2/' || req.url.startsWith('/v2/?')) { res.writeHead(200, headers); return res.end('{}'); }
+  setTimeout(() => {
+    res.writeHead(404, headers);
+    res.end(JSON.stringify({ errors: [{ code: 'MANIFEST_UNKNOWN', message: 'manifest unknown' }] }));
+  }, delay);
+}).listen(port, '127.0.0.1');
+EOF
+  node "$WORK/slow-registry.mjs" "$reg_port" 20000 >/dev/null 2>&1 &
+  REG_PID=$!
+  SLOW_VOLUME="ndit-$RUN-slow-data"
+  docker volume create "$SLOW_VOLUME" >/dev/null
+  fresh_project slow-workspace
+  ctrl=nodes-slow-ctrl
+  slow_name="$(cn slow-pull)"
+  good_name="$(cn slow-good)"
+  start_control "$ctrl" -e "CONTROL_ALLOWED_IMAGES=node-dev-host,localhost:$reg_port/nd-slow" \
+    -v /var/run/docker.sock:/var/run/docker.sock -v "$SLOW_VOLUME:/var/lib/dev-host/control"
+
+  # Docker's port proxy can accept a connection before the server listens, so wait for the server itself.
+  check "the control node answers before the first request" poll 60 body_has "$ctrl" /__dev-host/status.json '"state":"ok"'
+  slow_port="$(curl -fsS "$(url "$ctrl" /api/containers)" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(String(JSON.parse(s).nextPort)))')"
+  slow_body="$(node -e 'console.log(JSON.stringify({name:process.argv[1],workspace:process.argv[2],port:Number(process.argv[3]),image:process.argv[4]}))' \
+    "$slow_name" "$WORK/slow-workspace" "$slow_port" "localhost:$reg_port/nd-slow:latest")"
+  check "the node whose image cannot be pulled is recorded" \
+    [ "$(guarded_code "$ctrl" POST /api/nodes -H 'Content-Type: application/json' --data "$slow_body")" = 201 ]
+  good_port="$(curl -fsS "$(url "$ctrl" /api/containers)" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(String(JSON.parse(s).nextPort)))')"
+  good_body="$(node -e 'console.log(JSON.stringify({name:process.argv[1],workspace:process.argv[2],port:Number(process.argv[3]),image:process.argv[4]}))' \
+    "$good_name" "$WORK/slow-workspace" "$good_port" "$IMAGE")"
+  check "the node with the local test image is recorded" \
+    [ "$(guarded_code "$ctrl" POST /api/nodes -H 'Content-Type: application/json' --data "$good_body")" = 201 ]
+  check "the failing node gets an active window" [ "$(guarded_code "$ctrl" POST "/api/nodes/$slow_name/auto-start")" = 200 ]
+  check "the good node gets an active window" [ "$(guarded_code "$ctrl" POST "/api/nodes/$good_name/auto-start")" = 200 ]
+
+  docker rm -f "$(cn "$ctrl")" >/dev/null
+  start_control "$ctrl" -e "CONTROL_ALLOWED_IMAGES=node-dev-host,localhost:$reg_port/nd-slow" \
+    -v /var/run/docker.sock:/var/run/docker.sock -v "$SLOW_VOLUME:/var/lib/dev-host/control"
+  check "the restarted control node answers" poll 60 body_has "$ctrl" /__dev-host/status.json '"state":"ok"'
+  check "the startup pass shows the slow pull on its row" poll 120 row_phase_is "$ctrl" slow-pull pulling
+  check "the control node answers health during the slow pull" body_has "$ctrl" /__dev-host/status.json '"state":"ok"'
+  check "the list answers during the slow pull" body_any "$ctrl" /api/containers '"containers"'
+  check "the other node with an active window still starts" poll 420 row_is "$ctrl" slow-good running ok
+  check "the failed pull leaves its node not created with the error on the row" poll 180 row_failed_is "$ctrl" slow-pull
+  check "the failed node has no container" gone slow-pull
+  check "the control node is still healthy after the failed pull" body_has "$ctrl" /__dev-host/status.json '"state":"ok"'
+
+  check "Delete node answers 200 for the good node" [ "$(guarded_code "$ctrl" DELETE "/api/nodes/$good_name")" = 200 ]
+  check "Delete node answers 200 for the failed node" [ "$(guarded_code "$ctrl" DELETE "/api/nodes/$slow_name")" = 200 ]
+  kill "$REG_PID" 2>/dev/null
+  REG_PID=""
+}
+
 # ---- run ----------------------------------------------------------------------
 
 if [ "$VARIANT" = demo ]; then
@@ -448,3 +671,5 @@ fi
 test_control_runtime
 test_control_dashboard_api
 test_control_actions
+test_control_nodes
+test_control_startup_pull

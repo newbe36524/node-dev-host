@@ -6,7 +6,7 @@ import path from 'node:path';
 import { afterEach, test } from 'node:test';
 import { createDockerClient } from '../../../rootfs/usr/local/lib/dev-host/control/docker.mjs';
 import { createOperationTracker } from '../../../rootfs/usr/local/lib/dev-host/control/operations.mjs';
-import { createBody, nextPort, parseAllowedImages, parseWorkspaceRoots, validateNode } from '../../../rootfs/usr/local/lib/dev-host/control/nodes.mjs';
+import { createBody, DEFAULT_ALLOWED_IMAGES, nextPort, parseAllowedImages, parseWorkspaceRoots, validateNode } from '../../../rootfs/usr/local/lib/dev-host/control/nodes.mjs';
 import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from '../../../rootfs/usr/local/lib/dev-host/control/schedule.mjs';
 import { createStore } from '../../../rootfs/usr/local/lib/dev-host/control/store.mjs';
 import { createDiscovery } from '../../../rootfs/usr/local/lib/dev-host/control/discovery.mjs';
@@ -141,6 +141,9 @@ test('node validation, fixed creation body, and nextPort respect the record cont
   assert.equal(nextPort([{ port: 43100 }], [{ Labels: { 'node-dev-host.port': '43101' } }]), 43102);
   assert.deepEqual(parseAllowedImages('registry.example/nd'), ['registry.example/nd']);
   assert.deepEqual(parseWorkspaceRoots('/work,/repo'), ['/work', '/repo']);
+  assert.deepEqual(parseAllowedImages(''), DEFAULT_ALLOWED_IMAGES);
+  assert.deepEqual(DEFAULT_ALLOWED_IMAGES, ['ghcr.io/newbe36524/node-dev-host', 'node-dev-host']);
+  assert.deepEqual(parseWorkspaceRoots(''), []);
 });
 
 test('node operations lock per node and retain errors until a later success', async () => {
@@ -169,6 +172,7 @@ test('schedule windows use absolute timestamps and extend without shortening', (
   assert.equal(extendWindow(activeUntil, now), new Date(now + WEEK_MS).toISOString());
   assert.equal(extendWindow(new Date(now + 9 * 86_400_000).toISOString(), now), new Date(now + 9 * 86_400_000).toISOString());
   assert.equal(extendWindow(null, now), new Date(now + WEEK_MS).toISOString());
+  assert.equal(extendWindow(new Date(now - 86_400_000).toISOString(), now), new Date(now + WEEK_MS).toISOString());
   assert.equal(clearWindow(), null);
 });
 
@@ -182,6 +186,7 @@ test('startup pass starts only active records, bounds concurrency, and continues
   ];
   const operations = createOperationTracker();
   const started = [];
+  const resolved = [];
   let running = 0;
   let maximum = 0;
   let pulls = 0;
@@ -190,6 +195,7 @@ test('startup pass starts only active records, bounds concurrency, and continues
     store: { getNodes: async () => records },
     operations,
     resolveContainer: async (name) => {
+      resolved.push(name);
       if (name === 'running') return { State: { Running: true } };
       if (name === 'exited') return { State: { Running: false } };
       return null;
@@ -215,6 +221,9 @@ test('startup pass starts only active records, bounds concurrency, and continues
   assert.deepEqual(new Set(started), new Set(['exited', 'batch-0', 'batch-1', 'batch-2', 'batch-3']));
   assert.equal(errors.length, 1);
   assert.equal(operations.get('missing').error, 'port is allocated');
+  // Only records with an active window are looked at: the ended record and any container without a record are never touched.
+  assert.deepEqual([...new Set(resolved)].sort(), ['batch-0', 'batch-1', 'batch-2', 'batch-3', 'exited', 'missing', 'running']);
+  assert.ok(!resolved.includes('ended'));
 });
 
 test('discovery imports reproducible containers once and reports unsupported shapes', async () => {
@@ -262,4 +271,40 @@ test('discovery imports reproducible containers once and reports unsupported sha
     { name: 'nd-extra', reason: 'unsupported mount: /etc' },
     { name: 'nd-public', reason: 'published port is not bound to loopback' },
   ] });
+});
+
+test('discovery skips privileged containers and containers without a /workspace bind, with the documented reasons', async () => {
+  const store = createStore({ dir: await tempDir() });
+  const base = (name, overrides = {}) => ({
+    Name: `/${name}`,
+    Config: { Image: 'node-dev-host:latest', Labels: { 'node-dev-host.port': '43111' }, Env: [] },
+    State: { Running: false },
+    HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: false },
+    Mounts: [{ Type: 'bind', Source: '/workspace/site', Destination: '/workspace', RW: false }],
+    NetworkSettings: { Networks: {} },
+    ...overrides,
+  });
+  const containers = [
+    base('nd-priv', { HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: true } }),
+    base('nd-nows', { Mounts: [] }),
+  ];
+  const docker = {
+    dockerRaw: async (method, apiPath) => {
+      if (apiPath.startsWith('/containers/json')) {
+        return { status: 200, body: Buffer.from(JSON.stringify(containers.map((info) => ({ Names: [info.Name] })))) };
+      }
+      const name = decodeURIComponent(apiPath.split('/')[2]);
+      return { status: 200, body: Buffer.from(JSON.stringify(containers.find((info) => info.Name === `/${name}`))) };
+    },
+    imageInfo: async () => ({ Config: { Env: [] } }),
+  };
+  const discovery = createDiscovery({ docker, store, allowedImages: ['node-dev-host'], log: () => {} });
+  assert.deepEqual(await discovery.scan(), {
+    imported: [],
+    skipped: [
+      { name: 'nd-priv', reason: 'container is privileged' },
+      { name: 'nd-nows', reason: 'no /workspace bind' },
+    ],
+  });
+  assert.deepEqual(await store.getNodes(), []);
 });
