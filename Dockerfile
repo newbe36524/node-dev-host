@@ -1,8 +1,24 @@
 # syntax=docker/dockerfile:1
 ARG NODE_VERSION=24
 ARG CADDY_VERSION=2
+ARG PNPM_VERSION=12.18.0
 
 FROM caddy:${CADDY_VERSION}-alpine AS caddy
+
+# ---- control-ui: the control dashboard (React, Vite), built once into static files ----
+# Pinned to $BUILDPLATFORM: the toolchain runs natively on the builder, not under QEMU once per target.
+# Its output is plain HTML, JS and CSS, so the same dist is copied into every architecture and both bases.
+# Only /app/dist is copied out. No node_modules, source or build tool reaches a published layer.
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-bookworm-slim AS control-ui
+ARG PNPM_VERSION
+ENV PNPM_CONFIG_STORE_DIR=/pnpm-store
+WORKDIR /app
+RUN --mount=type=cache,target=/root/.npm \
+    npm install -g "pnpm@${PNPM_VERSION}"
+COPY control-ui/ ./
+RUN --mount=type=cache,target=/pnpm-store \
+    pnpm install --frozen-lockfile \
+ && pnpm build
 
 # ---- base: everything shared by all published variants ----
 FROM node:${NODE_VERSION}-bookworm-slim AS base
@@ -29,6 +45,8 @@ RUN --mount=type=cache,target=/root/.npm \
  && chmod 1777 /var/lib/dev-host
 
 COPY rootfs/ /
+# The built control dashboard, served by `dev-host control` (rootfs/usr/local/lib/dev-host/control/server.mjs).
+COPY --from=control-ui /app/dist /usr/local/lib/dev-host/control/ui
 ENV WORKSPACE=/workspace \
     PNPM_HOME=/var/lib/dev-host/pnpm \
     PNPM_CONFIG_STORE_DIR=/var/lib/dev-host/pnpm/store \
@@ -65,6 +83,8 @@ RUN --mount=type=cache,target=/root/.npm \
  && chmod 1777 /var/lib/dev-host
 
 COPY rootfs/ /
+# The built control dashboard, served by `dev-host control` (rootfs/usr/local/lib/dev-host/control/server.mjs).
+COPY --from=control-ui /app/dist /usr/local/lib/dev-host/control/ui
 ENV WORKSPACE=/workspace \
     PNPM_HOME=/var/lib/dev-host/pnpm \
     PNPM_CONFIG_STORE_DIR=/var/lib/dev-host/pnpm/store \
