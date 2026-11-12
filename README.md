@@ -113,6 +113,16 @@ Actions reach only labelled containers. Any other name is refused.
 
 The dashboard is the only visual view of what the containers do. Its design rules, with the status colours and the observation principles behind them, are in [`DESIGN.md`](DESIGN.md).
 
+### npm registry
+
+The **npm registry** button in the header sets a registry for every node. Each node container gets it as `NPM_REGISTRY`, and `dev-host` passes it to pnpm and npm as `PNPM_CONFIG_REGISTRY` and `npm_config_registry`. It overrides the registry in the workspace `.npmrc`. Leave the field empty to use each workspace's `.npmrc` or the default registry.
+
+- The setting applies to a node when its container is created: on Start of a not-created node, on Recreate, and on the startup pass for auto-started nodes. A running container keeps its value until you recreate it.
+- A node's own `NPM_REGISTRY` in its Environment overrides the setting for that node only.
+- The URL must be `http` or `https`, with no credentials and no query. Put registry credentials in the workspace `.npmrc`; the value is saved in `nodes.json` and returned by the API.
+- Inside a container, `127.0.0.1` is the container itself. For a mirror on the host, use `host.docker.internal` with `--add-host=host.docker.internal:host-gateway` on Linux.
+- The API is `POST /api/settings` with `{"npmRegistry": "http://mirror.example:4873/"}` (or `null` to clear). It uses the same guards as the other POST routes.
+
 ### Theme
 
 The **Theme** button in the header switches between Light, Dark and System. System is the default and follows the operating system's colour scheme. The choice is saved in the browser under `localStorage` key `dev-host-theme`, so it is not shared between browsers or devices.

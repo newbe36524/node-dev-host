@@ -287,6 +287,7 @@ All variables are optional.
 | --- | --- | --- |
 | `BUILD_CMD` | `pnpm build` | Command that writes the output folder. Runs in `/var/lib/dev-host/build`, a copy of `/workspace`. |
 | `INSTALL_CMD` | auto | Default: `pnpm install --frozen-lockfile` if `pnpm-lock.yaml` exists, otherwise `pnpm install`. Runs in the build copy. |
+| `NPM_REGISTRY` | empty | Package registry URL for pnpm and npm, for example a local mirror `http://mirror.example:4873/`. Must be http or https with no credentials. It overrides the registry in the workspace `.npmrc`; put credentials there. Set by the control node's npm registry setting, or by hand with `-e`. |
 | `DIST_DIR` | `dist` | Output folder, relative to the project root in the build copy. Must match what `BUILD_CMD` writes. It is copied to `www` after a successful build. |
 | `HTTP_PORT` | `8080` | Port Caddy listens on inside the container. |
 | `SPA` | `true` | Serve `index.html` for unknown paths. Set `false` for a multi-page site. |
