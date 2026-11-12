@@ -88,7 +88,24 @@ Build states: `starting`, `building`, `ok`, `failed`, `waiting` and `unknown`. A
 - **Logs** shows the last 200 lines of the container's log.
 - **Remove** force-removes the container after a confirmation, and frees its port.
 
+Around the table the dashboard adds:
+
+- **Fleet ribbon:** one segment per container with its state word, and totals with faults first. Past 12 containers it becomes a dense matrix (50 cells fit in two rows) that keeps the host's order, so a cell never moves; hover or focus a cell to read its name, state and port.
+- **Live rows:** a badge morphs when its state changes, and "Last build" is a ticking relative time. An action shows `rebuilding…` and the like until the next refresh.
+- **Session timeline:** the state changes this browser tab has seen since it was opened. The control node keeps no history, so nothing earlier is shown.
+- **Shortcuts:** `j` and `k` select a row, `L` opens its logs, `R` rebuilds it, and `Ctrl K` (`Cmd K` on macOS) opens a command palette. In read-only mode the palette hides commands that change a container. Logs follow the tail every 3 seconds, and Pause freezes them.
+
+Working a large fleet (the host limit is 50 containers):
+
+- **Triage order:** the table lists failed first, then building, then ok, then stopped, with ties by name. A refresh that moves a state slides the rows to their new place.
+- **Filter:** the counts above the matrix are buttons (`3 failed` shows only those), and the search box matches name, image or port. The filter lives in the address bar (`#q=api&s=failed`), so a reload or a shared link keeps the view. `/` focuses the search box, and `Esc` clears it.
+- **Batches:** tick rows (checkbox, `x`, Shift-click for a range, or the header checkbox for everything shown) and a bar offers Rebuild, Restart, Stop and Start, each with how many of the selection it applies to. Stop and Restart of several ask first. At most 4 containers are acted on at once, and one message reports the result. A batch only reaches rows the filter shows, and Remove is never batched.
+- **Moving fast:** `f` jumps to the next failed row, and the palette opens on group commands (`Rebuild 3 failed`, `Start 2 stopped`, `Show only building`). Type a name to go to a container, read its logs or change it.
+- **Quiet rows:** past 12 containers each row keeps `Logs` and folds the other actions into a menu.
+
 Actions reach only labelled containers. Any other name is refused.
+
+The dashboard is the only visual view of what the containers do. Its design rules, with the status colours and the observation principles behind them, are in [`DESIGN.md`](DESIGN.md).
 
 ### Theme
 
