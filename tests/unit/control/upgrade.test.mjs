@@ -240,3 +240,25 @@ test('a standby node ignores handovers addressed to another container', async ()
   clearInterval(timer);
   assert.equal(promotions, 0);
 });
+
+test('a restarted candidate stays active only when the handover names it', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'control-promoted-'));
+  const { fake } = await setup();
+  const node = createSelfUpgrade({ docker: fake.docker, store: storeSpy([]), operations: { inFlight: () => [] }, dataDir: dir, selfId: CAND_SHORT, timings, log: () => {} });
+  assert.equal(await node.wasPromoted(), false, 'no handover file');
+  await fs.writeFile(path.join(dir, 'handover.json'), JSON.stringify({ state: 'handover', to: CAND_SHORT }));
+  assert.equal(await node.wasPromoted(), false, 'handover not yet acknowledged');
+  await fs.writeFile(path.join(dir, 'handover.json'), JSON.stringify({ state: 'active', by: 'c'.repeat(12) }));
+  assert.equal(await node.wasPromoted(), false, 'acknowledged by another container');
+  await fs.writeFile(path.join(dir, 'handover.json'), JSON.stringify({ state: 'active', by: CAND_SHORT }));
+  assert.equal(await node.wasPromoted(), true);
+});
+
+test('changes pause only from the store handover, not while a candidate starts', async () => {
+  const { upgrade } = await setup({ healthy: false });
+  assert.equal(upgrade.pausesChanges(), false);
+  upgrade.start({ auto: false });
+  // The candidate never becomes healthy here, so the run ends before any handover phase.
+  await waitForPhase(upgrade, ['failed', 'done']);
+  assert.equal(upgrade.pausesChanges(), false);
+});

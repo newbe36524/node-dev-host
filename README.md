@@ -137,6 +137,20 @@ The Docker socket is root-equivalent on the host. The process that holds it can 
 
 There is no authentication beyond these checks.
 
+### Self-upgrade
+
+A control node started from a `latest` image upgrades itself when a newer `latest` appears. Every few hours (`CONTROL_SELF_UPDATE_INTERVAL_HOURS`, default 6) it pulls the image. If the image changed, it:
+
+1. starts a candidate control node from the new image, in standby, with the same volumes, networks and labels, and no host port;
+2. waits until the candidate reports healthy;
+3. waits for the running node's operations to finish, then pauses record changes (`POST` and `DELETE` return `503`, so retry) and writes `handover.json` in `CONTROL_DATA_DIR`;
+4. the candidate loads `nodes.json` and acknowledges in the same file;
+5. the new node is renamed to the old name, and the old container is removed.
+
+The dashboard and `GET` requests keep working during the switch: they go through `nd-gateway` (see `repos/nd-console`), which forwards to the container named `nd-control`. If the candidate is not healthy or does not acknowledge in time, the candidate is removed and the running node resumes. Child nodes are not touched.
+
+Pinned tags (for example `:0.2.1` or `@sha256:...`) never upgrade themselves. `POST /api/upgrade` starts an upgrade now, for any tag; `GET /api/upgrade` returns its phase and last error. Set `CONTROL_SELF_UPDATE=false` to turn the timer off.
+
 ### Configuration
 
 The control node reads these variables. The variables in the skill's Configuration table apply to project hosts, not to the control node.
@@ -150,6 +164,9 @@ The control node reads these variables. The variables in the skill's Configurati
 | `CONTROL_DATA_DIR` | `/var/lib/dev-host/control` | Directory containing `nodes.json`. Mount a persistent volume here to keep node records across control-container recreation. |
 | `CONTROL_ALLOWED_IMAGES` | `ghcr.io/newbe36524/node-dev-host,node-dev-host` | Comma-separated allowed image repositories for node creation. Tags may vary. |
 | `CONTROL_WORKSPACE_ROOTS` | empty | Comma-separated absolute host path roots allowed for workspaces. Empty allows any absolute path without `..` segments. |
+| `CONTROL_SELF_UPDATE` | `true` | Upgrade to a newer `latest` image on a timer. `false` (also `0`, `no`, `off`) turns the timer off; `POST /api/upgrade` still works. |
+| `CONTROL_SELF_UPDATE_INTERVAL_HOURS` | `6` | Hours between image checks for self-upgrade. |
+| `CONTROL_STANDBY` | empty | Set only by a self-upgrade on the candidate. A standby node answers its health check and returns `503` for the API until it takes over. Do not set it by hand. |
 
 ### Add a node through the API
 

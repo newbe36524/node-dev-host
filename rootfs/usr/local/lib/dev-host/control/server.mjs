@@ -30,7 +30,7 @@ const { dockerRaw } = docker;
 const READONLY = /^(1|true|yes|on)$/i.test(env.CONTROL_READONLY || '');
 // Standby: a candidate started by a self-upgrade. It answers only its health check until the running
 // control node hands the node store over (see upgrade.mjs).
-const STANDBY = /^(1|true|yes|on)$/i.test(env.CONTROL_STANDBY || '');
+let STANDBY = /^(1|true|yes|on)$/i.test(env.CONTROL_STANDBY || '');
 // Self-upgrade follows a `latest` image. Set CONTROL_SELF_UPDATE=false to keep the running version.
 const SELF_UPDATE = !/^(0|false|no|off)$/i.test(env.CONTROL_SELF_UPDATE || 'true');
 const SELF_UPDATE_HOURS = Number(env.CONTROL_SELF_UPDATE_INTERVAL_HOURS) > 0 ? Number(env.CONTROL_SELF_UPDATE_INTERVAL_HOURS) : 6;
@@ -56,6 +56,8 @@ const store = createStore({ dir: DATA_DIR, readOnly: READONLY, log: (...parts) =
 const operations = createOperationTracker();
 const discovery = createDiscovery({ docker, store, allowedImages: ALLOWED_IMAGES, workspaceRoots: WORKSPACE_ROOTS, log });
 const upgrade = createSelfUpgrade({ docker, store, operations, dataDir: DATA_DIR, selfId: os.hostname(), log });
+// A standby flag survives in the container's environment after a takeover, so ask the handover record first.
+if (STANDBY && (await upgrade.wasPromoted())) STANDBY = false;
 
 const enc = (name) => encodeURIComponent(name);
 
@@ -605,8 +607,8 @@ async function handle(req, res) {
     }
     // 3. Read-only mode rejects every state change.
     if (READONLY) return sendJson(res, 403, { error: 'read-only mode: changes are disabled' });
-    // 4. Changes pause while this node hands over to a newer control node.
-    if (upgrade.busy()) return sendJson(res, 503, { error: 'control node upgrade in progress: retry shortly' });
+    // 4. Changes pause while this node hands its store over to a newer control node.
+    if (upgrade.pausesChanges()) return sendJson(res, 503, { error: 'control node upgrade in progress: retry shortly' });
   }
 
   if (url.pathname === '/__dev-host/status.json') {
@@ -628,6 +630,7 @@ const server = http.createServer((req, res) => {
 // Takes over the node store: load it, import labelled containers, restore auto-start windows, and
 // start the self-upgrade check. Runs at startup, or when a handover makes this standby node active.
 async function activate() {
+  STANDBY = false;
   try {
     await store.load();
   } catch (err) {

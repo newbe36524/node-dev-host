@@ -16,6 +16,9 @@ import path from 'node:path';
 import { HttpError, dockerMessage } from './docker.mjs';
 
 const HANDOVER_FILE = 'handover.json';
+// Changes pause only from the moment the store is about to be handed over. Before that, a candidate
+// starting up does not touch the store, so writes keep working.
+const PAUSE_PHASES = new Set(['waiting-for-operations', 'handing-over', 'swapping']);
 const DEFAULT_TIMINGS = {
   healthTimeoutMs: 120_000,
   healthPollMs: 2_000,
@@ -79,6 +82,7 @@ export function createSelfUpgrade({
   let state = { phase: 'idle', since: null, error: null, result: null };
   let busy = false;
   let promoting = false;
+  const selfShort = selfId.slice(0, 12);
 
   const setState = (phase, extra = {}) => {
     state = { phase, since: now(), error: null, result: null, ...extra };
@@ -90,6 +94,12 @@ export function createSelfUpgrade({
     } catch {
       return null;
     }
+  }
+
+  // True when this container already took over, so a restart must not put it back on standby.
+  async function wasPromoted() {
+    const doc = await readHandover();
+    return doc?.state === 'active' && doc.by === selfShort;
   }
 
   async function writeHandover(doc) {
@@ -250,7 +260,9 @@ export function createSelfUpgrade({
   return {
     start,
     watchHandover,
+    wasPromoted,
     status: () => ({ ...state, busy }),
     busy: () => busy,
+    pausesChanges: () => busy && PAUSE_PHASES.has(state.phase),
   };
 }
