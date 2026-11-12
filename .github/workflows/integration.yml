@@ -67,7 +67,7 @@ jobs:
         run: pnpm test
 
       - name: Control server unit tests
-        run: node --test tests/unit/control/*.test.mjs
+        run: cd .. && node --test tests/unit/control/*.test.mjs
 
       - name: Build the dashboard
         run: pnpm build
