@@ -3,7 +3,12 @@ import path from 'node:path';
 
 const DEFAULT_DATA_DIR = '/var/lib/dev-host/control';
 
-export function createStore({ dir = process.env.CONTROL_DATA_DIR || DEFAULT_DATA_DIR, fsApi = fs.promises, log = console.warn } = {}) {
+export function createStore({
+  dir = process.env.CONTROL_DATA_DIR || DEFAULT_DATA_DIR,
+  fsApi = fs.promises,
+  log = console.warn,
+  readOnly = false,
+} = {}) {
   const file = path.join(dir, 'nodes.json');
   let state = { version: 1, nodes: [] };
   let warning = null;
@@ -12,7 +17,7 @@ export function createStore({ dir = process.env.CONTROL_DATA_DIR || DEFAULT_DATA
 
   async function load() {
     if (loaded) return structuredClone(state);
-    await fsApi.mkdir(dir, { recursive: true });
+    if (!readOnly) await fsApi.mkdir(dir, { recursive: true });
     try {
       const text = await fsApi.readFile(file, 'utf8');
       try {
@@ -21,8 +26,10 @@ export function createStore({ dir = process.env.CONTROL_DATA_DIR || DEFAULT_DATA
         state = parsed;
       } catch (err) {
         const damaged = `${file}.corrupt-${Date.now()}`;
-        await fsApi.rename(file, damaged);
-        warning = `node store could not be parsed; preserved at ${damaged}: ${err.message}`;
+        if (!readOnly) await fsApi.rename(file, damaged);
+        warning = readOnly
+          ? `node store could not be parsed in read-only mode: ${err.message}`
+          : `node store could not be parsed; preserved at ${damaged}: ${err.message}`;
         log(warning);
         state = { version: 1, nodes: [] };
       }
@@ -52,6 +59,7 @@ export function createStore({ dir = process.env.CONTROL_DATA_DIR || DEFAULT_DATA
   }
 
   function update(mutator) {
+    if (readOnly) return Promise.reject(new Error('node store is read-only'));
     const result = serial.then(async () => {
       await load();
       const current = structuredClone(state);

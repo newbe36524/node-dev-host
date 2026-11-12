@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { HttpError } from './docker.mjs';
 
 export const PORT_LABEL = 'node-dev-host.port';
 export const NAME_LABEL = 'node-dev-host.name';
@@ -115,4 +116,30 @@ export function parseAllowedImages(value = '') {
 
 export function parseWorkspaceRoots(value = '') {
   return value.split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+export async function addNodeRecord(store, input, { allowedImages, workspaceRoots, containers = [] } = {}) {
+  const record = validateNode(input, { allowedImages, workspaceRoots });
+  const labels = containers.map((container) => ({
+    name: container.name ?? (container.Names?.[0] || '').replace(/^\//, ''),
+    port: Number(container.port ?? container.Labels?.[PORT_LABEL]),
+  }));
+  return store.update((document) => {
+    const duplicate = document.nodes.find((node) => node.name === record.name) || labels.find((container) => container.name === record.name);
+    if (duplicate) throw new HttpError(409, `node name is already in use: ${record.name}`);
+    const portHolder = document.nodes.find((node) => node.port === record.port)
+      || labels.find((container) => container.port === record.port);
+    if (portHolder) throw new HttpError(409, `port ${record.port} is already in use by ${portHolder.name}`);
+    document.nodes.push(record);
+    return document;
+  });
+}
+
+export async function deleteNodeRecord(store, name) {
+  return store.update((document) => {
+    const index = document.nodes.findIndex((node) => node.name === name);
+    if (index < 0) throw new HttpError(404, `node not found: ${name}`);
+    document.nodes.splice(index, 1);
+    return document;
+  });
 }
