@@ -1,13 +1,13 @@
 ---
 name: node-dev-host
-description: "Run, configure and operate the node-dev-host Docker image (ghcr.io/newbe36524/node-dev-host). It copies a mounted source tree into a private build directory, builds it there, and serves the output with Caddy inside one long-lived container, rebuilding on every change without writing to the mounted project. Use when the user wants to preview or serve a Node, TypeScript, Vite or pnpm project in Docker without restarting the container, choose the host or demo variant, set BUILD_CMD, INSTALL_CMD, DIST_DIR, HTTP_PORT, SPA or API_UPSTREAM, proxy an API path, read build status, force a rebuild, or fix a container that serves stale or missing files. Keywords: node-dev-host, dev-host, live rebuild, 容器内构建, 本地预览, Caddy, dist, 热重载."
+description: "Run, configure and operate the node-dev-host Docker image (ghcr.io/newbe36524/node-dev-host). It copies a mounted source tree into a private build directory, builds it there, and serves the output with Caddy inside one long-lived container, rebuilding on every change without writing to the mounted project. Use when the user wants to preview or serve a Node, TypeScript, Vite or pnpm project in Docker without restarting the container, choose the host, demo or Alpine variant, set BUILD_CMD, INSTALL_CMD, DIST_DIR, HTTP_PORT, SPA or API_UPSTREAM, proxy an API path, read build status, force a rebuild, or fix a container that serves stale or missing files. Keywords: node-dev-host, dev-host, live rebuild, 容器内构建, 本地预览, Caddy, dist, 热重载."
 ---
 
 # node-dev-host
 
 A Docker image that builds **source → `dist`** inside one container. `dev-host` (PID 1 via `tini`) runs Caddy to serve the output and a build loop that rebuilds it when the source changes. The container is long-lived: edit files on the host, and the container rebuilds without a restart. The mounted project is read-only input: install and build run in a private copy inside the container, so nothing is written into the project folder.
 
-Inside the image: Node 24, `pnpm`, `typescript` (`tsc`), `tsx`, `git`, `curl`, and Caddy.
+Inside the image: Node 24, `pnpm`, `typescript` (`tsc`), `tsx`, `git`, `curl`, `rsync`, `tini`, and Caddy.
 
 ## Pick a variant
 
@@ -187,7 +187,7 @@ All variables are optional.
 | `CADDYFILE` | unset | Path inside the container to a custom Caddyfile, copied over the generated one. `API_UPSTREAM`, `API_PATH` and `SPA` then have no effect. `HTTP_PORT` still drives the health check, so keep it matching the custom file's listen port. Its `root` must be `/var/lib/dev-host/www`. It must also keep the `/__dev-host/status.json` route, which the health check uses. Mount the file with `-v`. |
 | `WORKSPACE` | `/workspace` | Mount point of the project. It is read, never written. Change only if the mount point changes. |
 
-Rebuilds are triggered by changes to any file in `/workspace`, except paths under `node_modules`, `.git`, `dist` (or `DIST_DIR`), `.vite`, `.turbo`, `.cache`, `coverage` and `.pnpm-store`.
+Rebuilds are triggered by changes to any file in `/workspace`, except `node_modules`, `.git`, `dist`, `.vite`, `.turbo`, `.cache`, `coverage` and `.pnpm-store`, which are excluded at any depth. `/$DIST_DIR` (for example `build` when `DIST_DIR=build`) is excluded at the project root only.
 
 The copy into the build directory skips `node_modules`, `.git`, `.vite`, `.turbo`, `.cache`, `coverage` and `.pnpm-store` at any depth, and `/$DIST_DIR` at the project root. Nested `dist` folders are copied.
 
@@ -223,6 +223,6 @@ Build args: `NODE_VERSION` (24), `CADDY_VERSION` (2), `PNPM_VERSION`, `TYPESCRIP
 - `Dockerfile`: Debian targets `base`, `demo`, `host`; Alpine targets `base-alpine`, `demo-alpine`, `host-alpine`. `host` stays last so a bare `docker build .` produces the Debian host image.
 - `rootfs/usr/local/bin/dev-host`: the entrypoint script with `run`, `rebuild`, and `status` commands.
 - `demo/`: the demo project copied into the `demo` image.
-- `.github/workflows/publish.yml`: publishes both variants on push to `main`, on `v*` tags, weekly, and on manual dispatch.
-- `.github/workflows/integration.yml`: builds all four targets and runs the integration tests against each one. It runs on pull requests that touch the image, the demo or the tests.
+- `.github/workflows/publish.yml`: publishes all four variants on push to `main`, on `v*` tags, weekly, and on manual dispatch.
+- `.github/workflows/integration.yml`: builds all four targets and runs the integration tests against each one. It runs on pull requests and on pushes to `main` that touch the image, the demo or the tests, and on manual dispatch.
 - `tests/integration/run.sh`: the integration tests. `run.sh <image> <target>` starts real containers from a fixture project and checks what they build and serve. Run it locally after `docker build -t node-dev-host:test-host --target host .`.

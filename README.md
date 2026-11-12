@@ -32,7 +32,9 @@ A git tag `v1.2.3` also publishes `1.2.3`, `1.2.3-demo`, `1.2.3-alpine` and `1.2
 
 ```sh
 # Use a free port from 43100-43299. Several containers on one machine must not share a port.
-docker run --rm -p 127.0.0.1:43100:8080 ghcr.io/newbe36524/node-dev-host:demo
+docker run --rm --name nd-demo -p 127.0.0.1:43100:8080 \
+  --label node-dev-host.port=43100 --label node-dev-host.name=nd-demo \
+  ghcr.io/newbe36524/node-dev-host:demo
 # open http://127.0.0.1:43100
 
 docker run -d --name nd-my-site -p 127.0.0.1:43101:8080 \
@@ -90,14 +92,14 @@ Build args: `NODE_VERSION`, `CADDY_VERSION`, `PNPM_VERSION`, `TYPESCRIPT_VERSION
 
 ## Integration tests
 
-`tests/integration/run.sh <image> <target>` runs real containers against a built image and checks what they build and serve: the read-only workspace, rebuilds on edit, failed builds, the `/api` proxy, a custom `CADDYFILE` and the shared pnpm store volume. It needs Docker and curl.
+`tests/integration/run.sh <image> <target>` runs real containers against a built image and checks what they build and serve: the read-only workspace, rebuilds on edit, failed builds, the `/api` proxy, a custom `CADDYFILE` and the shared pnpm store volume. It needs Docker, curl, Node.js (for the `/api` upstream), GNU `find` and coreutils (`cksum`, `sha256sum`), and either `ss` or `lsof`.
 
 ```sh
 docker build --target host -t node-dev-host:test-host .
 tests/integration/run.sh node-dev-host:test-host host
 ```
 
-The `integration` workflow runs the same script for all four variants on pull requests that change the image, the demo or the tests.
+The `integration` workflow runs the same script for all four variants on pull requests and on pushes to `main` that change the image, the demo or the tests, and on manual dispatch.
 
 ## License
 
