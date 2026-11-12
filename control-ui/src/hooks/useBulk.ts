@@ -1,17 +1,17 @@
 import { toast } from "sonner"
 import type { PendingAction } from "@/hooks/useCommands"
+import type { BulkAction } from "@/lib/fleet"
 
 /** How many containers a batch touches at once. A host running 50 builds at the same time helps nobody. */
 export const BULK_CONCURRENCY = 4
 
-type RunOne = (name: string, action: PendingAction, opts: { quiet: boolean }) => Promise<boolean>
+type RunOne = (name: string, action: BulkAction, opts: { quiet: boolean }) => Promise<boolean>
 
-const VERB: Record<PendingAction, string> = {
+const VERB: Record<BulkAction, string> = {
   start: "Started",
   stop: "Stopped",
   restart: "Restarted",
   rebuild: "Rebuilt",
-  remove: "Removed",
 }
 
 /**
@@ -20,7 +20,7 @@ const VERB: Record<PendingAction, string> = {
  */
 export async function runBatch(
   names: string[],
-  action: PendingAction,
+  action: BulkAction,
   runOne: RunOne,
   onPending: (name: string, action: PendingAction | null) => void,
 ): Promise<string[]> {

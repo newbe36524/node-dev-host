@@ -21,6 +21,7 @@ import {
 import { type PendingAction, useCommands } from "@/hooks/useCommands"
 import { useMediaQuery } from "@/hooks/useMediaQuery"
 import type { ContainerAction, ContainerInfo } from "@/lib/api"
+import { StartPrompt } from "./StartPrompt"
 import { LogsSheet } from "./LogsSheet"
 
 /** Tailwind's md breakpoint. Below it the row actions collapse into a menu. */
@@ -34,6 +35,8 @@ interface ContainerActionsProps {
   onPending?: (name: string, action: PendingAction | null) => void
   /** When given, Logs asks the page to open its one shared sheet. Without it the row owns a sheet of its own. */
   onShowLogs?: (name: string) => void
+  /** Lets the dashboard share one StartPrompt across row and palette commands. */
+  onStart?: (name: string) => void
   /**
    * For a long list: wide rows keep Logs and fold the rest into a menu. Five buttons on each of fifty
    * rows is two hundred and fifty buttons, and a red Remove on every line.
@@ -41,29 +44,41 @@ interface ContainerActionsProps {
   dense?: boolean
 }
 
-export function ContainerActions({ container, readOnly, onChanged, onPending, onShowLogs, dense = false }: ContainerActionsProps) {
+export function ContainerActions({ container, readOnly, onChanged, onPending, onShowLogs, onStart, dense = false }: ContainerActionsProps) {
   const [busy, setBusy] = useState(false)
   const [logsOpen, setLogsOpen] = useState(false)
-  const [removeOpen, setRemoveOpen] = useState(false)
+  const [confirm, setConfirm] = useState<"remove" | "delete">()
+  const [startOpen, setStartOpen] = useState(false)
   const wide = useMediaQuery(WIDE_QUERY)
   const disabled = readOnly || busy
   const { name, port, state } = container
   const running = state === "running"
   // The menu stays enabled in read-only mode so Logs can still be opened; mutating items are disabled.
   const lifecycle: ContainerAction[] = running ? ["rebuild", "restart", "stop"] : ["start"]
+  const nodeActions = container.registered ? (["recreate", "extend", "stop-auto-start"] as const) : []
+  const canRemove = state !== "not created"
 
   const commands = useCommands({ onPending, onChanged })
 
-  async function run(action: PendingAction) {
+  async function run(action: PendingAction, options?: { autoStart?: boolean }, prompted = false) {
+    if (action === "start" && !prompted && !options?.autoStart && container.registered && container.schedule.state !== "active") {
+      if (onStart) onStart(name)
+      else setStartOpen(true)
+      return
+    }
     setBusy(true)
     try {
-      await commands.run(name, action)
+      await commands.run(name, action, options)
     } finally {
       setBusy(false)
     }
   }
 
   const showLogs = () => (onShowLogs ? onShowLogs(name) : setLogsOpen(true))
+  const chooseStart = (autoStart: boolean) => {
+    setStartOpen(false)
+    void run("start", { autoStart }, true)
+  }
 
   const label: Record<ContainerAction, string> = {
     start: "Start",
@@ -87,12 +102,24 @@ export function ContainerActions({ container, readOnly, onChanged, onPending, on
               {label[action]}
             </Button>
           ))}
+          {nodeActions.map((action) => (
+            <Button key={action} size="sm" variant="outline" disabled={disabled} onClick={() => run(action)}>
+              {action === "recreate" ? "Recreate" : action === "extend" ? "Extend 7 days" : "Stop auto-start"}
+            </Button>
+          ))}
           <Button size="sm" variant="ghost" onClick={showLogs}>
             Logs
           </Button>
-          <Button size="sm" variant="destructive" disabled={disabled} onClick={() => setRemoveOpen(true)}>
-            Remove
-          </Button>
+          {canRemove && (
+            <Button size="sm" variant="destructive" disabled={disabled} onClick={() => setConfirm("remove")}>
+              Remove container
+            </Button>
+          )}
+          {container.registered && (
+            <Button size="sm" variant="destructive" disabled={disabled} onClick={() => setConfirm("delete")}>
+              Delete node
+            </Button>
+          )}
         </div>
       ) : (
         <div className="flex items-center gap-1">
@@ -123,11 +150,24 @@ export function ContainerActions({ container, readOnly, onChanged, onPending, on
                 {label[action]}
               </DropdownMenuItem>
             ))}
+            {nodeActions.length > 0 && <DropdownMenuSeparator />}
+            {nodeActions.map((action) => (
+              <DropdownMenuItem key={action} disabled={disabled} onSelect={() => run(action)}>
+                {action === "recreate" ? "Recreate" : action === "extend" ? "Extend 7 days" : "Stop auto-start"}
+              </DropdownMenuItem>
+            ))}
             <DropdownMenuSeparator />
             <DropdownMenuItem onSelect={showLogs}>Logs</DropdownMenuItem>
-            <DropdownMenuItem variant="destructive" disabled={disabled} onSelect={() => setRemoveOpen(true)}>
-              Remove
-            </DropdownMenuItem>
+            {canRemove && (
+              <DropdownMenuItem variant="destructive" disabled={disabled} onSelect={() => setConfirm("remove")}>
+                Remove container
+              </DropdownMenuItem>
+            )}
+            {container.registered && (
+              <DropdownMenuItem variant="destructive" disabled={disabled} onSelect={() => setConfirm("delete")}>
+                Delete node
+              </DropdownMenuItem>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
         </div>
@@ -135,18 +175,24 @@ export function ContainerActions({ container, readOnly, onChanged, onPending, on
 
       {!onShowLogs && <LogsSheet name={name} open={logsOpen} onOpenChange={setLogsOpen} />}
 
-      <AlertDialog open={removeOpen} onOpenChange={setRemoveOpen}>
+      <StartPrompt name={name} open={startOpen} onOpenChange={setStartOpen} onChoose={chooseStart} />
+
+      <AlertDialog open={confirm !== undefined} onOpenChange={(open) => !open && setConfirm(undefined)}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Remove {name}?</AlertDialogTitle>
+            <AlertDialogTitle>{confirm === "delete" ? `Delete ${name}?` : `Remove ${name}?`}</AlertDialogTitle>
             <AlertDialogDescription>
-              Removing {name} deletes the container and frees host port {port}.
+              {confirm === "delete"
+                ? `Deleting ${name} removes its container and saved node record, and frees host port ${port}.`
+                : `Removing ${name} deletes the container and frees host port ${port}. ${
+                    container.registered ? "The saved node record remains." : "No node record is affected."
+                  }`}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction variant="destructive" onClick={() => run("remove")}>
-              Remove
+            <AlertDialogAction variant="destructive" onClick={() => run(confirm === "delete" ? "delete-node" : "remove")}>
+              {confirm === "delete" ? "Delete node" : "Remove container"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

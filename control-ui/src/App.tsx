@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Loader2, RefreshCw, Search, ShieldAlert } from "lucide-react"
+import { Loader2, Plus, RefreshCw, ScanLine, Search, ShieldAlert } from "lucide-react"
 import { ThemeProvider } from "next-themes"
 import { toast } from "sonner"
 import { CommandPalette } from "@/components/CommandPalette"
 import { BulkBar } from "@/components/BulkBar"
+import { AddNodeDialog } from "@/components/AddNodeDialog"
 import { ContainerTable } from "@/components/ContainerTable"
 import { FleetRibbon, TILE_LIMIT } from "@/components/FleetRibbon"
 import { FleetToolbar } from "@/components/FleetToolbar"
 import { LogsSheet } from "@/components/LogsSheet"
 import { SessionTimeline } from "@/components/SessionTimeline"
+import { StartPrompt } from "@/components/StartPrompt"
 import { ThemeToggle } from "@/components/ThemeToggle"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -21,7 +23,7 @@ import { useFleetFilter } from "@/hooks/useFleetFilter"
 import { usePending } from "@/hooks/usePending"
 import { usePolling } from "@/hooks/usePolling"
 import { useSessionLog } from "@/hooks/useSessionLog"
-import { errorText, listContainers } from "@/lib/api"
+import { errorText, listContainers, scanNodes, type ScanResult } from "@/lib/api"
 import { badgeState, type BulkAction, EMPTY_FILTER, filterActive, filterFleet, fleetChanged, sortFleet, toggleState } from "@/lib/fleet"
 import { transition } from "@/lib/viewTransition"
 
@@ -74,6 +76,9 @@ function Dashboard() {
   const [selectedId, setSelectedId] = useState<string>()
   const [logs, setLogs] = useState<{ name: string; open: boolean }>()
   const [paletteOpen, setPaletteOpen] = useState(false)
+  const [addNodeOpen, setAddNodeOpen] = useState(false)
+  const [startName, setStartName] = useState<string>()
+  const [scanResult, setScanResult] = useState<ScanResult>()
   const searchRef = useRef<HTMLInputElement>(null)
 
   // The cursor never points at a row that has gone, or one the filter hides.
@@ -139,13 +144,44 @@ function Dashboard() {
     transition(() => setLogs({ name, open: true }))
   }, [])
 
+  const requestStart = useCallback(
+    (name: string) => {
+      const target = containers?.find((container) => container.name === name)
+      if (target?.registered && target.schedule.state !== "active") {
+        setStartName(name)
+      } else {
+        void commands.run(name, "start")
+      }
+    },
+    [containers, commands.run],
+  )
+
+  const chooseStart = useCallback(
+    (autoStart: boolean) => {
+      const name = startName
+      setStartName(undefined)
+      if (name) void commands.run(name, "start", { autoStart })
+    },
+    [startName, commands.run],
+  )
+
+  const scan = useCallback(async () => {
+    try {
+      setScanResult(await scanNodes())
+      afterChange()
+    } catch (err) {
+      toast.error(`Scan failed. ${errorText(err)}`)
+    }
+  }, [afterChange])
+
   const run = useCallback(
     (name: string, action: Parameters<typeof commands.run>[1]) => {
-      void commands.run(name, action)
+      if (action === "start") requestStart(name)
+      else void commands.run(name, action)
     },
     // `commands.run` closes over stable callbacks only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [setPending, afterChange],
+    [requestStart, setPending, afterChange],
   )
 
   const bulk = useCallback(
@@ -220,6 +256,17 @@ function Dashboard() {
           }
           break
         }
+        case "s":
+          if (!selected) {
+            toast.info("Select a row first with j and k.")
+          } else if (list?.readOnly) {
+            toast.info("Read-only mode is on, so changes are disabled.")
+          } else if (selected.state === "running") {
+            toast.info(`${selected.name} is already running.`)
+          } else {
+            run(selected.name, "start")
+          }
+          break
       }
     }
     document.addEventListener("keydown", onKeyDown)
@@ -239,6 +286,19 @@ function Dashboard() {
           </p>
         </div>
         <div className="flex items-center gap-3">
+          <Button size="sm" variant="outline" disabled={!list?.persistence?.writable || list.readOnly} onClick={() => setAddNodeOpen(true)}>
+            <Plus aria-hidden="true" />
+            Add node
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={!list?.persistence?.writable || list.readOnly}
+            onClick={() => void scan()}
+          >
+            <ScanLine aria-hidden="true" />
+            Scan
+          </Button>
           <Button size="sm" variant="outline" onClick={() => setPaletteOpen(true)} aria-keyshortcuts="Control+K Meta+K">
             <Search aria-hidden="true" />
             Commands
@@ -273,6 +333,30 @@ function Dashboard() {
           </AlertDescription>
         </Alert>
       )}
+      {list?.persistence && !list.persistence.mounted && (
+        <Alert data-testid="persistence-not-mounted">
+          <AlertTitle>Node records are not on a mounted volume</AlertTitle>
+          <AlertDescription>
+            Node records may be lost if the control container is recreated.{" "}
+            {list.persistence.warning ?? `They are stored at ${list.persistence.dir}, but that directory is not a separate mount.`}
+          </AlertDescription>
+        </Alert>
+      )}
+      {list?.persistence && !list.persistence.writable && (
+        <Alert variant="destructive" data-testid="persistence-not-writable">
+          <AlertTitle>Node records cannot be saved</AlertTitle>
+          <AlertDescription>
+            {list.persistence.warning ?? `The control server cannot write to ${list.persistence.dir}. Add, scan and schedule changes are unavailable.`}
+          </AlertDescription>
+        </Alert>
+      )}
+      {scanResult && (
+        <p role="status" data-testid="scan-result" className="text-sm text-muted-foreground">
+          Scan complete: {scanResult.imported.length} imported, {scanResult.skipped.length} skipped
+          {scanResult.imported.length > 0 && ` — ${scanResult.imported.join(", ")}`}
+          {scanResult.skipped.map(({ name, reason }) => ` — ${name}: ${reason}`)}
+        </p>
+      )}
 
       {list ? (
         <>
@@ -301,6 +385,7 @@ function Dashboard() {
                 pending={pending}
                 onPending={setPending}
                 onShowLogs={showLogs}
+                onStart={requestStart}
                 logsId={logs?.open ? logsContainer?.id : undefined}
                 checked={list.containers.length > 1 ? tickedVisible : undefined}
                 onTick={tick}
@@ -317,7 +402,8 @@ function Dashboard() {
               <kbd className="rounded-sm border px-1">j</kbd> <kbd className="rounded-sm border px-1">k</kbd> select a row ·{" "}
               <kbd className="rounded-sm border px-1">x</kbd> tick · <kbd className="rounded-sm border px-1">f</kbd> next failed ·{" "}
               <kbd className="rounded-sm border px-1">/</kbd> filter · <kbd className="rounded-sm border px-1">L</kbd> logs ·{" "}
-              <kbd className="rounded-sm border px-1">R</kbd> rebuild · <kbd className="rounded-sm border px-1">{PALETTE_KEY}</kbd> all commands
+              <kbd className="rounded-sm border px-1">R</kbd> rebuild · <kbd className="rounded-sm border px-1">S</kbd> start ·{" "}
+              <kbd className="rounded-sm border px-1">{PALETTE_KEY}</kbd> all commands
             </p>
           )}
           <SessionTimeline log={log} />
@@ -334,6 +420,7 @@ function Dashboard() {
           onOpenChange={(open) => setLogs((prev) => (prev ? { ...prev, open } : prev))}
         />
       )}
+      {startName && <StartPrompt name={startName} open onOpenChange={(open) => !open && setStartName(undefined)} onChoose={chooseStart} />}
       <CommandPalette
         open={paletteOpen}
         onOpenChange={setPaletteOpen}
@@ -343,12 +430,20 @@ function Dashboard() {
         readOnly={list?.readOnly ?? false}
         run={run}
         bulk={bulk}
+        scan={() => void scan()}
         showLogs={showLogs}
         goTo={goTo}
         setFilter={setFilter}
         refresh={refresh}
       />
       <BulkBar selected={tickedContainers} readOnly={list?.readOnly ?? false} onRun={bulk} onClear={clearTicks} />
+      <AddNodeDialog
+        open={addNodeOpen}
+        onOpenChange={setAddNodeOpen}
+        nextPort={list?.nextPort ?? null}
+        disabled={!list?.persistence?.writable || list.readOnly}
+        onAdded={afterChange}
+      />
       <Toaster />
     </main>
   )

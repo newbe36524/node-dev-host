@@ -38,6 +38,11 @@ export function container(overrides: Partial<ContainerInfo> = {}): ContainerInfo
     state: "running",
     health: "healthy",
     build: { state: "ok", builds: 3, failures: 0, finishedAt: "2026-11-11T10:00:00Z" },
+    registered: false,
+    schedule: { state: "none", until: null, daysLeft: null },
+    operation: null,
+    error: null,
+    warning: null,
     ...overrides,
   }
 }
@@ -65,7 +70,7 @@ export function setViewport(wide: boolean) {
  * A host at its limit: 50 containers named nd-site-01 to nd-site-50.
  * 03, 17 and 41 have failed, 08 and 22 are building, 12 and 33 are stopped; the other 43 are ok.
  */
-export function fleet50(): { readOnly: boolean; containers: ContainerInfo[] } {
+export function fleet50(): { readOnly: boolean; containers: ContainerInfo[]; persistence: { dir: string; writable: boolean; mounted: boolean; warning: null }; nextPort: number } {
   const failed = new Set([3, 17, 41])
   const building = new Set([8, 22])
   const stopped = new Set([12, 33])
@@ -78,5 +83,5 @@ export function fleet50(): { readOnly: boolean; containers: ContainerInfo[] } {
     if (building.has(n)) return { ...base, build: { state: "building" as const, builds: 1, failures: 0, finishedAt: null } }
     return base
   })
-  return { readOnly: false, containers }
+  return { readOnly: false, containers, persistence: { dir: "/var/lib/dev-host/control", writable: true, mounted: true, warning: null }, nextPort: 43100 }
 }

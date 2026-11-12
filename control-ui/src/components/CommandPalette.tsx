@@ -32,6 +32,7 @@ interface BuildArgs {
   goTo: (id: string) => void
   setFilter: (filter: FleetFilter) => void
   refresh: () => void
+  scan: () => void
   setTheme: (theme: string) => void
 }
 
@@ -41,7 +42,7 @@ export const MAX_SHOWN = 30
 const ACTION_LABEL = { start: "Start", rebuild: "Rebuild", restart: "Restart", stop: "Stop" } as const
 
 /** The commands the palette offers. Remove is left out on purpose: it needs a confirmation, which lives on the row. */
-export function buildPaletteItems({ containers, visible, filter, readOnly, run, bulk, showLogs, goTo, setFilter, refresh, setTheme }: BuildArgs): PaletteItem[] {
+export function buildPaletteItems({ containers, visible, filter, readOnly, run, bulk, showLogs, goTo, setFilter, refresh, scan, setTheme }: BuildArgs): PaletteItem[] {
   const items: PaletteItem[] = []
 
   // Commands that act on a group come first and are the whole list until the visitor types.
@@ -81,20 +82,28 @@ export function buildPaletteItems({ containers, visible, filter, readOnly, run, 
   for (const c of containers) {
     items.push({ id: `go:${c.id}`, label: `Go to ${c.name}`, detail: badgeState(c), keywords: "select jump find", searchOnly: true, run: () => goTo(c.id) })
     items.push({ id: `logs:${c.id}`, label: `Logs: ${c.name}`, detail: c.name, keywords: "log output", searchOnly: true, run: () => showLogs(c.name) })
-    items.push({
-      id: `open:${c.id}`,
-      label: `Open ${c.name}`,
-      detail: `port ${c.port}`,
-      keywords: "browse visit preview",
-      searchOnly: true,
-      run: () => window.open(openUrl(c.port), "_blank", "noopener,noreferrer"),
-    })
+    if (c.state !== "not created") {
+      items.push({
+        id: `open:${c.id}`,
+        label: `Open ${c.name}`,
+        detail: `port ${c.port}`,
+        keywords: "browse visit preview",
+        searchOnly: true,
+        run: () => window.open(openUrl(c.port), "_blank", "noopener,noreferrer"),
+      })
+    }
     if (readOnly) continue
     const lifecycle = c.state === "running" ? (["rebuild", "restart", "stop"] as const) : (["start"] as const)
     for (const action of lifecycle) {
       items.push({ id: `${action}:${c.id}`, label: `${ACTION_LABEL[action]} ${c.name}`, detail: c.name, searchOnly: true, run: () => run(c.name, action) })
     }
+    if (c.registered) {
+      items.push({ id: `recreate:${c.id}`, label: `Recreate ${c.name}`, detail: c.name, searchOnly: true, run: () => run(c.name, "recreate") })
+      items.push({ id: `extend:${c.id}`, label: `Extend 7 days: ${c.name}`, detail: c.name, searchOnly: true, run: () => run(c.name, "extend") })
+      items.push({ id: `stop-auto-start:${c.id}`, label: `Stop auto-start: ${c.name}`, detail: c.name, searchOnly: true, run: () => run(c.name, "stop-auto-start") })
+    }
   }
+  if (!readOnly) items.push({ id: "scan", label: "Scan for existing nodes", keywords: "import discover containers", run: scan })
   items.push({ id: "refresh", label: "Refresh now", keywords: "poll reload update", run: refresh })
   for (const theme of ["light", "dark", "system"]) {
     items.push({ id: `theme:${theme}`, label: `Theme: ${theme}`, keywords: "appearance colour mode", run: () => setTheme(theme) })
@@ -138,7 +147,7 @@ export function CommandPalette({ open, onOpenChange, ...args }: CommandPalettePr
     () => buildPaletteItems({ ...args, setTheme }),
     // `args` members are stable callbacks and the container list; spreading keeps the dependency list honest.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [args.containers, args.visible, args.filter, args.readOnly, args.run, args.bulk, args.showLogs, args.goTo, args.setFilter, args.refresh, setTheme],
+    [args.containers, args.visible, args.filter, args.readOnly, args.run, args.bulk, args.showLogs, args.goTo, args.setFilter, args.refresh, args.scan, setTheme],
   )
   const matches = useMemo(
     () => (query.trim() ? filterItems(items, query) : items.filter((item) => !item.searchOnly)),

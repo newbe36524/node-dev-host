@@ -1,7 +1,7 @@
 import { render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { ContainerTable, openUrl } from "@/components/ContainerTable"
-import { container } from "@/test/fakeApi"
+import { container, setViewport } from "@/test/fakeApi"
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -84,5 +84,70 @@ describe("ContainerTable", () => {
         expect(button).toBeDisabled()
       }
     }
+  })
+
+  it("shows active and ended auto-start windows as quiet time values", () => {
+    render(
+      <ContainerTable
+        containers={[
+          container({ schedule: { state: "active", until: "2026-11-18T10:00:00Z", daysLeft: 6 } }),
+          container({ id: "def456", name: "nd-site-b", schedule: { state: "ended", until: "2026-11-10T10:00:00Z", daysLeft: 0 } }),
+          container({ id: "ghi789", name: "nd-site-c" }),
+        ]}
+        readOnly={false}
+        onChanged={() => {}}
+      />,
+    )
+
+    const active = screen.getByRole("row", { name: /nd-site-a/ })
+    const activeSchedule = within(active).getAllByRole("cell")[7]
+    expect(within(activeSchedule).getByText(/6 days left/)).toBeInTheDocument()
+    expect(within(activeSchedule).getByText(/Until/).tagName).toBe("TIME")
+    const ended = screen.getByRole("row", { name: /nd-site-b/ })
+    const endedSchedule = within(ended).getAllByRole("cell")[7]
+    expect(within(endedSchedule).getByText(/Ended/)).toBeInTheDocument()
+    const noWindow = screen.getByRole("row", { name: /nd-site-c/ })
+    expect(within(within(noWindow).getAllByRole("cell")[7]).getByText("—")).toBeInTheDocument()
+    expect(screen.getByRole("columnheader", { name: "Auto-start" })).toHaveClass("hidden", "md:table-cell")
+  })
+
+  it("keeps an unregistered row unscheduled and omits node-only actions", () => {
+    render(<ContainerTable containers={[container({ state: "exited" })]} readOnly={false} onChanged={() => {}} />)
+
+    const row = screen.getByRole("row", { name: /nd-site-a/ })
+    expect(within(row).getByText("—")).toBeInTheDocument()
+    expect(within(row).queryByRole("button", { name: "Recreate" })).toBeNull()
+    expect(within(row).queryByRole("button", { name: "Delete node" })).toBeNull()
+  })
+
+  it("shows a failed operation, error and warning on a narrow not-created card", () => {
+    const restoreViewport = setViewport(false)
+    render(
+      <ContainerTable
+        containers={[
+          container({
+            id: "node:nd-site-a",
+            state: "not created",
+            registered: true,
+            operation: { phase: "creating", since: "2026-11-11T10:00:00Z" },
+            error: "Docker refused the create",
+            warning: "Latest image could not be pulled: pull access denied for node-dev-host, repository does not exist or may require 'docker login'",
+          }),
+        ]}
+        readOnly={false}
+        onChanged={() => {}}
+      />,
+    )
+
+    const row = screen.getByRole("row", { name: /nd-site-a/ })
+    const state = within(row).getByText("not created")
+    expect(state).toHaveClass("border-dashed")
+    expect(within(row).getByText("stopped", { selector: "[data-state]" })).toBeInTheDocument()
+    expect(within(row).getByTestId("pending-action")).toHaveTextContent("creating…")
+    expect(within(row).getByTestId("row-error")).toHaveTextContent("Docker refused the create")
+    expect(within(row).getByTestId("row-warning")).toHaveTextContent("Latest image could not be pulled")
+    expect(within(row).getByTestId("row-warning")).toHaveClass("w-72", "break-words")
+    expect(within(row).queryByRole("link", { name: "Open" })).toBeNull()
+    restoreViewport()
   })
 })

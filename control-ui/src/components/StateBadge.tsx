@@ -32,3 +32,11 @@ export function StateBadge({ state, transitionName }: { state: BuildBadgeState; 
     </Badge>
   )
 }
+
+export function ContainerStateBadge({ state }: { state: string }) {
+  return (
+    <Badge variant="outline" className={state === "not created" ? "border-dashed text-muted-foreground" : undefined}>
+      {state}
+    </Badge>
+  )
+}

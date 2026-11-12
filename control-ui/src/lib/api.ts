@@ -3,11 +3,13 @@
 
 export type ContainerState =
   | "running"
+  | "created"
   | "exited"
   | "created"
   | "paused"
   | "restarting"
   | "dead"
+  | "not created"
 
 export type ContainerHealth = "healthy" | "unhealthy" | "starting"
 
@@ -26,6 +28,17 @@ export interface ContainerBuild {
   finishedAt: string | null
 }
 
+export interface NodeSchedule {
+  state: "active" | "ended" | "none"
+  until: string | null
+  daysLeft: number | null
+}
+
+export interface NodeOperation {
+  phase: "pulling" | "creating" | "starting" | "removing"
+  since: string
+}
+
 export interface ContainerInfo {
   name: string
   id: string
@@ -34,14 +47,33 @@ export interface ContainerInfo {
   state: ContainerState
   health: ContainerHealth | null
   build: ContainerBuild
+  registered: boolean
+  schedule: NodeSchedule
+  operation: NodeOperation | null
+  error: string | null
+  warning: string | null
+}
+
+export interface Persistence {
+  dir: string
+  writable: boolean
+  mounted: boolean
+  warning: string | null
 }
 
 export interface ContainerList {
   readOnly: boolean
   containers: ContainerInfo[]
+  persistence: Persistence
+  nextPort: number | null
 }
 
 export type ContainerAction = "start" | "stop" | "restart" | "rebuild"
+export type NodeInput = { name: string; workspace: string; port: number; image: string; env?: Record<string, string> }
+export interface ScanResult {
+  imported: string[]
+  skipped: { name: string; reason: string }[]
+}
 
 export const CONTROL_HEADER = "X-Dev-Host-Control"
 
@@ -68,14 +100,15 @@ async function errorMessage(res: Response): Promise<string> {
   return `Request failed with HTTP ${res.status}`
 }
 
-async function request(method: "GET" | "POST" | "DELETE", path: string): Promise<Response> {
+async function request(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<Response> {
   const headers = new Headers()
   if (method !== "GET") {
     headers.set(CONTROL_HEADER, "1")
   }
+  if (body !== undefined) headers.set("Content-Type", "application/json")
   let res: Response
   try {
-    res = await fetch(path, { method, headers })
+    res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) })
   } catch {
     throw new ApiError("Cannot reach the control server", 0)
   }
@@ -90,12 +123,37 @@ export async function listContainers(): Promise<ContainerList> {
   return (await res.json()) as ContainerList
 }
 
-export async function runContainerAction(name: string, action: ContainerAction): Promise<void> {
-  await request("POST", `/api/containers/${encodeURIComponent(name)}/${action}`)
+export async function runContainerAction(name: string, action: ContainerAction, autoStart = false): Promise<void> {
+  await request("POST", `/api/containers/${encodeURIComponent(name)}/${action}`, autoStart ? { autoStart: true } : undefined)
 }
 
 export async function removeContainer(name: string): Promise<void> {
   await request("DELETE", `/api/containers/${encodeURIComponent(name)}`)
+}
+
+export async function recreateContainer(name: string): Promise<void> {
+  await request("POST", `/api/containers/${encodeURIComponent(name)}/recreate`)
+}
+
+export async function addNode(node: NodeInput): Promise<void> {
+  await request("POST", "/api/nodes", node)
+}
+
+export async function deleteNode(name: string): Promise<void> {
+  await request("DELETE", `/api/nodes/${encodeURIComponent(name)}`)
+}
+
+export async function extendAutoStart(name: string): Promise<void> {
+  await request("POST", `/api/nodes/${encodeURIComponent(name)}/auto-start`)
+}
+
+export async function stopAutoStart(name: string): Promise<void> {
+  await request("DELETE", `/api/nodes/${encodeURIComponent(name)}/auto-start`)
+}
+
+export async function scanNodes(): Promise<ScanResult> {
+  const res = await request("POST", "/api/scan")
+  return (await res.json()) as ScanResult
 }
 
 export async function fetchLogs(name: string, tail = 200): Promise<string> {

@@ -39,16 +39,17 @@ describe("badgeState and summarize", () => {
 })
 
 describe("fleetChanged", () => {
+  const persistence = { dir: "/var/lib/dev-host/control", writable: true, mounted: true, warning: null }
   it("is false for the first list and for an identical one", () => {
-    const list = { readOnly: false, containers: [container()] }
+    const list = { readOnly: false, containers: [container()], persistence, nextPort: 43100 }
     expect(fleetChanged(undefined, list)).toBe(false)
     expect(fleetChanged(list, { ...list })).toBe(false)
   })
 
   it("is true when a state moves or a container appears", () => {
-    const before = { readOnly: false, containers: [container()] }
-    expect(fleetChanged(before, { readOnly: false, containers: [container({ build: failed })] })).toBe(true)
-    expect(fleetChanged(before, { readOnly: false, containers: [container(), container({ id: "b" })] })).toBe(true)
+    const before = { readOnly: false, containers: [container()], persistence, nextPort: 43100 }
+    expect(fleetChanged(before, { ...before, containers: [container({ build: failed })] })).toBe(true)
+    expect(fleetChanged(before, { ...before, containers: [container(), container({ id: "b" })] })).toBe(true)
   })
 })
 
@@ -118,6 +119,11 @@ describe("working a large fleet", () => {
     state,
     health: null,
     build: { state: build, builds: 1, failures: 0, finishedAt: null },
+    registered: false,
+    schedule: { state: "none", until: null, daysLeft: null },
+    operation: null,
+    error: null,
+    warning: null,
   })
   const fleet = [
     mk("nd-site-10", "running", "ok", 43110),

@@ -1,8 +1,18 @@
+import { useCallback } from "react"
 import { toast } from "sonner"
-import { type ContainerAction, errorText, removeContainer, runContainerAction } from "@/lib/api"
+import {
+  type ContainerAction,
+  deleteNode,
+  errorText,
+  extendAutoStart,
+  recreateContainer,
+  removeContainer,
+  runContainerAction,
+  stopAutoStart,
+} from "@/lib/api"
 
 /** What is in flight for a container, shown beside its badge until the next refresh lands. */
-export type PendingAction = ContainerAction | "remove"
+export type PendingAction = ContainerAction | "remove" | "delete-node" | "recreate" | "extend" | "stop-auto-start"
 
 export interface CommandHooks {
   /** Called with the action when it starts, and with null if it failed. */
@@ -17,18 +27,29 @@ export interface CommandHooks {
  */
 export function useCommands({ onPending, onChanged }: CommandHooks) {
   /** `quiet` is for batches: the caller reports one summary and refreshes once, instead of once per container. */
-  async function run(name: string, action: PendingAction, { quiet = false }: { quiet?: boolean } = {}): Promise<boolean> {
-    onPending?.(name, action)
-    try {
-      if (action === "remove") await removeContainer(name)
-      else await runContainerAction(name, action)
-      if (!quiet) onChanged()
-      return true
-    } catch (err) {
-      onPending?.(name, null)
-      if (!quiet) toast.error(`${name}: ${action} failed. ${errorText(err)}`)
-      return false
-    }
-  }
+  const run = useCallback(
+    async (
+      name: string,
+      action: PendingAction,
+      { quiet = false, autoStart = false }: { quiet?: boolean; autoStart?: boolean } = {},
+    ): Promise<boolean> => {
+      onPending?.(name, action)
+      try {
+        if (action === "remove") await removeContainer(name)
+        else if (action === "delete-node") await deleteNode(name)
+        else if (action === "recreate") await recreateContainer(name)
+        else if (action === "extend") await extendAutoStart(name)
+        else if (action === "stop-auto-start") await stopAutoStart(name)
+        else await runContainerAction(name, action, autoStart)
+        if (!quiet) onChanged()
+        return true
+      } catch (err) {
+        onPending?.(name, null)
+        if (!quiet) toast.error(`${name}: ${action} failed. ${errorText(err)}`)
+        return false
+      }
+    },
+    [onChanged, onPending],
+  )
   return { run }
 }

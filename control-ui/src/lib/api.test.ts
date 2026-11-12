@@ -1,5 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { ApiError, fetchLogs, listContainers, removeContainer, runContainerAction } from "@/lib/api"
+import {
+  addNode,
+  ApiError,
+  deleteNode,
+  extendAutoStart,
+  fetchLogs,
+  listContainers,
+  recreateContainer,
+  removeContainer,
+  runContainerAction,
+  scanNodes,
+  stopAutoStart,
+} from "@/lib/api"
 import { jsonResponse, mockFetch, textResponse } from "@/test/fakeApi"
 
 afterEach(() => {
@@ -41,6 +53,44 @@ describe("api client", () => {
     expect(new Headers(init?.headers).get("X-Dev-Host-Control")).toBe("1")
   })
 
+  it("sends JSON and the control header for adding a node", async () => {
+    const spy = mockFetch(() => jsonResponse({ ok: true }))
+    const node = { name: "nd-site-a", workspace: "/srv/site-a", port: 43101, image: "node-dev-host:test", env: { NODE_ENV: "production" } }
+
+    await addNode(node)
+
+    const [url, init] = spy.mock.calls[0]
+    expect(String(url)).toBe("/api/nodes")
+    expect(init?.method).toBe("POST")
+    expect(new Headers(init?.headers).get("X-Dev-Host-Control")).toBe("1")
+    expect(new Headers(init?.headers).get("Content-Type")).toBe("application/json")
+    expect(JSON.parse(String(init?.body))).toEqual(node)
+  })
+
+  it.each([
+    ["delete node", () => deleteNode("nd-site-a"), "DELETE", "/api/nodes/nd-site-a"],
+    ["extend auto-start", () => extendAutoStart("nd-site-a"), "POST", "/api/nodes/nd-site-a/auto-start"],
+    ["stop auto-start", () => stopAutoStart("nd-site-a"), "DELETE", "/api/nodes/nd-site-a/auto-start"],
+    ["recreate", () => recreateContainer("nd-site-a"), "POST", "/api/containers/nd-site-a/recreate"],
+    ["scan", () => scanNodes(), "POST", "/api/scan"],
+  ])("sends the control header on %s", async (_label, call, method, path) => {
+    const spy = mockFetch(() => jsonResponse({ imported: [], skipped: [] }))
+    await call()
+    const [url, init] = spy.mock.calls[0]
+    expect(String(url)).toBe(path)
+    expect(init?.method).toBe(method)
+    expect(new Headers(init?.headers).get("X-Dev-Host-Control")).toBe("1")
+  })
+
+  it("starts with auto-start using a JSON body", async () => {
+    const spy = mockFetch(() => jsonResponse({ ok: true }))
+    await runContainerAction("nd-site-a", "start", true)
+    const [, init] = spy.mock.calls[0]
+    expect(new Headers(init?.headers).get("X-Dev-Host-Control")).toBe("1")
+    expect(new Headers(init?.headers).get("Content-Type")).toBe("application/json")
+    expect(JSON.parse(String(init?.body))).toEqual({ autoStart: true })
+  })
+
   it("maps a JSON error body to its message", async () => {
     mockFetch(() => jsonResponse({ error: "container is busy" }, 409))
 
@@ -55,6 +105,12 @@ describe("api client", () => {
     mockFetch(() => textResponse("<html>oops</html>", 500))
 
     await expect(removeContainer("nd-site-a")).rejects.toThrow("Request failed with HTTP 500")
+  })
+
+  it.each([400, 403, 409, 413, 415, 503])("preserves the server error message for HTTP %i", async (status) => {
+    mockFetch(() => jsonResponse({ error: `failure ${status}` }, status))
+    await expect(addNode({ name: "nd-site-a", workspace: "/srv/site-a", port: 43101, image: "node-dev-host:test" }))
+      .rejects.toMatchObject({ status, message: `failure ${status}` })
   })
 
   it("reports an unreachable server", async () => {

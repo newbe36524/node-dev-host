@@ -1,7 +1,6 @@
 import { useEffect, useRef, type CSSProperties } from "react"
 import { Loader2, ShieldAlert } from "lucide-react"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import type { PendingAction } from "@/hooks/useCommands"
@@ -11,7 +10,7 @@ import { badgeState, relativeAge } from "@/lib/fleet"
 import { cn } from "@/lib/utils"
 import { ContainerActions } from "./ContainerActions"
 import { badgeTransitionName } from "./LogsSheet"
-import { StateBadge } from "./StateBadge"
+import { ContainerStateBadge, StateBadge } from "./StateBadge"
 
 type LocationLike = Pick<Location, "protocol" | "hostname">
 
@@ -29,7 +28,18 @@ const PENDING_WORD: Record<PendingAction, string> = {
   restart: "restarting…",
   rebuild: "rebuilding…",
   remove: "removing…",
+  "delete-node": "deleting…",
+  recreate: "recreating…",
+  extend: "extending…",
+  "stop-auto-start": "updating…",
 }
+
+const OPERATION_WORD = {
+  pulling: "pulling…",
+  creating: "creating…",
+  starting: "starting…",
+  removing: "removing…",
+} as const
 
 /** "12s ago", ticking once a second. The full local time is in the tooltip and the ISO value in `dateTime`. */
 function BuildAge({ iso }: { iso: string | null }) {
@@ -86,6 +96,7 @@ interface ContainerTableProps {
   pending?: Record<string, PendingAction>
   onPending?: (name: string, action: PendingAction | null) => void
   onShowLogs?: (name: string) => void
+  onStart?: (name: string) => void
   /** The container whose logs sheet is open. Its row badge gives up its transition name so the sheet's badge can take it. */
   logsId?: string
   /** Ticked for a batch. When absent the table has no checkbox column. */
@@ -111,6 +122,7 @@ export function ContainerTable({
   pending = {},
   onPending,
   onShowLogs,
+  onStart,
   logsId,
   checked,
   onTick,
@@ -164,6 +176,7 @@ export function ContainerTable({
                 <TableHead className="hidden md:table-cell">Health</TableHead>
                 <TableHead>Build</TableHead>
                 <TableHead className="hidden md:table-cell">Last build</TableHead>
+                <TableHead className="hidden md:table-cell">Auto-start</TableHead>
                 <TableHead>Open</TableHead>
                 <TableHead>Actions</TableHead>
               </TableRow>
@@ -174,6 +187,7 @@ export function ContainerTable({
                 const changed = changedAt[c.id]
                 const recent = changed !== undefined && now - changed < RECENT_MS
                 const inFlight = pending[c.name]
+                const operationWord = c.operation ? OPERATION_WORD[c.operation.phase] : undefined
                 const selected = c.id === selectedId
                 const ticked = checked?.has(c.id) ?? false
                 return (
@@ -212,35 +226,59 @@ export function ContainerTable({
                     {c.image}
                   </TableCell>
                   <TableCell>
-                    <Badge variant="outline">{c.state}</Badge>
+                    <ContainerStateBadge state={c.state} />
                   </TableCell>
                   <TableCell className="hidden md:table-cell">{c.health ?? "—"}</TableCell>
                   <TableCell>
-                    <div className="flex items-center gap-2">
-                      {/* Re-keyed on every change so the ring restarts; absent when nothing changed recently. */}
-                      <span key={recent ? changed : "steady"} className={recent ? "state-ring" : "inline-flex"}>
-                        <StateBadge
-                          state={state}
-                          transitionName={logsId === c.id ? undefined : badgeTransitionName(c.id)}
-                        />
-                      </span>
-                      {inFlight && (
-                        <span className="flex items-center gap-1 text-xs text-muted-foreground" data-testid="pending-action">
-                          <Loader2 className="size-3 animate-spin motion-reduce:animate-none" aria-hidden="true" />
-                          {PENDING_WORD[inFlight]}
+                    <div className="grid gap-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {/* Re-keyed on every change so the ring restarts; absent when nothing changed recently. */}
+                        <span key={recent ? changed : "steady"} className={recent ? "state-ring" : "inline-flex"}>
+                          <StateBadge
+                            state={state}
+                            transitionName={logsId === c.id ? undefined : badgeTransitionName(c.id)}
+                          />
                         </span>
-                      )}
+                        {(operationWord || inFlight) && (
+                          <span className="flex items-center gap-1 text-xs text-muted-foreground" data-testid="pending-action">
+                            <Loader2 className="size-3 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                            {operationWord ?? (inFlight ? PENDING_WORD[inFlight] : "")}
+                          </span>
+                        )}
+                      </div>
+                      {c.error && <span className="block w-72 max-w-full break-words text-xs text-destructive" data-testid="row-error">Fault: {c.error}</span>}
+                      {c.warning && <span className="block w-72 max-w-full break-words text-xs text-muted-foreground" data-testid="row-warning">{c.warning}</span>}
                     </div>
                   </TableCell>
                   <TableCell className="hidden md:table-cell">
                     <BuildAge iso={c.build.finishedAt} />
                   </TableCell>
                   <TableCell>
-                    <Button variant="link" size="sm" asChild>
-                      <a href={openUrl(c.port)} target="_blank" rel="noopener noreferrer">
-                        Open
-                      </a>
-                    </Button>
+                    {c.schedule.state === "active" && c.schedule.until ? (
+                      <span className="text-xs text-muted-foreground">
+                        {c.schedule.daysLeft !== null && `${c.schedule.daysLeft} days left · `}
+                        <time dateTime={c.schedule.until} title={new Date(c.schedule.until).toLocaleString()}>
+                          Until {new Date(c.schedule.until).toLocaleDateString()}
+                        </time>
+                      </span>
+                    ) : c.schedule.state === "ended" && c.schedule.until ? (
+                      <span className="text-xs text-muted-foreground">
+                        Ended <time dateTime={c.schedule.until}>{new Date(c.schedule.until).toLocaleDateString()}</time>
+                      </span>
+                    ) : (
+                      "—"
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {c.state === "not created" ? (
+                      "—"
+                    ) : (
+                      <Button variant="link" size="sm" asChild>
+                        <a href={openUrl(c.port)} target="_blank" rel="noopener noreferrer">
+                          Open
+                        </a>
+                      </Button>
+                    )}
                   </TableCell>
                   <TableCell>
                     <ContainerActions
@@ -249,6 +287,7 @@ export function ContainerTable({
                       onChanged={onChanged}
                       onPending={onPending}
                       onShowLogs={onShowLogs}
+                      onStart={onStart}
                       dense={denseActions}
                     />
                   </TableCell>
