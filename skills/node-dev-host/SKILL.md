@@ -20,13 +20,62 @@ Inside the image: Node 24, `pnpm`, `typescript` (`tsc`), `tsx`, `git`, `curl`, a
 
 Use an exact version tag (`1.2.3`, `1.2.3-demo`, `1.2.3-alpine` or `1.2.3-demo-alpine`) when the user needs a pinned image. All variants run `linux/amd64` and `linux/arm64`. The Debian tags are the default; choose Alpine only on request or when the image size matters.
 
+## Choose the host port
+
+Several containers often share one machine, and fixed ports collide. Every container takes its host port from the range **43100–43299**. The agent picks the port itself on every run. Never publish a fixed port such as `8080` unless the user names one.
+
+Docker is the registry. Nothing is kept in a separate file:
+
+- The port is recorded in the label `node-dev-host.port`, and the container name in `node-dev-host.name`.
+- A port stays reserved while its container exists, running or stopped. `docker rm` frees it.
+- A port that is listening on the host, or published by any other container, counts as taken, so other software is respected.
+- The search starts at a point derived from the container name, so a name gets the same port on every run as long as that port is free.
+
+Procedure:
+
+1. **Name the container** `nd-<project>`. `<project>` is the project folder name in lowercase, with every character outside `a-z0-9` replaced by `-`. Use a name the user gives instead, if they give one.
+2. **Pick the port** with `pick_port` below: `PORT=$(pick_port nd-<project>)`. It returns the port the container already has, if it has one.
+3. **Replace an existing container of that name.** If the container exists and only needs starting, run `docker start` and stop here. Otherwise run `docker rm -f nd-<project>`. That frees the port, so the same port comes back.
+4. **Run** with the port on loopback and the two labels, as in [Run it](#run-it).
+5. **If `docker run` fails**, run `docker rm -f nd-<project>` first. A failed start can leave a container that still holds the label, and the same port would be picked again. Then go back to step 2. Stop after 5 tries and report the error.
+6. **Tell the user** the address `http://127.0.0.1:<PORT>`.
+
+```sh
+pick_port() {
+  local name="$1" port listening taken start c i
+  # The port this container already has, if any.
+  port=$(docker inspect -f '{{index .Config.Labels "node-dev-host.port"}}' "$name" 2>/dev/null)
+  if [ -n "$port" ] && [ "$port" != "<no value>" ]; then echo "$port"; return 0; fi
+  # Taken: listening on the host, published by any container, or reserved by a labelled container.
+  if command -v ss >/dev/null 2>&1; then
+    listening=$(ss -Htln | awk '{print $4}' | sed 's/.*://')
+  else
+    listening=$(lsof -nP -iTCP -sTCP:LISTEN | awk 'NR>1 {print $9}' | sed 's/.*://')
+  fi
+  taken=$( { echo "$listening"
+             docker ps --format '{{.Ports}}' | grep -oE '[0-9]+->' | tr -d '>-'
+             docker ps -a --filter label=node-dev-host.port --format '{{.Label "node-dev-host.port"}}'
+           } | grep -E '^[0-9]+$' | sort -un)
+  start=$(( 43100 + $(printf '%s' "$name" | cksum | cut -d' ' -f1) % 200 ))
+  for i in $(seq 0 199); do
+    c=$(( 43100 + (start - 43100 + i) % 200 ))
+    grep -qx "$c" <<<"$taken" || { echo "$c"; return 0; }
+  done
+  echo "no free port in 43100-43299" >&2
+  return 1
+}
+```
+
+To see the registry, run `docker ps -a --filter label=node-dev-host.port --format 'table {{.Names}}\t{{.Label "node-dev-host.port"}}\t{{.Status}}'`. To release a port, remove its container with `docker rm -f <name>`. Never give a container another container's name, and never reuse a port that a container of another name holds.
+
 ## Run it
 
 Mount the project so that its `package.json` is at the root of `/workspace`:
 
 ```sh
 docker run -d --name <name> \
-  -p <host-port>:<HTTP_PORT> \
+  -p 127.0.0.1:<PORT>:<HTTP_PORT> \
+  --label node-dev-host.port=<PORT> --label node-dev-host.name=<name> \
   -v "<absolute-path-to-project>":/workspace:ro \
   -v node-dev-host-pnpm:/var/lib/dev-host/pnpm \
   [-e VAR=value ...] \
@@ -38,7 +87,7 @@ The cache volume (the shared pnpm store) is part of the default command. See [Sh
 Rules:
 
 - Use an absolute host path (or `"$PWD"` from the project directory). Do not use a relative path.
-- The `-p` host-side port is free to choose. The container-side port must equal `HTTP_PORT` (default `8080`). If `HTTP_PORT` is changed, change the container side of `-p` too.
+- The host port (`<PORT>`) comes from `pick_port` in [Choose the host port](#choose-the-host-port). Never publish a fixed port. The container-side port must equal `HTTP_PORT` (default `8080`). If `HTTP_PORT` is changed, change the container side of `-p` too.
 - Mount the project read-only (`:ro`). The container copies it and never writes to it; install and build run in the copy.
 - Without a `package.json` in `/workspace`, the container stays in state `waiting`. Mount the project when the container is created. A running container cannot gain a mount, so recreate it instead.
 - Keep the container running. Use `--restart unless-stopped` if it should survive a reboot. If Caddy or the build loop dies, the container exits on purpose so that the restart policy can bring it back.
@@ -55,7 +104,8 @@ A new container starts with an empty package cache, so it downloads every depend
 
   ```sh
   mkdir -p "$HOME/.cache/node-dev-host/pnpm"
-  docker run -d --name <name> -p <host-port>:<HTTP_PORT> \
+  docker run -d --name <name> -p 127.0.0.1:<PORT>:<HTTP_PORT> \
+    --label node-dev-host.port=<PORT> --label node-dev-host.name=<name> \
     --user "$(id -u):$(id -g)" -e HOME=/tmp \
     -v "<absolute-path-to-project>":/workspace:ro \
     -v "$HOME/.cache/node-dev-host/pnpm":/var/lib/dev-host/pnpm \
@@ -95,7 +145,7 @@ Polling is deliberate: file-watch events are unreliable across Docker bind mount
 docker exec <name> dev-host status        # last build state as JSON
 docker exec <name> dev-host rebuild       # queue a rebuild; picked up within POLL_INTERVAL seconds
 docker logs <name>                        # build output, prefixed with [dev-host HH:MM:SS]
-curl http://localhost:<host-port>/__dev-host/status.json
+curl http://127.0.0.1:<PORT>/__dev-host/status.json
 ```
 
 `status.json` example: `{"state":"ok","builds":3,"failures":0,"lastExitCode":0,"finishedAt":"2026-11-11T08:00:00Z"}`. While a build runs, it also carries `"reason"`.

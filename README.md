@@ -31,14 +31,18 @@ A git tag `v1.2.3` also publishes `1.2.3`, `1.2.3-demo`, `1.2.3-alpine` and `1.2
 ## Quick start
 
 ```sh
-docker run --rm -p 8080:8080 ghcr.io/newbe36524/node-dev-host:demo
-# open http://localhost:8080
+# Use a free port from 43100-43299. Several containers on one machine must not share a port.
+docker run --rm -p 127.0.0.1:43100:8080 ghcr.io/newbe36524/node-dev-host:demo
+# open http://127.0.0.1:43100
 
-docker run -d --name my-site -p 8080:8080 \
+docker run -d --name nd-my-site -p 127.0.0.1:43101:8080 \
+  --label node-dev-host.port=43101 --label node-dev-host.name=nd-my-site \
   -v "$PWD":/workspace:ro \
   -v node-dev-host-pnpm:/var/lib/dev-host/pnpm \
   ghcr.io/newbe36524/node-dev-host:latest
 ```
+
+The `node-dev-host.port` label records the port, so `docker ps --filter label=node-dev-host.port` lists the ports in use. The skill's [port procedure](skills/node-dev-host/SKILL.md#choose-the-host-port) picks ports the same way for agents.
 
 ## Share the package cache
 
@@ -64,10 +68,10 @@ Or copy `skills/node-dev-host/` into your agent's skills directory.
 
 Example requests once the skill is installed:
 
-- "Serve my Vite project in `~/code/app` with node-dev-host on port 8080."
+- "Serve my Vite project in `~/code/app` with node-dev-host on a free port in 43100-43299."
 - "Proxy `/api` to `localhost:3000` in the node-dev-host container."
 - "Check whether the node-dev-host build failed, and show the log."
-- "Force a rebuild in `my-site`."
+- "Force a rebuild in `nd-my-site`."
 
 The demo project is in [`demo/`](demo) if you want a template.
 
