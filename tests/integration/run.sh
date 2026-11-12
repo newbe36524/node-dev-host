@@ -8,6 +8,11 @@
 # Each scenario starts a real container, waits for dev-host to build, and checks what Caddy serves.
 # The project folder is copied into a temporary directory and mounted read-only, the way the skill
 # tells users to run it. A failed check prints the container logs and makes the script exit 1.
+#
+# Host ports come from the range 43100-43299 and are registered with the same Docker labels the
+# skill uses (node-dev-host.port, node-dev-host.name). That keeps the tests clear of other
+# node-dev-host containers on the same machine. Container names carry the run's PID, so
+# concurrent or repeated runs do not collide either.
 set -uo pipefail
 
 IMAGE="${1:?usage: run.sh <image> <target>}"
@@ -15,8 +20,8 @@ TARGET="${2:?usage: run.sh <image> <target>}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURE="$HERE/fixtures/app"
 WORK="$(mktemp -d)"
-VOLUME="ndit-pnpm-store"
-API_PORT=38475
+RUN="$$"
+VOLUME="ndit-$RUN-pnpm"
 CONTAINERS=()
 API_PID=""
 FAILS=0
@@ -53,17 +58,60 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ---- port registry (the same procedure as skills/node-dev-host/SKILL.md, "Choose the host port") ----
+
+# pick_port NAME: prints the host port for the container NAME, from 43100-43299.
+pick_port() {
+  local name="$1" port listening taken start c i
+  port=$(docker inspect -f '{{index .Config.Labels "node-dev-host.port"}}' "$name" 2>/dev/null)
+  if [ -n "$port" ] && [ "$port" != "<no value>" ]; then echo "$port"; return 0; fi
+  if command -v ss >/dev/null 2>&1; then
+    listening=$(ss -Htln | awk '{print $4}' | sed 's/.*://')
+  else
+    listening=$(lsof -nP -iTCP -sTCP:LISTEN | awk 'NR>1 {print $9}' | sed 's/.*://')
+  fi
+  taken=$( { echo "$listening"
+             docker ps --format '{{.Ports}}' | grep -oE '[0-9]+->' | tr -d '>-'
+             docker ps -a --filter label=node-dev-host.port --format '{{.Label "node-dev-host.port"}}'
+           } | grep -E '^[0-9]+$' | sort -un)
+  start=$(( 43100 + $(printf '%s' "$name" | cksum | cut -d' ' -f1) % 200 ))
+  for i in $(seq 0 199); do
+    c=$(( 43100 + (start - 43100 + i) % 200 ))
+    grep -qx "$c" <<<"$taken" || { echo "$c"; return 0; }
+  done
+  echo "no free port in 43100-43299" >&2
+  return 1
+}
+in_range() { [ "$1" -ge 43100 ] && [ "$1" -le 43299 ]; }
+
 # ---- container helpers ------------------------------------------------------
 
-# start NAME [docker run options...]: starts $IMAGE with port 8080 on a random loopback port.
+# cn SHORT: the container name for a scenario in this run.
+cn() { echo "ndit-$RUN-$1"; }
+
+# start SHORT [docker run options...]: starts $IMAGE on a registered port from 43100-43299.
 start() {
-  local name="$1"; shift
+  local name port
+  name="$(cn "$1")"; shift
   CONTAINERS+=("$name")
-  docker run -d --name "$name" -p 127.0.0.1::8080 "$@" "$IMAGE" >/dev/null
+  # Another process may take the port between pick and run. Then remove the failed container
+  # (it still holds the label) and pick again, as the skill describes.
+  for _ in 1 2 3 4 5; do
+    port="$(pick_port "$name")" || { fail "no free port for $name"; return 1; }
+    if docker run -d --name "$name" -p "127.0.0.1:$port:8080" \
+         --label "node-dev-host.port=$port" --label "node-dev-host.name=$name" \
+         "$@" "$IMAGE" >/dev/null 2>&1; then
+      check "port $port for $name is in 43100-43299" in_range "$port"
+      return 0
+    fi
+    docker rm -f "$name" >/dev/null 2>&1
+  done
+  fail "could not start $name after 5 tries"
+  return 1
 }
-port()    { docker port "$1" 8080/tcp | head -n1 | sed 's/.*://'; }
+port()    { docker port "$(cn "$1")" 8080/tcp | head -n1 | sed 's/.*://'; }
 url()     { echo "http://127.0.0.1:$(port "$1")$2"; }
-status()  { docker exec "$1" dev-host status 2>/dev/null; }
+status()  { docker exec "$(cn "$1")" dev-host status 2>/dev/null; }
 state()   { status "$1" | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p'; }
 builds()  { status "$1" | sed -n 's/.*"builds":\([0-9]*\).*/\1/p'; }
 
@@ -79,7 +127,7 @@ poll() {
 
 state_is()     { [ "$(state "$1")" = "$2" ]; }
 builds_above() { [ "$(builds "$1")" -gt "$2" ]; }
-healthy()      { [ "$(docker inspect -f '{{.State.Health.Status}}' "$1")" = healthy ]; }
+healthy()      { [ "$(docker inspect -f '{{.State.Health.Status}}' "$(cn "$1")")" = healthy ]; }
 body_has()     { curl -fsS "$(url "$1" "$2")" 2>/dev/null | grep -q -- "$3"; }
 body_lacks()   { ! curl -fsS "$(url "$1" "$2")" 2>/dev/null | grep -q -- "$3"; }
 header_value() { curl -sI "$(url "$1" "$2")" | tr -d '\r' | sed -n "s/^$3: //Ip"; }
@@ -138,7 +186,7 @@ test_host() {
 
   log "host: dev-host rebuild triggers a build"
   local before_builds; before_builds="$(builds host)"
-  docker exec host dev-host rebuild >/dev/null
+  docker exec "$(cn host)" dev-host rebuild >/dev/null
   check "a manual build finishes" poll 120 builds_above host "$before_builds"
   check "status is ok after the manual build" poll 120 state_is host ok
 }
@@ -152,15 +200,18 @@ test_waiting() {
 
 test_api_proxy() {
   log "host: /api/* is proxied to API_UPSTREAM"
+  local api_port
+  api_port="$(pick_port "$(cn api-upstream)")" || { fail "no free port for the API upstream"; return 1; }
+  check "API upstream port $api_port is in 43100-43299" in_range "$api_port"
   node -e "require('http').createServer((q, s) => {
     s.setHeader('content-type', 'application/json');
     s.end(JSON.stringify({ from: 'upstream', path: q.url }));
-  }).listen($API_PORT, '0.0.0.0')" &
+  }).listen($api_port, '0.0.0.0')" &
   API_PID=$!
   fresh_project api
   start api -v "$WORK/api:/workspace:ro" \
     --add-host=host.docker.internal:host-gateway \
-    -e "API_UPSTREAM=host.docker.internal:$API_PORT"
+    -e "API_UPSTREAM=host.docker.internal:$api_port"
   check "reaches state ok" poll 300 state_is api ok
   check "/api/hello reaches the upstream" poll 60 body_has api /api/hello '"from":"upstream"'
   check "other paths are still served from the build" body_has api / marker-v1
@@ -203,11 +254,11 @@ test_shared_cache() {
   start cache-1 -v "$WORK/c1:/workspace:ro" -v "$VOLUME:/var/lib/dev-host/pnpm"
   check "first container reaches state ok" poll 300 state_is cache-1 ok
   check "first container stores packages in the volume" \
-    bash -c "docker logs cache-1 2>&1 | grep -q 'store is at: /var/lib/dev-host/pnpm/store'"
+    bash -c "docker logs $(cn cache-1) 2>&1 | grep -q 'store is at: /var/lib/dev-host/pnpm/store'"
   start cache-2 -v "$WORK/c2:/workspace:ro" -v "$VOLUME:/var/lib/dev-host/pnpm"
   check "second container reaches state ok" poll 300 state_is cache-2 ok
   check "second container reuses the packages from the first" \
-    bash -c "docker logs cache-2 2>&1 | grep -Eq 'reused [1-9][0-9]*, downloaded 0'"
+    bash -c "docker logs $(cn cache-2) 2>&1 | grep -Eq 'reused [1-9][0-9]*, downloaded 0'"
 }
 
 # ---- run ----------------------------------------------------------------------
