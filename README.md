@@ -90,6 +90,10 @@ Build states: `starting`, `building`, `ok`, `failed`, `waiting` and `unknown`. A
 
 Actions reach only labelled containers. Any other name is refused.
 
+### Theme
+
+The **Theme** button in the header switches between Light, Dark and System. System is the default and follows the operating system's colour scheme. The choice is saved in the browser under `localStorage` key `dev-host-theme`, so it is not shared between browsers or devices.
+
 ### Socket risk
 
 The Docker socket is root-equivalent on the host. The process that holds it can run any Docker command, so a compromised control node means a compromised host. Keep the port on loopback (`127.0.0.1:...`). Every request passes these checks:

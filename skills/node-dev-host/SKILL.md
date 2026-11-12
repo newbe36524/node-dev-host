@@ -226,6 +226,8 @@ curl -s -X POST -H "Origin: http://127.0.0.1:<PORT>" -H "X-Dev-Host-Control: 1" 
 
 The dashboard's Build column shows `starting`, `building`, `ok`, `failed`, `waiting` or `unknown`. A stopped container shows `stopped` there, and its API build state is `unknown`.
 
+The header's **Theme** button picks Light, Dark or System (the default). The choice is stored in the user's browser (`localStorage`, key `dev-host-theme`) and is not part of the API, so change it in the browser, not with a request.
+
 ## Configuration
 
 All variables are optional.
