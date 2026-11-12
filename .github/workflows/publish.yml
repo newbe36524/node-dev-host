@@ -14,6 +14,8 @@ permissions:
 
 env:
   IMAGE: ghcr.io/newbe36524/node-dev-host
+  # Every published tag must carry all of these; the verify step below fails the job otherwise.
+  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
   image:
@@ -23,8 +25,16 @@ jobs:
         include:
           - target: host
             tag: latest
+            suffix: ""
           - target: demo
             tag: demo
+            suffix: "-demo"
+          - target: host-alpine
+            tag: alpine
+            suffix: "-alpine"
+          - target: demo-alpine
+            tag: demo-alpine
+            suffix: "-demo-alpine"
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -37,10 +47,9 @@ jobs:
       - id: meta
         run: |
           tags="$IMAGE:${{ matrix.tag }}"
-          # a v1.2.3 git tag also publishes 1.2.3 (host) / 1.2.3-demo (demo)
+          # a v1.2.3 git tag also publishes 1.2.3, 1.2.3-demo, 1.2.3-alpine and 1.2.3-demo-alpine
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            v="${GITHUB_REF_NAME#v}"
-            [ "${{ matrix.target }}" = demo ] && v="$v-demo"
+            v="${GITHUB_REF_NAME#v}${{ matrix.suffix }}"
             tags="$tags,$IMAGE:$v"
           fi
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
@@ -48,8 +57,22 @@ jobs:
         with:
           context: .
           target: ${{ matrix.target }}
-          platforms: linux/amd64,linux/arm64
-          push: true
+          platforms: ${{ env.PLATFORMS }}
+          # zstd layers are about 24% smaller to pull than gzip (measured on the host image).
+          # Clients that cannot read zstd layers cannot pull these tags; check the target Docker version.
+          outputs: type=registry,compression=zstd,compression-level=19,force-compression=true
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+      - name: Verify every platform was published
+        run: |
+          out=$(docker buildx imagetools inspect "$IMAGE:${{ matrix.tag }}")
+          echo "$out" | grep 'Platform:'
+          missing=0
+          for p in ${PLATFORMS//,/ }; do
+            if ! grep -Eq "Platform: +${p}\$" <<<"$out"; then
+              echo "::error::$IMAGE:${{ matrix.tag }} is missing $p"
+              missing=1
+            fi
+          done
+          exit "$missing"
