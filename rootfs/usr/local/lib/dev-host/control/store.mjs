@@ -14,6 +14,7 @@ export function createStore({
   let warning = null;
   let loaded = false;
   let serial = Promise.resolve();
+  let frozen = null; // reason string while a control-node upgrade hands the store over
 
   async function load() {
     if (loaded) return structuredClone(state);
@@ -58,8 +59,27 @@ export function createStore({
     }
   }
 
+  // While frozen, every write fails with status 503 so the caller can retry after the handover.
+  function freeze(reason) {
+    frozen = reason;
+  }
+
+  function thaw() {
+    frozen = null;
+  }
+
+  // Resolves once every write that started before the call has been saved (or failed).
+  async function drain() {
+    await serial;
+  }
+
   function update(mutator) {
     if (readOnly) return Promise.reject(new Error('node store is read-only'));
+    if (frozen) {
+      const err = new Error(`node records are frozen: ${frozen}`);
+      err.status = 503;
+      return Promise.reject(err);
+    }
     const result = serial.then(async () => {
       await load();
       const current = structuredClone(state);
@@ -105,7 +125,7 @@ export function createStore({
     return { dir, writable, mounted, warning };
   }
 
-  return { dir, file, load, getNodes, getSettings, update, status };
+  return { dir, file, load, getNodes, getSettings, update, status, freeze, thaw, drain };
 }
 
 export { DEFAULT_DATA_DIR };

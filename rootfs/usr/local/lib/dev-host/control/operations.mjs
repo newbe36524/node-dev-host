@@ -55,5 +55,9 @@ export function createOperationTracker() {
     operations.set(name, current);
   }
 
-  return { get, snapshot, run, setError };
+  function inFlight() {
+    return [...locks];
+  }
+
+  return { get, snapshot, run, setError, inFlight };
 }

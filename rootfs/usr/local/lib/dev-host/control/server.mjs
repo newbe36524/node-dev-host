@@ -12,6 +12,7 @@
 
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { createDiscovery } from './discovery.mjs';
 import { createDockerClient, DockerUnavailable, dockerMessage, HttpError } from './docker.mjs';
@@ -19,6 +20,7 @@ import { addNodeRecord, createBody, deleteNodeRecord, nextPort, parseAllowedImag
 import { createOperationTracker } from './operations.mjs';
 import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from './schedule.mjs';
 import { createStore } from './store.mjs';
+import { createSelfUpgrade, isLatestTag } from './upgrade.mjs';
 
 const env = process.env;
 const PORT = Number(env.HTTP_PORT) > 0 ? Number(env.HTTP_PORT) : 8080;
@@ -26,6 +28,12 @@ const SOCKET = env.DOCKER_SOCKET || '/var/run/docker.sock';
 const docker = createDockerClient(SOCKET);
 const { dockerRaw } = docker;
 const READONLY = /^(1|true|yes|on)$/i.test(env.CONTROL_READONLY || '');
+// Standby: a candidate started by a self-upgrade. It answers only its health check until the running
+// control node hands the node store over (see upgrade.mjs).
+const STANDBY = /^(1|true|yes|on)$/i.test(env.CONTROL_STANDBY || '');
+// Self-upgrade follows a `latest` image. Set CONTROL_SELF_UPDATE=false to keep the running version.
+const SELF_UPDATE = !/^(0|false|no|off)$/i.test(env.CONTROL_SELF_UPDATE || 'true');
+const SELF_UPDATE_HOURS = Number(env.CONTROL_SELF_UPDATE_INTERVAL_HOURS) > 0 ? Number(env.CONTROL_SELF_UPDATE_INTERVAL_HOURS) : 6;
 const DATA_DIR = env.CONTROL_DATA_DIR || '/var/lib/dev-host/control';
 const ALLOWED_IMAGES = parseAllowedImages(env.CONTROL_ALLOWED_IMAGES || '');
 const WORKSPACE_ROOTS = parseWorkspaceRoots(env.CONTROL_WORKSPACE_ROOTS || '');
@@ -47,7 +55,7 @@ const log = (...parts) => console.log(`[control ${new Date().toISOString().slice
 const store = createStore({ dir: DATA_DIR, readOnly: READONLY, log: (...parts) => log(...parts) });
 const operations = createOperationTracker();
 const discovery = createDiscovery({ docker, store, allowedImages: ALLOWED_IMAGES, workspaceRoots: WORKSPACE_ROOTS, log });
-await store.load();
+const upgrade = createSelfUpgrade({ docker, store, operations, dataDir: DATA_DIR, selfId: os.hostname(), log });
 
 const enc = (name) => encodeURIComponent(name);
 
@@ -347,7 +355,7 @@ async function removeContainer(name) {
 async function health() {
   try {
     const r = await dockerRaw('GET', '/_ping', { timeout: 2000 });
-    if (r.status === 200) return [200, { state: 'ok', role: 'control' }];
+    if (r.status === 200) return [200, { state: 'ok', role: 'control', ...(STANDBY ? { standby: true } : {}) }];
     return [503, { state: 'error', role: 'control', error: `Docker answered HTTP ${r.status}` }];
   } catch (err) {
     return [503, { state: 'error', role: 'control', error: err.message }];
@@ -372,9 +380,10 @@ function sendText(res, status, text) {
 }
 
 function sendError(res, err) {
-  if (!(err instanceof HttpError)) log('internal error:', err);
-  const status = err instanceof HttpError ? err.status : 500;
-  const message = err instanceof HttpError ? err.message : 'internal error';
+  const known = err instanceof HttpError || Number.isInteger(err?.status);
+  if (!known) log('internal error:', err);
+  const status = known ? err.status : 500;
+  const message = known ? err.message : 'internal error';
   if (!res.headersSent) sendJson(res, status, { error: message });
 }
 
@@ -502,6 +511,12 @@ async function serveApi(req, res, url) {
     return sendJson(res, 201, { ok: true, node: result.nodes.find((node) => node.name === body.name) });
   }
 
+  if (parts.length === 2 && parts[1] === 'upgrade') {
+    if (req.method === 'GET') return sendJson(res, 200, upgrade.status());
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'GET, POST' });
+    return sendJson(res, 202, { ok: true, ...upgrade.start({ auto: false }) });
+  }
+
   if (parts.length === 2 && parts[1] === 'scan') {
     if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'POST' });
     return sendJson(res, 200, await discovery.scan());
@@ -590,6 +605,8 @@ async function handle(req, res) {
     }
     // 3. Read-only mode rejects every state change.
     if (READONLY) return sendJson(res, 403, { error: 'read-only mode: changes are disabled' });
+    // 4. Changes pause while this node hands over to a newer control node.
+    if (upgrade.busy()) return sendJson(res, 503, { error: 'control node upgrade in progress: retry shortly' });
   }
 
   if (url.pathname === '/__dev-host/status.json') {
@@ -597,7 +614,10 @@ async function handle(req, res) {
     const [status, body] = await health();
     return sendJson(res, status, body);
   }
-  if (url.pathname === '/api' || url.pathname.startsWith('/api/')) return serveApi(req, res, url);
+  if (url.pathname === '/api' || url.pathname.startsWith('/api/')) {
+    if (STANDBY) return sendJson(res, 503, { error: 'standby control node: waiting to take over from the running one' });
+    return serveApi(req, res, url);
+  }
   return serveStatic(req, res, url.pathname);
 }
 
@@ -605,30 +625,57 @@ const server = http.createServer((req, res) => {
   handle(req, res).catch((err) => sendError(res, err));
 });
 
+// Takes over the node store: load it, import labelled containers, restore auto-start windows, and
+// start the self-upgrade check. Runs at startup, or when a handover makes this standby node active.
+async function activate() {
+  try {
+    await store.load();
+  } catch (err) {
+    log('node store could not be loaded:', err.message || err);
+  }
+  if (READONLY) return;
+  try {
+    await discovery.scan();
+  } catch (err) {
+    log('startup scan failed:', err.message || err);
+  }
+  // Not awaited: a standby node must acknowledge the handover before it pulls images for auto-started nodes.
+  runStartupPass({
+    store,
+    operations,
+    resolveContainer: inspectContainer,
+    pullImage: docker.pullImage,
+    createContainer: docker.createContainer,
+    createBody: async (record) => createBody(record, { httpPort: nodeHttpPort(record), npmRegistry: await npmRegistrySetting() }),
+    startContainer,
+    log,
+  }).catch((err) => log('startup pass failed:', err.message || err));
+  if (SELF_UPDATE) scheduleSelfUpdateChecks();
+}
+
+// Checks the image every few hours. Only a `latest` image upgrades itself; a pinned tag never does.
+function scheduleSelfUpdateChecks() {
+  const every = SELF_UPDATE_HOURS * 60 * 60 * 1000;
+  const check = async () => {
+    try {
+      const self = await inspectContainer(os.hostname());
+      if (self && isLatestTag(self.Config?.Image) && !upgrade.busy()) upgrade.start({ auto: true });
+    } catch (err) {
+      log(`self-upgrade check failed: ${err.message || err}`);
+    }
+    setTimeout(check, every).unref?.();
+  };
+  setTimeout(check, 60_000).unref?.();
+  log(`self-upgrade check every ${SELF_UPDATE_HOURS} h for latest images`);
+}
+
 server.listen(PORT, '0.0.0.0', () => {
   log(`listening on :${PORT}; docker socket ${SOCKET}; read-only ${READONLY}; allowed hosts ${[...ALLOWED_HOSTS].join(', ')}`);
   log(fs.existsSync(path.join(UI_DIR, 'index.html')) ? `dashboard from ${UI_DIR}` : `dashboard not built (${UI_DIR} missing)`);
-  if (!READONLY) {
-    void (async () => {
-      try {
-        await discovery.scan();
-      } catch (err) {
-        log('startup scan failed:', err.message || err);
-      }
-      try {
-        await runStartupPass({
-          store,
-          operations,
-          resolveContainer: inspectContainer,
-          pullImage: docker.pullImage,
-          createContainer: docker.createContainer,
-          createBody: async (record) => createBody(record, { httpPort: nodeHttpPort(record), npmRegistry: await npmRegistrySetting() }),
-          startContainer,
-          log,
-        });
-      } catch (err) {
-        log('startup pass failed:', err.message || err);
-      }
-    })();
+  if (STANDBY) {
+    log('standby: waiting for the running control node to hand over');
+    upgrade.watchHandover(activate);
+  } else {
+    void activate();
   }
 });
