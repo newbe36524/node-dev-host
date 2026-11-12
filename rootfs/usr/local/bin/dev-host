@@ -21,6 +21,10 @@ SPA="${SPA:-true}"
 API_PATH="${API_PATH:-/api/*}"
 API_UPSTREAM="${API_UPSTREAM:-}"
 STATE_DIR="${STATE_DIR:-/var/lib/dev-host}"
+# Install and build run in BUILD_DIR, a copy of WORKSPACE, so the mounted project is never written to.
+BUILD_DIR="$STATE_DIR/build"
+# Output of the last successful build. Caddy serves it, and a failed build never changes it.
+SERVE_DIR="$STATE_DIR/www"
 STATUS_FILE="$STATE_DIR/status.json"
 TRIGGER_FILE="$STATE_DIR/rebuild"
 # Read by Caddy on every request (X-Build-Time / X-Build-Duration headers).
@@ -52,7 +56,7 @@ deps_sig() {
 }
 
 write_caddyfile() {
-  local root="$WORKSPACE/$DIST_DIR" file="$STATE_DIR/Caddyfile"
+  local root="$SERVE_DIR" file="$STATE_DIR/Caddyfile"
   {
     echo "{"
     echo "  admin off"
@@ -83,16 +87,28 @@ write_caddyfile() {
   } > "$file"
 }
 
+# Copy WORKSPACE into BUILD_DIR. node_modules, caches and the build output are left out of the copy and
+# protected from --delete, so they persist in BUILD_DIR between builds and never land in the workspace.
+sync_source() {
+  mkdir -p "$BUILD_DIR" &&
+  rsync -a --delete \
+    --exclude=node_modules --exclude=.git --exclude=.vite --exclude=.turbo \
+    --exclude=.cache --exclude=coverage --exclude=.pnpm-store \
+    --exclude="/$DIST_DIR" \
+    "$WORKSPACE/" "$BUILD_DIR/"
+}
+
 run_build() {
-  local reason="$1" start rc=0
+  local reason="$1" start rc=0 secs
   write_status building ',"reason":"'"$reason"'"'
   start=$(date +%s)
-  cd "$WORKSPACE" || return 1
-  if [ ! -f package.json ]; then
+  if [ ! -f "$WORKSPACE/package.json" ]; then
     log "no package.json in $WORKSPACE, waiting for source"
     LAST_EXIT=null; write_status waiting; return 0
   fi
-  if [ ! -d node_modules ] || [ "$(deps_sig)" != "$DEPS_SIG" ]; then
+  if ! sync_source; then log "copy of $WORKSPACE to $BUILD_DIR failed"; rc=1; fi
+  if [ "$rc" -eq 0 ]; then cd "$BUILD_DIR" || rc=1; fi
+  if [ "$rc" -eq 0 ] && { [ ! -d node_modules ] || [ "$(deps_sig)" != "$DEPS_SIG" ]; }; then
     local icmd="$INSTALL_CMD"
     if [ -z "$icmd" ]; then
       if [ -f pnpm-lock.yaml ]; then icmd="pnpm install --frozen-lockfile"; else icmd="pnpm install"; fi
@@ -109,9 +125,13 @@ run_build() {
     log "build ($reason): $BUILD_CMD"
     bash -c "$BUILD_CMD" || rc=$?
   fi
+  if [ "$rc" -eq 0 ]; then
+    # Publish only a finished build. A failed build leaves SERVE_DIR as it was.
+    rsync -a --delete "$BUILD_DIR/$DIST_DIR/" "$SERVE_DIR/" || { log "could not publish $BUILD_DIR/$DIST_DIR"; rc=1; }
+  fi
   BUILDS=$((BUILDS + 1)); LAST_EXIT=$rc
   if [ "$rc" -eq 0 ]; then
-    local secs=$(( $(date +%s) - start ))
+    secs=$(( $(date +%s) - start ))
     # Only a successful build changes the headers: the served dist is then the one they describe.
     printf '%s' "$(date -u +%FT%TZ)" > "$BUILD_TIME_FILE.tmp" && mv "$BUILD_TIME_FILE.tmp" "$BUILD_TIME_FILE"
     printf '%s' "$secs" > "$BUILD_DURATION_FILE.tmp" && mv "$BUILD_DURATION_FILE.tmp" "$BUILD_DURATION_FILE"
@@ -124,14 +144,15 @@ run_build() {
 build_loop() {
   local sig prev now changed_at=0 pending=0 pending_since=0 last_build
   BUILDS=0; FAILURES=0; LAST_EXIT=null; DEPS_SIG=""
+  # Baseline before the first build: an edit saved during a build then shows up at the next poll.
+  prev="$(source_sig)"
   run_build initial
   last_build=$(date +%s)
-  prev="$(source_sig)"
   while sleep "$POLL_INTERVAL"; do
     now=$(date +%s)
     if [ -f "$TRIGGER_FILE" ]; then
       rm -f "$TRIGGER_FILE"; run_build manual
-      last_build=$(date +%s); pending=0; prev="$(source_sig)"; continue
+      last_build=$(date +%s); pending=0; continue
     fi
     sig="$(source_sig)"
     if [ "$sig" != "$prev" ]; then
@@ -144,8 +165,8 @@ build_loop() {
     [ $(( now - changed_at )) -ge "$DEBOUNCE_SECONDS" ] || [ $(( now - pending_since )) -ge "$MAX_WAIT_SECONDS" ] || continue
     run_build "source changed"
     last_build=$(date +%s); pending=0
-    # Files the build itself writes (tsbuildinfo, generated code) must not retrigger it.
-    prev="$(source_sig)"
+    # No re-read of the signature here: builds write only to BUILD_DIR, so a change made during
+    # this build is still seen at the next poll.
   done
 }
 
@@ -157,7 +178,7 @@ case "$cmd" in
   *) echo "usage: dev-host [run|rebuild|status]" >&2; exit 2 ;;
 esac
 
-mkdir -p "$STATE_DIR" "$WORKSPACE/$DIST_DIR"
+mkdir -p "$STATE_DIR" "$SERVE_DIR"
 if [ -f "${CADDYFILE:-}" ]; then
   cp "$CADDYFILE" "$STATE_DIR/Caddyfile"
 else
@@ -169,7 +190,7 @@ BUILDS=0; FAILURES=0; LAST_EXIT=null
 : > "$BUILD_TIME_FILE"; : > "$BUILD_DURATION_FILE"
 write_status starting
 
-log "caddy on :$HTTP_PORT, serving $WORKSPACE/$DIST_DIR"
+log "caddy on :$HTTP_PORT, serving $SERVE_DIR (built in $BUILD_DIR from $WORKSPACE)"
 caddy run --config "$STATE_DIR/Caddyfile" --adapter caddyfile &
 CADDY_PID=$!
 build_loop &
