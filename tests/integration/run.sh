@@ -6,6 +6,8 @@
 #     <target>  the Dockerfile target it was built from: host, demo, host-alpine or demo-alpine
 #
 # Each scenario starts a real container, waits for dev-host to build, and checks what Caddy serves.
+# The control scenarios (test_control_*) start the same image with the argument `control` and the
+# Docker socket mounted, then check its API, guards, actions and the built dashboard.
 # The project folder is copied into a temporary directory and mounted read-only, the way the skill
 # tells users to run it. A failed check prints the container logs and makes the script exit 1.
 #
@@ -261,6 +263,177 @@ test_shared_cache() {
     bash -c "docker logs $(cn cache-2) 2>&1 | grep -Eq 'reused [1-9][0-9]*, downloaded 0'"
 }
 
+# ---- control node -------------------------------------------------------------
+# The control node is the same image started with the argument `control`. It needs the Docker socket,
+# and it carries no node-dev-host.port label, so it never lists or manages itself.
+
+# start_control SHORT [docker run options...]: starts $IMAGE in control mode on a registered port.
+start_control() {
+  local name port
+  name="$(cn "$1")"; shift
+  CONTAINERS+=("$name")
+  for _ in 1 2 3 4 5; do
+    port="$(pick_port "$name")" || { fail "no free port for $name"; return 1; }
+    if docker run -d --name "$name" -p "127.0.0.1:$port:8080" \
+         --label node-dev-host.role=control "$@" "$IMAGE" control >/dev/null 2>&1; then
+      check "port $port for $name is in 43100-43299" in_range "$port"
+      return 0
+    fi
+    docker rm -f "$name" >/dev/null 2>&1
+  done
+  fail "could not start $name after 5 tries"
+  return 1
+}
+
+# code SHORT METHOD PATH [curl options...]: the HTTP status code of one request to a container.
+code()  { local short="$1" method="$2" p="$3"; shift 3; curl -s -o /dev/null -w '%{http_code}' -X "$method" "$@" "$(url "$short" "$p")"; }
+# reply SHORT METHOD PATH [curl options...]: the body of one request to a container.
+reply() { local short="$1" method="$2" p="$3"; shift 3; curl -s -X "$method" "$@" "$(url "$short" "$p")"; }
+# guarded_code / guarded_reply: a state-changing request with the Origin and control header the node expects.
+guarded_code()  { local short="$1"; shift; code "$short" "$@" -H "Origin: http://127.0.0.1:$(port "$short")" -H 'X-Dev-Host-Control: 1'; }
+guarded_reply() { local short="$1"; shift; reply "$short" "$@" -H "Origin: http://127.0.0.1:$(port "$short")" -H 'X-Dev-Host-Control: 1'; }
+
+cstate()    { docker inspect -f '{{.State.Status}}' "$(cn "$1")" 2>/dev/null; }
+cstate_is() { [ "$(cstate "$1")" = "$2" ]; }
+clabel()    { docker inspect -f '{{index .Config.Labels "node-dev-host.port"}}' "$(cn "$1")" 2>/dev/null; }
+body_any()  { curl -s "$(url "$1" "$2")" | grep -q -- "$3"; }
+extra_host_ok() { [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: devbox.local:$(port "$1")" "$(url "$1" /__dev-host/status.json)")" = 200 ]; }
+# rows SHORT: one line per row the control node lists: "name docker-state build-state".
+rows() {
+  curl -fsS "$(url "$1" /api/containers)" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const c of JSON.parse(s).containers)console.log(c.name,c.state,c.build.state)})'
+}
+row_is()     { local out; out="$(rows "$1")" && grep -qx -- "$(cn "$2") $3 $4" <<<"$out"; }
+not_listed() { local out; out="$(rows "$1")" && ! grep -q -- "$(cn "$2")" <<<"$out"; }
+paused_message_is_shown() { guarded_reply act-ctrl POST "/api/containers/$(cn "$1")/start" | grep -q paused; }
+gone() { local names; names="$(docker ps -a --format '{{.Names}}')"; ! grep -qx -- "$(cn "$1")" <<<"$names"; }
+no_port_label() { local names; names="$(docker ps -a --filter label=node-dev-host.port --format '{{.Names}}')"; ! grep -qx -- "$(cn "$1")" <<<"$names"; }
+
+test_control_runtime() {
+  log "control: starts in control mode, answers health, and refuses bad requests before any Docker call"
+  fresh_project rt
+  start rt-target -v "$WORK/rt:/workspace:ro"
+  check "target project container reaches state ok" poll 300 state_is rt-target ok
+  start_control rt-ctrl -v /var/run/docker.sock:/var/run/docker.sock
+  check "control container becomes healthy" poll 120 healthy rt-ctrl
+  check "status.json reports state ok and role control" body_has rt-ctrl /__dev-host/status.json '"role":"control"'
+
+  check "a foreign Host is rejected (403)" [ "$(code rt-ctrl GET /api/containers -H 'Host: attacker.example')" = 403 ]
+  check "a cross-site POST is rejected (403)" \
+    [ "$(code rt-ctrl POST "/api/containers/$(cn rt-target)/stop" -H 'Origin: http://evil.example' -H 'X-Dev-Host-Control: 1')" = 403 ]
+  check "a POST without the control header is rejected (403)" \
+    [ "$(code rt-ctrl POST "/api/containers/$(cn rt-target)/stop" -H "Origin: http://127.0.0.1:$(port rt-ctrl)")" = 403 ]
+  check "the target is still running after the refused requests" cstate_is rt-target running
+
+  start_control rt-allowed -e CONTROL_ALLOWED_HOSTS=devbox.local -v /var/run/docker.sock:/var/run/docker.sock
+  check "an extra allowed host is accepted" poll 60 extra_host_ok rt-allowed
+  check "the same Host is refused when it is not allowed (403)" \
+    [ "$(code rt-ctrl GET /__dev-host/status.json -H "Host: devbox.local:$(port rt-ctrl)")" = 403 ]
+
+  log "control: without the Docker socket"
+  start_control rt-nosock
+  check "status.json names the missing socket mount" poll 60 body_any rt-nosock /__dev-host/status.json 'Mount it with -v /var/run/docker.sock'
+  check "the list answers 503 when Docker is unreachable" [ "$(code rt-nosock GET /api/containers)" = 503 ]
+}
+
+test_control_dashboard_api() {
+  log "control: lists labelled containers with Docker and build state, logs, and serves the dashboard"
+  fresh_project dash
+  start dash-a -v "$WORK/dash:/workspace:ro"
+  start dash-b -v "$WORK/dash:/workspace:ro"
+  check "dash-a reaches state ok" poll 300 state_is dash-a ok
+  check "dash-b reaches state ok" poll 300 state_is dash-b ok
+  docker stop "$(cn dash-b)" >/dev/null
+  CONTAINERS+=("$(cn plain)")
+  docker run -d --name "$(cn plain)" --entrypoint sleep "$IMAGE" 600 >/dev/null
+  start_control dash-ctrl -v /var/run/docker.sock:/var/run/docker.sock
+
+  check "the list shows the running labelled container with build state ok" poll 60 row_is dash-ctrl dash-a running ok
+  check "the list shows the stopped labelled container as exited, build state unknown" row_is dash-ctrl dash-b exited unknown
+  check "the unlabelled container is not listed" not_listed dash-ctrl plain
+  check "the control container does not list itself" not_listed dash-ctrl dash-ctrl
+  check "the list reports readOnly false" body_has dash-ctrl /api/containers '"readOnly":false'
+
+  touch "$WORK/dash/BREAK"
+  check "a failed build shows as failed in the list" poll 180 row_is dash-ctrl dash-a running failed
+  rm -f "$WORK/dash/BREAK"
+  check "the list shows ok again after the next good build" poll 180 row_is dash-ctrl dash-a running ok
+
+  check "logs of a running container show the dev-host build lines" body_has dash-ctrl "/api/containers/$(cn dash-a)/logs" '\[dev-host'
+  check "logs of a stopped container show its stored lines" body_has dash-ctrl "/api/containers/$(cn dash-b)/logs" '\[dev-host'
+  check "tail=5000 returns at most 1000 lines" [ "$(reply dash-ctrl GET "/api/containers/$(cn dash-a)/logs?tail=5000" | wc -l)" -le 1000 ]
+
+  check "GET / serves the built dashboard" body_has dash-ctrl / '/assets/'
+  local asset
+  asset="$(curl -fsS "$(url dash-ctrl /)" | grep -o '/assets/[^"]*\.js' | head -n1)"
+  check "a built asset is served with 200" [ "$(code dash-ctrl GET "$asset")" = 200 ]
+  check "an SPA path serves the same page" [ "$(reply dash-ctrl GET /some/route)" = "$(reply dash-ctrl GET /)" ]
+  check "an unknown /api path is a JSON 404" [ "$(code dash-ctrl GET /api/nope)" = 404 ]
+  check "status.json still reports state ok" body_has dash-ctrl /__dev-host/status.json '"state":"ok"'
+}
+
+test_control_actions() {
+  log "control: start, stop, restart, rebuild and remove act only on labelled containers"
+  fresh_project act
+  start act-a -v "$WORK/act:/workspace:ro"
+  check "act-a reaches state ok" poll 300 state_is act-a ok
+  CONTAINERS+=("$(cn plain)")
+  docker run -d --name "$(cn plain)" --entrypoint sleep "$IMAGE" 600 >/dev/null
+  start_control act-ctrl -v /var/run/docker.sock:/var/run/docker.sock
+  check "the control node answers the list" poll 60 body_has act-ctrl /api/containers '"readOnly"'
+
+  log "control: refusals"
+  check "an unlabelled container is refused for stop (403)" [ "$(guarded_code act-ctrl POST "/api/containers/$(cn plain)/stop")" = 403 ]
+  check "an unlabelled container is refused for remove (403)" [ "$(guarded_code act-ctrl DELETE "/api/containers/$(cn plain)")" = 403 ]
+  check "the control container is refused (403)" [ "$(guarded_code act-ctrl POST "/api/containers/$(cn act-ctrl)/stop")" = 403 ]
+  check "a missing container is refused (404)" [ "$(guarded_code act-ctrl POST /api/containers/ndit-missing/stop)" = 404 ]
+  check "an unknown action is refused (400)" [ "$(guarded_code act-ctrl POST "/api/containers/$(cn act-a)/exec")" = 400 ]
+  check "the unlabelled container is still running" cstate_is plain running
+  check "the control container is still running" cstate_is act-ctrl running
+
+  log "control: stop, start and restart keep the port and labels"
+  local port_before
+  port_before="$(clabel act-a)"
+  check "stop answers 200" [ "$(guarded_code act-ctrl POST "/api/containers/$(cn act-a)/stop")" = 200 ]
+  check "a stopped container is exited" poll 30 cstate_is act-a exited
+  check "start answers 200" [ "$(guarded_code act-ctrl POST "/api/containers/$(cn act-a)/start")" = 200 ]
+  check "a started container is running again" poll 30 cstate_is act-a running
+  check "start keeps the same port label" [ "$(clabel act-a)" = "$port_before" ]
+  check "restart answers 200" [ "$(guarded_code act-ctrl POST "/api/containers/$(cn act-a)/restart")" = 200 ]
+  check "a restarted container is running" poll 30 cstate_is act-a running
+
+  log "control: a Docker error comes back as a message"
+  docker pause "$(cn act-a)" >/dev/null
+  check "starting a paused container answers 409" [ "$(guarded_code act-ctrl POST "/api/containers/$(cn act-a)/start")" = 409 ]
+  check "the message names the paused state" paused_message_is_shown act-a
+  docker unpause "$(cn act-a)" >/dev/null
+  check "the container runs again after unpause" poll 30 cstate_is act-a running
+
+  log "control: rebuild runs dev-host rebuild in the container"
+  check "act-a is ok before the rebuild" poll 300 state_is act-a ok
+  local before
+  before="$(builds act-a)"
+  check "rebuild answers 202" [ "$(guarded_code act-ctrl POST "/api/containers/$(cn act-a)/rebuild")" = 202 ]
+  check "the container's build count goes up" poll 180 builds_above act-a "$before"
+  docker stop "$(cn act-a)" >/dev/null
+  check "rebuild of a stopped container is refused (409)" [ "$(guarded_code act-ctrl POST "/api/containers/$(cn act-a)/rebuild")" = 409 ]
+  check "the stopped container stays exited" cstate_is act-a exited
+  docker start "$(cn act-a)" >/dev/null
+  check "act-a is ok again after it starts" poll 300 state_is act-a ok
+
+  log "control: remove deletes a labelled container and frees its port"
+  start act-temp
+  check "remove answers 200" [ "$(guarded_code act-ctrl DELETE "/api/containers/$(cn act-temp)")" = 200 ]
+  check "the container is gone from docker ps -a" poll 30 gone act-temp
+  check "its port label no longer appears" no_port_label act-temp
+
+  log "control: read-only mode rejects every change and still lists"
+  start_control act-ro -e CONTROL_READONLY=true -v /var/run/docker.sock:/var/run/docker.sock
+  check "read-only mode is reported" poll 60 body_has act-ro /api/containers '"readOnly":true'
+  check "a stop is rejected (403)" [ "$(guarded_code act-ro POST "/api/containers/$(cn act-a)/stop")" = 403 ]
+  check "the container keeps running" cstate_is act-a running
+  check "the list still shows the container" poll 60 row_is act-ro act-a running ok
+}
+
 # ---- run ----------------------------------------------------------------------
 
 if [ "$VARIANT" = demo ]; then
@@ -272,3 +445,6 @@ else
   test_custom_caddyfile
   test_shared_cache
 fi
+test_control_runtime
+test_control_dashboard_api
+test_control_actions

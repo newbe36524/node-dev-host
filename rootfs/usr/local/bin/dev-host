@@ -3,6 +3,8 @@
 #   dev-host run       (default) start Caddy and the build loop
 #   dev-host rebuild   ask the running loop to rebuild now
 #   dev-host status    print the last build status as JSON
+#   dev-host control   start the control node (dashboard and API) instead of a project host
+#                      (needs the Docker socket mounted; see README "Control node")
 set -uo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
@@ -175,7 +177,9 @@ case "$cmd" in
   rebuild) mkdir -p "$STATE_DIR" && touch "$TRIGGER_FILE" && echo "rebuild requested"; exit 0 ;;
   status)  cat "$STATUS_FILE"; exit 0 ;;
   run) ;;
-  *) echo "usage: dev-host [run|rebuild|status]" >&2; exit 2 ;;
+  # The control node replaces the project host: no Caddy, no build loop, no project STATE_DIR setup.
+  control) exec node /usr/local/lib/dev-host/control/server.mjs ;;
+  *) echo "usage: dev-host [run|rebuild|status|control]" >&2; exit 2 ;;
 esac
 
 mkdir -p "$STATE_DIR" "$SERVE_DIR"
