@@ -13,13 +13,22 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import { createDiscovery } from './discovery.mjs';
 import { createDockerClient, DockerUnavailable, dockerMessage, HttpError } from './docker.mjs';
+import { addNodeRecord, createBody, deleteNodeRecord, nextPort, parseAllowedImages, parseWorkspaceRoots } from './nodes.mjs';
+import { createOperationTracker } from './operations.mjs';
+import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from './schedule.mjs';
+import { createStore } from './store.mjs';
 
 const env = process.env;
 const PORT = Number(env.HTTP_PORT) > 0 ? Number(env.HTTP_PORT) : 8080;
 const SOCKET = env.DOCKER_SOCKET || '/var/run/docker.sock';
-const { dockerRaw } = createDockerClient(SOCKET);
+const docker = createDockerClient(SOCKET);
+const { dockerRaw } = docker;
 const READONLY = /^(1|true|yes|on)$/i.test(env.CONTROL_READONLY || '');
+const DATA_DIR = env.CONTROL_DATA_DIR || '/var/lib/dev-host/control';
+const ALLOWED_IMAGES = parseAllowedImages(env.CONTROL_ALLOWED_IMAGES || '');
+const WORKSPACE_ROOTS = parseWorkspaceRoots(env.CONTROL_WORKSPACE_ROOTS || '');
 const ALLOWED_HOSTS = new Set([
   '127.0.0.1', 'localhost', '[::1]',
   ...(env.CONTROL_ALLOWED_HOSTS || '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean),
@@ -28,27 +37,38 @@ const UI_DIR = '/usr/local/lib/dev-host/control/ui';
 const PORT_LABEL = 'node-dev-host.port';
 const CONTROL_HEADER = 'x-dev-host-control';
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
-const ACTIONS = new Set(['start', 'stop', 'restart', 'rebuild']);
+const ACTIONS = new Set(['start', 'stop', 'restart', 'rebuild', 'recreate']);
 const BUILD_STATES = new Set(['starting', 'building', 'ok', 'failed', 'waiting']);
 const UNKNOWN_BUILD = Object.freeze({ state: 'unknown', builds: null, failures: null, finishedAt: null });
 const MAX_TAIL = 1000;
 const DEFAULT_TAIL = 200;
 
 const log = (...parts) => console.log(`[control ${new Date().toISOString().slice(11, 19)}]`, ...parts);
+const store = createStore({ dir: DATA_DIR, readOnly: READONLY, log: (...parts) => log(...parts) });
+const operations = createOperationTracker();
+const discovery = createDiscovery({ docker, store, allowedImages: ALLOWED_IMAGES, workspaceRoots: WORKSPACE_ROOTS, log });
+await store.load();
 
 const enc = (name) => encodeURIComponent(name);
 
-// Returns the container's inspect document when it exists and carries the port label, otherwise throws.
-// Every action and every logs request goes through here, so a name outside the label scope never reaches Docker.
-async function requireTarget(name) {
+async function inspectContainer(name) {
   const r = await dockerRaw('GET', `/containers/${enc(name)}/json`);
-  if (r.status === 404) throw new HttpError(404, `container not found: ${name}`);
+  if (r.status === 404) return null;
   if (r.status !== 200) throw new HttpError(502, dockerMessage(r));
-  const info = JSON.parse(r.body.toString('utf8'));
-  if (!info.Config?.Labels?.[PORT_LABEL]) {
+  return JSON.parse(r.body.toString('utf8'));
+}
+
+async function resolveTarget(name, action) {
+  const [container, records] = await Promise.all([inspectContainer(name), store.getNodes()]);
+  const record = records.find((node) => node.name === name) || null;
+  if (container && !container.Config?.Labels?.[PORT_LABEL] && !record) {
     throw new HttpError(403, `container ${name} is not managed: it has no ${PORT_LABEL} label`);
   }
-  return info;
+  if (!container && !record) throw new HttpError(404, `container not found: ${name}`);
+  if (!container && !['start', 'recreate', 'delete'].includes(action)) {
+    throw new HttpError(409, `node ${name} has no container`);
+  }
+  return { container, record };
 }
 
 // ---- container list and build state ---------------------------------------------
@@ -82,15 +102,21 @@ async function probeBuild(info) {
   }
 }
 
-async function listContainers() {
+async function labelledSummaries() {
   const filters = encodeURIComponent(JSON.stringify({ label: [PORT_LABEL] }));
   const r = await dockerRaw('GET', `/containers/json?all=1&filters=${filters}`);
   if (r.status !== 200) throw new HttpError(502, dockerMessage(r));
-  const summaries = JSON.parse(r.body.toString('utf8'));
+  return JSON.parse(r.body.toString('utf8'));
+}
+
+async function listContainers() {
+  const summaries = await labelledSummaries();
+  const [records, persistence] = await Promise.all([store.getNodes(), store.status()]);
+  const byName = new Map(records.map((record) => [record.name, record]));
 
   const rows = await Promise.all(summaries.map(async (c) => {
     const name = (c.Names?.[0] || '').replace(/^\//, '');
-    let info;
+    let info = null;
     try {
       const detail = await dockerRaw('GET', `/containers/${enc(name)}/json`);
       if (detail.status !== 200) return null; // removed between the list and the inspect
@@ -100,17 +126,52 @@ async function listContainers() {
       return null;
     }
     const running = info.State?.Running === true;
+    const record = byName.get(name);
+    const operation = operations.get(name);
     return {
       name,
       id: c.Id.slice(0, 12),
-      image: c.Image,
-      port: Number(c.Labels?.[PORT_LABEL]),
+      image: record?.image || c.Image,
+      port: record?.port ?? Number(c.Labels?.[PORT_LABEL]),
       state: c.State,
       health: info.State?.Health?.Status ?? null,
       build: running ? await probeBuild(info) : { ...UNKNOWN_BUILD },
+      registered: Boolean(record),
+      schedule: scheduleState(record?.autoStartUntil),
+      operation: operation?.phase ? { phase: operation.phase, since: operation.since } : null,
+      error: operation?.error ?? null,
+      warning: operation?.warning ?? null,
     };
   }));
-  return rows.filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
+  const listed = rows.filter(Boolean);
+  const names = new Set(listed.map((row) => row.name));
+  for (const record of records) {
+    if (names.has(record.name)) continue;
+    const operation = operations.get(record.name);
+    listed.push({
+      name: record.name,
+      id: `node:${record.name}`,
+      image: record.image,
+      port: record.port,
+      state: 'not created',
+      health: null,
+      build: { ...UNKNOWN_BUILD },
+      registered: true,
+      schedule: scheduleState(record.autoStartUntil),
+      operation: operation?.phase ? { phase: operation.phase, since: operation.since } : null,
+      error: operation?.error ?? null,
+      warning: operation?.warning ?? null,
+    });
+  }
+  listed.sort((a, b) => a.name.localeCompare(b.name));
+  return {
+    containers: listed,
+    persistence: {
+      ...persistence,
+      warning: persistence.warning || (persistence.mounted ? null : `node records are not on a separate mount at ${DATA_DIR}`),
+    },
+    nextPort: nextPort(records, summaries),
+  };
 }
 
 // ---- logs -------------------------------------------------------------------------
@@ -135,7 +196,8 @@ function clampTail(raw) {
 }
 
 async function containerLogs(name, rawTail) {
-  const info = await requireTarget(name);
+  const { container: info } = await resolveTarget(name, 'logs');
+  if (!info) throw new HttpError(409, `node ${name} has no container`);
   const tail = clampTail(rawTail);
   const r = await dockerRaw('GET', `/containers/${enc(name)}/logs?stdout=1&stderr=1&tail=${tail}`);
   if (r.status !== 200) throw new HttpError(502, dockerMessage(r));
@@ -148,17 +210,90 @@ async function containerLogs(name, rawTail) {
 
 // ---- actions ------------------------------------------------------------------------
 
-async function lifecycle(name, action) {
-  const info = await requireTarget(name);
+async function ensureStoreWritable() {
+  if (!(await store.status()).writable) {
+    throw new HttpError(503, `node records cannot be saved; check CONTROL_DATA_DIR at ${DATA_DIR}`);
+  }
+}
+
+function nodeHttpPort(record) {
+  const value = Number(record.env?.HTTP_PORT);
+  return value > 0 ? value : 8080;
+}
+
+async function startContainer(name) {
+  const r = await dockerRaw('POST', `/containers/${enc(name)}/start`);
+  if (r.status === 204 || r.status === 304) return null;
+  throw new HttpError(r.status === 409 ? 409 : 500, dockerMessage(r));
+}
+
+async function createFromRecord(record, context, pullCache) {
+  context.setPhase('pulling');
+  if (!pullCache.has(record.image)) pullCache.set(record.image, docker.pullImage(record.image));
+  const pulled = await pullCache.get(record.image);
+  if (pulled.warning) context.setWarning(pulled.warning);
+  context.setPhase('creating');
+  await docker.createContainer(record.name, createBody(record, { httpPort: nodeHttpPort(record) }));
+  context.setPhase('starting');
+  await startContainer(record.name);
+  return { warning: pulled.warning };
+}
+
+function queueOperation(name, initialPhase, work) {
+  void operations.run(name, initialPhase, work).catch((err) => log(`operation failed for ${name}: ${err.message || err}`));
+}
+
+async function setAutoStart(name, until) {
+  await ensureStoreWritable();
+  return store.update((document) => {
+    const record = document.nodes.find((node) => node.name === name);
+    if (!record) throw new HttpError(404, `node not found: ${name}`);
+    record.autoStartUntil = until;
+    return document;
+  });
+}
+
+async function lifecycle(name, action, body = {}) {
+  const { container, record } = await resolveTarget(name, action);
+  if (action === 'recreate') {
+    if (!record) throw new HttpError(409, `container ${name} is not registered; scan first`);
+    queueOperation(name, 'pulling', async (context) => {
+      context.setPhase('pulling');
+      const pulled = await docker.pullImage(record.image);
+      if (pulled.warning) context.setWarning(pulled.warning);
+      if (container) {
+        context.setPhase('removing');
+        const removed = await dockerRaw('DELETE', `/containers/${enc(name)}?force=1`);
+        if (removed.status !== 204 && removed.status !== 404) throw new HttpError(500, dockerMessage(removed));
+      }
+      context.setPhase('creating');
+      await docker.createContainer(name, createBody(record, { httpPort: nodeHttpPort(record) }));
+      context.setPhase('starting');
+      await startContainer(name);
+      return { warning: pulled.warning };
+    });
+    return { queued: true };
+  }
+  if (action === 'start' && body.autoStart === true) {
+    if (!record) throw new HttpError(409, `node ${name} is not registered`);
+    await setAutoStart(name, new Date(Date.now() + WEEK_MS).toISOString());
+  }
+  if (action === 'start' && !container) {
+    queueOperation(name, 'pulling', (context) => createFromRecord(record, context, new Map()));
+    return { queued: true };
+  }
   if (action === 'rebuild') {
-    if (info.State?.Running !== true) {
+    if (container.State?.Running !== true) {
       throw new HttpError(409, `container ${name} is not running; start it before rebuilding`);
     }
-    return rebuild(name);
+    return operations.run(name, null, () => rebuild(name));
   }
-  const r = await dockerRaw('POST', `/containers/${enc(name)}/${action}`);
-  if (r.status === 204 || r.status === 304) return null; // 304: already in that state
-  throw new HttpError(r.status === 409 ? 409 : 500, dockerMessage(r));
+  if (action === 'start') return operations.run(name, 'starting', () => startContainer(name));
+  return operations.run(name, null, async () => {
+    const r = await dockerRaw('POST', `/containers/${enc(name)}/${action}`);
+    if (r.status === 204 || r.status === 304) return null; // 304: already in that state
+    throw new HttpError(r.status === 409 ? 409 : 500, dockerMessage(r));
+  });
 }
 
 // The command is a constant. `dev-host rebuild` only touches a trigger file, so the exec finishes at once.
@@ -183,10 +318,13 @@ async function rebuild(name) {
 }
 
 async function removeContainer(name) {
-  await requireTarget(name);
-  const r = await dockerRaw('DELETE', `/containers/${enc(name)}?force=1`);
-  if (r.status === 204) return null;
-  throw new HttpError(r.status === 404 ? 404 : 500, dockerMessage(r));
+  const { container } = await resolveTarget(name, 'remove');
+  if (!container) throw new HttpError(409, `node ${name} has no container`);
+  return operations.run(name, 'removing', async () => {
+    const r = await dockerRaw('DELETE', `/containers/${enc(name)}?force=1`);
+    if (r.status === 204) return null;
+    throw new HttpError(r.status === 404 ? 404 : 500, dockerMessage(r));
+  });
 }
 
 // ---- health ------------------------------------------------------------------------
@@ -223,6 +361,23 @@ function sendError(res, err) {
   const status = err instanceof HttpError ? err.status : 500;
   const message = err instanceof HttpError ? err.message : 'internal error';
   if (!res.headersSent) sendJson(res, status, { error: message });
+}
+
+async function readJsonBody(req) {
+  const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
+  if (contentType !== 'application/json') throw new HttpError(415, 'content type must be application/json');
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size <= 16 * 1024) chunks.push(chunk);
+  }
+  if (size > 16 * 1024) throw new HttpError(413, 'request body exceeds 16 KB');
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw new HttpError(400, 'request body must be valid JSON');
+  }
 }
 
 // The Host header must name a loopback address or an entry from CONTROL_ALLOWED_HOSTS (blocks DNS rebinding).
@@ -298,17 +453,67 @@ async function serveApi(req, res, url) {
   const parts = url.pathname.split('/').filter(Boolean); // ['api', 'containers', name?, action?]
   if (parts.length === 2 && parts[1] === 'containers') {
     if (req.method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'GET' });
-    return sendJson(res, 200, { readOnly: READONLY, containers: await listContainers() });
+    const list = await listContainers();
+    return sendJson(res, 200, { readOnly: READONLY, ...list });
   }
+
+  if (parts.length === 2 && parts[1] === 'nodes') {
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'POST' });
+    const body = await readJsonBody(req);
+    await ensureStoreWritable();
+    const summaries = await labelledSummaries();
+    const result = await addNodeRecord(store, body, {
+      allowedImages: ALLOWED_IMAGES,
+      workspaceRoots: WORKSPACE_ROOTS,
+      containers: summaries,
+    });
+    return sendJson(res, 201, { ok: true, node: result.nodes.find((node) => node.name === body.name) });
+  }
+
+  if (parts.length === 2 && parts[1] === 'scan') {
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'POST' });
+    return sendJson(res, 200, await discovery.scan());
+  }
+
+  if (parts[1] === 'nodes' && (parts.length === 3 || parts.length === 4)) {
+    let name;
+    try { name = decodeURIComponent(parts[2]); } catch { return sendJson(res, 400, { error: 'malformed node name' }); }
+    if (!NAME_RE.test(name)) return sendJson(res, 400, { error: `invalid node name: ${name}` });
+    if (parts.length === 4 && parts[3] === 'auto-start') {
+      const record = (await store.getNodes()).find((node) => node.name === name);
+      if (!record) throw new HttpError(404, `node not found: ${name}`);
+      await ensureStoreWritable();
+      const until = req.method === 'POST' ? extendWindow(record.autoStartUntil) : req.method === 'DELETE' ? clearWindow() : undefined;
+      if (until === undefined) return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'POST, DELETE' });
+      await store.update((document) => {
+        const node = document.nodes.find((candidate) => candidate.name === name);
+        if (!node) throw new HttpError(404, `node not found: ${name}`);
+        node.autoStartUntil = until;
+        return document;
+      });
+      return sendJson(res, 200, { ok: true, autoStartUntil: until });
+    }
+    if (parts.length !== 3 || req.method !== 'DELETE') {
+      return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'DELETE' });
+    }
+    const { container, record } = await resolveTarget(name, 'delete');
+    if (!record) throw new HttpError(404, `node not found: ${name}`);
+    await ensureStoreWritable();
+    await operations.run(name, 'removing', async () => {
+      if (container) {
+        const removed = await dockerRaw('DELETE', `/containers/${enc(name)}?force=1`);
+        if (removed.status !== 204 && removed.status !== 404) throw new HttpError(500, dockerMessage(removed));
+      }
+      await deleteNodeRecord(store, name);
+    });
+    return sendJson(res, 200, { ok: true });
+  }
+
   if (parts[1] !== 'containers' || parts.length < 3 || parts.length > 4) {
     return sendJson(res, 404, { error: 'not found' });
   }
   let name;
-  try {
-    name = decodeURIComponent(parts[2]);
-  } catch {
-    return sendJson(res, 400, { error: 'malformed container name' });
-  }
+  try { name = decodeURIComponent(parts[2]); } catch { return sendJson(res, 400, { error: 'malformed container name' }); }
   if (!NAME_RE.test(name)) return sendJson(res, 400, { error: `invalid container name: ${name}` });
 
   if (parts.length === 3) {
@@ -325,8 +530,17 @@ async function serveApi(req, res, url) {
   }
   if (!ACTIONS.has(action)) return sendJson(res, 400, { error: `action not supported: ${action}` });
   if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'POST' });
-  await lifecycle(name, action);
-  return sendJson(res, action === 'rebuild' ? 202 : 200, { ok: true, action, queued: action === 'rebuild' });
+  let body = {};
+  if (action === 'start' && (req.headers['content-type'] || req.headers['content-length'] || req.headers['transfer-encoding'])) {
+    body = await readJsonBody(req);
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => key !== 'autoStart')) {
+      throw new HttpError(400, 'start body may contain only autoStart');
+    }
+    if (body.autoStart !== undefined && typeof body.autoStart !== 'boolean') throw new HttpError(400, 'autoStart must be a boolean');
+  }
+  const result = await lifecycle(name, action, body);
+  const queued = result?.queued === true || action === 'rebuild';
+  return sendJson(res, queued ? 202 : 200, { ok: true, action, queued });
 }
 
 async function handle(req, res) {
@@ -362,4 +576,27 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, '0.0.0.0', () => {
   log(`listening on :${PORT}; docker socket ${SOCKET}; read-only ${READONLY}; allowed hosts ${[...ALLOWED_HOSTS].join(', ')}`);
   log(fs.existsSync(path.join(UI_DIR, 'index.html')) ? `dashboard from ${UI_DIR}` : `dashboard not built (${UI_DIR} missing)`);
+  if (!READONLY) {
+    void (async () => {
+      try {
+        await discovery.scan();
+      } catch (err) {
+        log('startup scan failed:', err.message || err);
+      }
+      try {
+        await runStartupPass({
+          store,
+          operations,
+          resolveContainer: inspectContainer,
+          pullImage: docker.pullImage,
+          createContainer: docker.createContainer,
+          createBody: (record) => createBody(record, { httpPort: nodeHttpPort(record) }),
+          startContainer,
+          log,
+        });
+      } catch (err) {
+        log('startup pass failed:', err.message || err);
+      }
+    })();
+  }
 });

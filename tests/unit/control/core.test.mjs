@@ -7,8 +7,9 @@ import { afterEach, test } from 'node:test';
 import { createDockerClient } from '../../../rootfs/usr/local/lib/dev-host/control/docker.mjs';
 import { createOperationTracker } from '../../../rootfs/usr/local/lib/dev-host/control/operations.mjs';
 import { createBody, nextPort, parseAllowedImages, parseWorkspaceRoots, validateNode } from '../../../rootfs/usr/local/lib/dev-host/control/nodes.mjs';
-import { clearWindow, extendWindow, scheduleState, WEEK_MS } from '../../../rootfs/usr/local/lib/dev-host/control/schedule.mjs';
+import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from '../../../rootfs/usr/local/lib/dev-host/control/schedule.mjs';
 import { createStore } from '../../../rootfs/usr/local/lib/dev-host/control/store.mjs';
+import { createDiscovery } from '../../../rootfs/usr/local/lib/dev-host/control/discovery.mjs';
 
 const temporary = new Set();
 const servers = new Set();
@@ -169,4 +170,96 @@ test('schedule windows use absolute timestamps and extend without shortening', (
   assert.equal(extendWindow(new Date(now + 9 * 86_400_000).toISOString(), now), new Date(now + 9 * 86_400_000).toISOString());
   assert.equal(extendWindow(null, now), new Date(now + WEEK_MS).toISOString());
   assert.equal(clearWindow(), null);
+});
+
+test('startup pass starts only active records, bounds concurrency, and continues after errors', async () => {
+  const records = [
+    { name: 'missing', image: 'nd:latest', autoStartUntil: '2027-01-08T00:00:00.000Z' },
+    { name: 'exited', image: 'nd:latest', autoStartUntil: '2027-01-08T00:00:00.000Z' },
+    { name: 'running', image: 'nd:latest', autoStartUntil: '2027-01-08T00:00:00.000Z' },
+    { name: 'ended', image: 'nd:latest', autoStartUntil: '2026-01-01T00:00:00.000Z' },
+    ...Array.from({ length: 4 }, (_, i) => ({ name: `batch-${i}`, image: 'nd:latest', autoStartUntil: '2027-01-08T00:00:00.000Z' })),
+  ];
+  const operations = createOperationTracker();
+  const started = [];
+  let running = 0;
+  let maximum = 0;
+  let pulls = 0;
+  const errors = [];
+  await runStartupPass({
+    store: { getNodes: async () => records },
+    operations,
+    resolveContainer: async (name) => {
+      if (name === 'running') return { State: { Running: true } };
+      if (name === 'exited') return { State: { Running: false } };
+      return null;
+    },
+    pullImage: async () => { pulls += 1; return { warning: null }; },
+    createBody: (record) => record,
+    createContainer: async (name) => {
+      running += 1;
+      maximum = Math.max(maximum, running);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        if (name === 'missing') throw new Error('port is allocated');
+        started.push(name);
+      } finally {
+        running -= 1;
+      }
+    },
+    startContainer: async (name) => { if (!started.includes(name)) started.push(name); },
+    log: (message) => errors.push(message),
+  });
+  assert.ok(maximum <= 2);
+  assert.equal(pulls, 1);
+  assert.deepEqual(new Set(started), new Set(['exited', 'batch-0', 'batch-1', 'batch-2', 'batch-3']));
+  assert.equal(errors.length, 1);
+  assert.equal(operations.get('missing').error, 'port is allocated');
+});
+
+test('discovery imports reproducible containers once and reports unsupported shapes', async () => {
+  const dir = await tempDir();
+  const store = createStore({ dir });
+  const makeInfo = (name, overrides = {}) => ({
+    Name: `/${name}`,
+    Config: {
+      Image: 'node-dev-host:latest',
+      Labels: { 'node-dev-host.port': name === 'nd-public' ? '43102' : name === 'nd-extra' ? '43103' : '43101' },
+      Env: ['NODE_VERSION=24', 'CUSTOM=value'],
+    },
+    State: { Running: false },
+    HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: name === 'nd-public' ? '0.0.0.0' : '127.0.0.1' }] }, Privileged: false },
+    Mounts: [{ Type: 'bind', Source: '/workspace/site', Destination: '/workspace', RW: false }],
+    NetworkSettings: { Networks: { bridge: { IPAddress: '' } } },
+    ...overrides,
+  });
+  const containers = [
+    makeInfo('nd-import'),
+    makeInfo('nd-extra', { Mounts: [{ Type: 'bind', Source: '/etc', Destination: '/etc' }] }),
+    makeInfo('nd-public'),
+  ];
+  const docker = {
+    dockerRaw: async (method, apiPath) => {
+      if (apiPath.startsWith('/containers/json')) {
+        return { status: 200, body: Buffer.from(JSON.stringify(containers.map((info) => ({ Names: [info.Name] })))) };
+      }
+      const name = decodeURIComponent(apiPath.split('/')[2]);
+      return { status: 200, body: Buffer.from(JSON.stringify(containers.find((info) => info.Name === `/${name}`))) };
+    },
+    imageInfo: async () => ({ Config: { Env: ['NODE_VERSION=24'] } }),
+  };
+  const discovery = createDiscovery({ docker, store, allowedImages: ['node-dev-host'], log: () => {} });
+  const first = await discovery.scan();
+  assert.deepEqual(first, {
+    imported: ['nd-import'],
+    skipped: [
+      { name: 'nd-extra', reason: 'unsupported mount: /etc' },
+      { name: 'nd-public', reason: 'published port is not bound to loopback' },
+    ],
+  });
+  assert.deepEqual((await store.getNodes())[0].env, { CUSTOM: 'value' });
+  assert.deepEqual(await discovery.scan(), { imported: [], skipped: [
+    { name: 'nd-extra', reason: 'unsupported mount: /etc' },
+    { name: 'nd-public', reason: 'published port is not bound to loopback' },
+  ] });
 });

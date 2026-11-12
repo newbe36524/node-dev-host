@@ -17,3 +17,47 @@ export function extendWindow(until, now = Date.now()) {
 export function clearWindow() {
   return null;
 }
+
+export async function runStartupPass({
+  store,
+  operations,
+  resolveContainer,
+  pullImage,
+  createContainer,
+  createBody,
+  startContainer,
+  now = Date.now(),
+  concurrency = 2,
+  log = console.warn,
+}) {
+  const active = (await store.getNodes()).filter((node) => scheduleState(node.autoStartUntil, now).state === 'active');
+  const pulls = new Map();
+  let next = 0;
+  async function worker() {
+    while (next < active.length) {
+      const record = active[next++];
+      try {
+        const container = await resolveContainer(record.name);
+        if (container?.State?.Running) continue;
+        await operations.run(record.name, container ? 'starting' : 'pulling', async ({ setPhase, setWarning }) => {
+          let warning = null;
+          if (!container) {
+            setPhase('pulling');
+            if (!pulls.has(record.image)) pulls.set(record.image, pullImage(record.image));
+            const result = await pulls.get(record.image);
+            warning = result.warning;
+            if (warning) setWarning(warning);
+            setPhase('creating');
+            await createContainer(record.name, createBody(record));
+          }
+          setPhase('starting');
+          await startContainer(record.name);
+          return { warning };
+        });
+      } catch (err) {
+        log(`startup failed for ${record.name}: ${err.message || err}`);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, active.length) }, () => worker()));
+}

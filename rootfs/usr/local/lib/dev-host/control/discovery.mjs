@@ -22,7 +22,7 @@ function unsupportedReason(info, httpPort) {
   const port = info.HostConfig?.PortBindings?.[`${httpPort}/tcp`]
     || info.NetworkSettings?.Ports?.[`${httpPort}/tcp`]
     || [];
-  if (port.some((binding) => binding.HostIp && binding.HostIp !== '127.0.0.1')) {
+  if (port.some((binding) => binding.HostIp !== '127.0.0.1')) {
     return 'published port is not bound to loopback';
   }
   if (info.HostConfig?.Privileged) return 'container is privileged';
@@ -56,12 +56,16 @@ export function createDiscovery({ docker, store, allowedImages, workspaceRoots, 
       const mount = workspaceMount(info);
       const image = info.Config?.Image || summary.Image;
       const imageInfo = await docker.imageInfo(image);
-      const builtInEnv = new Set((imageInfo?.Config?.Env || []).map((entry) => entry.split('=', 1)[0]));
+      const builtInEnv = new Map((imageInfo?.Config?.Env || []).map((entry) => {
+        const index = entry.indexOf('=');
+        return index < 0 ? [entry, ''] : [entry.slice(0, index), entry.slice(index + 1)];
+      }));
       const env = {};
       for (const entry of info.Config?.Env || []) {
         const at = entry.indexOf('=');
         const key = at < 0 ? entry : entry.slice(0, at);
-        if (at >= 0 && !builtInEnv.has(key)) env[key] = entry.slice(at + 1);
+        const value = at < 0 ? '' : entry.slice(at + 1);
+        if (at >= 0 && (!builtInEnv.has(key) || builtInEnv.get(key) !== value)) env[key] = value;
       }
       const networks = Object.keys(info.NetworkSettings?.Networks || {})
         .filter((network) => !['bridge', 'host', 'none'].includes(network));
