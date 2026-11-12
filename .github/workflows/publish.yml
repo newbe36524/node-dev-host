@@ -14,7 +14,9 @@ permissions:
 
 env:
   IMAGE: ghcr.io/newbe36524/node-dev-host
-  # Every published tag must carry all of these; the verify step below fails the job otherwise.
+  # Every published tag must carry all of these; the verify steps below fail the job otherwise.
+  # The control dashboard is built once per target on the builder's platform, and its static output is
+  # copied into each platform's image, so the UI check below runs for every platform in this list.
   PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
@@ -76,3 +78,12 @@ jobs:
             fi
           done
           exit "$missing"
+      - name: Verify the control dashboard is in every platform
+        # Runs the published image for each platform and fails if the dashboard's entry file is absent.
+        run: |
+          for p in ${PLATFORMS//,/ }; do
+            echo "checking $p"
+            docker run --rm --platform "$p" --entrypoint sh "$IMAGE:${{ matrix.tag }}" \
+              -c 'test -f /usr/local/lib/dev-host/control/ui/index.html' \
+              || { echo "::error::$IMAGE:${{ matrix.tag }} ($p) has no control dashboard"; exit 1; }
+          done

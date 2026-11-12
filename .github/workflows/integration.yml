@@ -2,8 +2,13 @@ name: integration
 
 # Builds every image variant and runs tests/integration/run.sh against it. Each test starts real
 # containers, waits for dev-host to build a fixture project, and checks what Caddy serves: builds,
-# rebuilds, failed builds, the read-only workspace, the /api proxy, custom Caddyfiles and the shared
-# pnpm store volume. Nothing is pushed; the publish workflow still builds and pushes the images.
+# rebuilds, failed builds, the read-only workspace, the /api proxy, custom Caddyfiles, the shared
+# pnpm store volume, and the control node (list, actions, guards, read-only mode and the built dashboard).
+#
+# The control-ui job runs the dashboard's unit tests and build once, on amd64. Each image target then runs
+# on a native amd64 runner (ubuntu-latest) and a native arm64 runner (ubuntu-24.04-arm), building the image for
+# that runner's own platform, so the control scenarios run on arm64 hardware and not under emulation.
+# Nothing is pushed; the publish workflow still builds and pushes the images.
 
 on:
   pull_request:
@@ -12,6 +17,7 @@ on:
       - ".dockerignore"
       - "rootfs/**"
       - "demo/**"
+      - "control-ui/**"
       - "tests/integration/**"
       - ".github/workflows/integration.yml"
   push:
@@ -21,6 +27,7 @@ on:
       - ".dockerignore"
       - "rootfs/**"
       - "demo/**"
+      - "control-ui/**"
       - "tests/integration/**"
       - ".github/workflows/integration.yml"
   workflow_dispatch:
@@ -33,28 +40,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  integration:
-    name: integration (${{ matrix.target }})
+  control-ui:
+    name: control-ui (test and build)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: control-ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.18.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: control-ui/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Unit and component tests
+        run: pnpm test
+
+      - name: Build the dashboard
+        run: pnpm build
+
+  integration:
+    name: integration (${{ matrix.target }}, ${{ matrix.arch }})
+    needs: control-ui
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         target: [host, demo, host-alpine, demo-alpine]
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build the ${{ matrix.target }} image for testing
+      - name: Build the ${{ matrix.target }} image for testing (${{ matrix.arch }})
         uses: docker/build-push-action@v6
         with:
           context: .
           target: ${{ matrix.target }}
           load: true
           tags: node-dev-host:test-${{ matrix.target }}
-          cache-from: type=gha,scope=it-${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=it-${{ matrix.target }}
+          cache-from: type=gha,scope=it-${{ matrix.target }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=it-${{ matrix.target }}-${{ matrix.arch }}
 
       - name: Run integration tests
         run: tests/integration/run.sh node-dev-host:test-${{ matrix.target }} ${{ matrix.target }}
