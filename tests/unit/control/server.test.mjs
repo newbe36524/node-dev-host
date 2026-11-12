@@ -55,6 +55,11 @@ test('control API guards writes, persists nodes, and creates only registered con
         Labels: item.Config.Labels,
       })).filter((item) => item.Labels?.['node-dev-host.port']));
     }
+    if (url.pathname.startsWith('/networks/')) {
+      const network = decodeURIComponent(url.pathname.split('/')[2]);
+      if (network === 'nd-console_default') return json(res, 200, { Name: network });
+      return json(res, 404, { message: `network ${network} not found` });
+    }
     if (url.pathname.startsWith('/images/create')) {
       pulls += 1;
       if (pullDelayMs) await new Promise((resolve) => setTimeout(resolve, pullDelayMs));
@@ -77,6 +82,7 @@ test('control API guards writes, persists nodes, and creates only registered con
         name,
         Config: { Image: body.Image, Labels: body.Labels, Env: body.Env, Tty: false },
         HostConfig: body.HostConfig,
+        NetworkingConfig: body.NetworkingConfig,
         NetworkSettings: { Networks: {} },
         State: { Running: false },
       };
@@ -282,6 +288,23 @@ test('control API guards writes, persists nodes, and creates only registered con
   assert.equal(failedRow.state, 'not created');
   assert.match(failedRow.error, /simulated create failure/);
   assert.ok(!containers.has('nd-failed'));
+
+  const networkedRecord = { ...recordInput, name: 'nd-net', port: 43107, networks: ['nd-console_default'] };
+  assert.equal((await guarded('/api/nodes', 'POST', networkedRecord)).status, 201);
+  const missingNetwork = await guarded('/api/nodes', 'POST', { ...networkedRecord, name: 'nd-net-missing', port: 43108, networks: ['missing-net'] });
+  assert.equal(missingNetwork.status, 400);
+  assert.match((await missingNetwork.json()).error, /network not found: missing-net/);
+  const hostNetwork = await guarded('/api/nodes', 'POST', { ...networkedRecord, name: 'nd-net-host', port: 43109, networks: ['host'] });
+  assert.equal(hostNetwork.status, 400);
+  assert.match((await hostNetwork.json()).error, /user-defined/);
+  assert.equal((await guarded('/api/containers/nd-net/start', 'POST')).status, 202);
+  for (let i = 0; i < 100; i += 1) {
+    if ((await (await guarded('/api/containers')).json()).containers.some((item) => item.name === 'nd-net' && item.state === 'running')) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(Object.keys(containers.get('nd-net').NetworkingConfig.EndpointsConfig), ['nd-console_default']);
+  assert.equal((await guarded('/api/containers/nd-net', 'DELETE')).status, 200);
+  assert.equal((await guarded('/api/nodes/nd-net', 'DELETE')).status, 200);
 
   assert.equal((await guarded('/api/nodes', 'POST', { ...recordInput, name: 'nd-recreate-failed', port: 43105 })).status, 201);
   assert.equal((await guarded('/api/containers/nd-recreate-failed/start', 'POST')).status, 202);

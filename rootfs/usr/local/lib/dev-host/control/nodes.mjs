@@ -9,7 +9,10 @@ export const MIN_PORT = 43100;
 export const MAX_PORT = 43299;
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const ENV_RE = /^[A-Z0-9_]+$/;
-const USER_KEYS = new Set(['name', 'workspace', 'port', 'image', 'env']);
+const USER_KEYS = new Set(['name', 'workspace', 'port', 'image', 'env', 'networks']);
+const NETWORK_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const RESERVED_NETWORKS = new Set(['bridge', 'host', 'none']);
+const MAX_NETWORKS = 4;
 const invalid = (message) => { throw new HttpError(400, message); };
 
 function repository(image) {
@@ -56,6 +59,13 @@ export function validateNode(input, {
       invalid(`workspace must be under CONTROL_WORKSPACE_ROOTS: ${workspaceRoots.join(', ')}`);
     }
   }
+  const networks = input.networks ?? [];
+  if (!Array.isArray(networks)) invalid('networks must be an array of network names');
+  if (networks.length > MAX_NETWORKS) invalid(`networks may list at most ${MAX_NETWORKS} names`);
+  for (const network of networks) {
+    if (typeof network !== 'string' || !NETWORK_RE.test(network)) invalid(`invalid network name: ${network}`);
+    if (RESERVED_NETWORKS.has(network)) invalid(`network ${network} is not a user-defined network`);
+  }
   const env = input.env ?? {};
   if (!env || typeof env !== 'object' || Array.isArray(env)) invalid('env must be an object');
   for (const [key, value] of Object.entries(env)) {
@@ -69,7 +79,7 @@ export function validateNode(input, {
     image: input.image.trim(),
     env: { ...env },
     restartPolicy: input.restartPolicy || 'no',
-    networks: Array.isArray(input.networks) ? [...input.networks] : [],
+    networks: [...new Set(networks)],
     source: input.source || 'added',
     createdAt: input.createdAt || new Date().toISOString(),
     autoStartUntil: input.autoStartUntil ?? null,

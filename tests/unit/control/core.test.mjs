@@ -308,3 +308,17 @@ test('discovery skips privileged containers and containers without a /workspace 
   });
   assert.deepEqual(await store.getNodes(), []);
 });
+
+test('networks on add are validated as user-defined names and attached through the create body', () => {
+  const input = { name: 'nd-net', workspace: '/home/me/repos/site', port: 43196, image: 'node-dev-host:latest' };
+  const options = { allowedImages: ['node-dev-host'], workspaceRoots: [] };
+  const record = validateNode({ ...input, networks: ['nd-console_default', 'nd-console_default'] }, options);
+  assert.deepEqual(record.networks, ['nd-console_default']);
+  assert.deepEqual(Object.keys(createBody(record).NetworkingConfig.EndpointsConfig), ['nd-console_default']);
+  assert.equal(createBody(validateNode(input, options)).NetworkingConfig, undefined);
+  assert.throws(() => validateNode({ ...input, networks: 'nd-console_default' }, options), /array of network names/);
+  assert.throws(() => validateNode({ ...input, networks: ['bridge'] }, options), /user-defined/);
+  assert.throws(() => validateNode({ ...input, networks: ['host'] }, options), /user-defined/);
+  assert.throws(() => validateNode({ ...input, networks: ['bad name'] }, options), /invalid network name/);
+  assert.throws(() => validateNode({ ...input, networks: ['a', 'b', 'c', 'd', 'e'] }, options), /at most 4/);
+});

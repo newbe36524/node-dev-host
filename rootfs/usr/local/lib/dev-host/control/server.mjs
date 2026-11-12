@@ -15,7 +15,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { createDiscovery } from './discovery.mjs';
 import { createDockerClient, DockerUnavailable, dockerMessage, HttpError } from './docker.mjs';
-import { addNodeRecord, createBody, deleteNodeRecord, nextPort, parseAllowedImages, parseWorkspaceRoots } from './nodes.mjs';
+import { addNodeRecord, createBody, deleteNodeRecord, nextPort, parseAllowedImages, parseWorkspaceRoots, validateNode } from './nodes.mjs';
 import { createOperationTracker } from './operations.mjs';
 import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from './schedule.mjs';
 import { createStore } from './store.mjs';
@@ -214,6 +214,13 @@ async function ensureStoreWritable() {
   if (!(await store.status()).writable) {
     throw new HttpError(503, `node records cannot be saved; check CONTROL_DATA_DIR at ${DATA_DIR}`);
   }
+}
+
+// A network named in an add request must already exist, so a typo fails at add time, not at start.
+async function ensureNetworkExists(network) {
+  const r = await dockerRaw('GET', `/networks/${enc(network)}`);
+  if (r.status === 404) throw new HttpError(400, `network not found: ${network}`);
+  if (r.status !== 200) throw new HttpError(502, dockerMessage(r));
 }
 
 function nodeHttpPort(record) {
@@ -461,6 +468,8 @@ async function serveApi(req, res, url) {
     if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'POST' });
     const body = await readJsonBody(req);
     await ensureStoreWritable();
+    validateNode(body, { allowedImages: ALLOWED_IMAGES, workspaceRoots: WORKSPACE_ROOTS });
+    for (const network of body.networks ?? []) await ensureNetworkExists(network);
     const summaries = await labelledSummaries();
     const result = await addNodeRecord(store, body, {
       allowedImages: ALLOWED_IMAGES,
