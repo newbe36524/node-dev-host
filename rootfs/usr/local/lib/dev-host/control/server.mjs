@@ -13,10 +13,12 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import { createDockerClient, DockerUnavailable, dockerMessage, HttpError } from './docker.mjs';
 
 const env = process.env;
 const PORT = Number(env.HTTP_PORT) > 0 ? Number(env.HTTP_PORT) : 8080;
 const SOCKET = env.DOCKER_SOCKET || '/var/run/docker.sock';
+const { dockerRaw } = createDockerClient(SOCKET);
 const READONLY = /^(1|true|yes|on)$/i.test(env.CONTROL_READONLY || '');
 const ALLOWED_HOSTS = new Set([
   '127.0.0.1', 'localhost', '[::1]',
@@ -33,56 +35,6 @@ const MAX_TAIL = 1000;
 const DEFAULT_TAIL = 200;
 
 const log = (...parts) => console.log(`[control ${new Date().toISOString().slice(11, 19)}]`, ...parts);
-
-// ---- errors -------------------------------------------------------------------
-
-class HttpError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
-}
-
-class DockerUnavailable extends HttpError {
-  constructor(message) { super(503, message); }
-}
-
-function dockerUnavailable(err) {
-  if (err.code === 'ENOENT') {
-    return new DockerUnavailable(
-      `Docker socket not found at ${SOCKET}. Mount it with -v /var/run/docker.sock:/var/run/docker.sock`);
-  }
-  if (err.code === 'EACCES') {
-    return new DockerUnavailable(`Permission denied on the Docker socket ${SOCKET}`);
-  }
-  if (err.code === 'ECONNREFUSED') {
-    return new DockerUnavailable(`Docker is not answering on ${SOCKET}`);
-  }
-  return new DockerUnavailable(`Docker is unreachable at ${SOCKET}: ${err.message}`);
-}
-
-// ---- Docker Engine API over the unix socket ----------------------------------
-
-function dockerRaw(method, apiPath, { body, timeout } = {}) {
-  return new Promise((resolve, reject) => {
-    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
-    const headers = payload ? { 'content-type': 'application/json', 'content-length': payload.length } : {};
-    const req = http.request({ socketPath: SOCKET, path: apiPath, method, headers }, (res) => {
-      const chunks = [];
-      res.on('data', (chunk) => chunks.push(chunk));
-      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
-      res.on('error', reject);
-    });
-    if (timeout) req.setTimeout(timeout, () => req.destroy(new Error(`Docker did not answer within ${timeout} ms`)));
-    req.on('error', (err) => reject(dockerUnavailable(err)));
-    req.end(payload ?? undefined);
-  });
-}
-
-function dockerMessage(r) {
-  try {
-    const parsed = JSON.parse(r.body.toString('utf8'));
-    if (parsed && parsed.message) return parsed.message;
-  } catch { /* not JSON */ }
-  return r.body.toString('utf8').trim() || `Docker returned HTTP ${r.status}`;
-}
 
 const enc = (name) => encodeURIComponent(name);
 
