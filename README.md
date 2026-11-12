@@ -1,6 +1,6 @@
 # node-dev-host
 
-A Docker image that builds your mounted source into `dist` and serves it with Caddy, all inside one long-lived container. Edit files on the host; the container rebuilds by itself, so you never restart it for a change.
+A Docker image that builds your mounted source into `dist` and serves it with Caddy, all inside one long-lived container. Edit files on the host; the container rebuilds by itself, so you never restart it for a change. The project is mounted read-only: the container copies it and builds the copy, so nothing is written into your project folder.
 
 Image: `ghcr.io/newbe36524/node-dev-host` (`linux/amd64`, `linux/arm64`)
 
@@ -9,7 +9,7 @@ Image: `ghcr.io/newbe36524/node-dev-host` (`linux/amd64`, `linux/arm64`)
 | Tag | What it is |
 | --- | --- |
 | `latest` | Plain host. Mount your project at `/workspace`. |
-| `demo` | Same host plus a small Vite + TypeScript project, already built and served. |
+| `demo` | Same host plus a small Vite + TypeScript project. It installs and builds on first start. |
 | `alpine` | Plain host on Alpine (musl libc). About 28% smaller uncompressed. |
 | `demo-alpine` | The demo on Alpine. |
 
@@ -19,7 +19,7 @@ A git tag `v1.2.3` also publishes `1.2.3`, `1.2.3-demo`, `1.2.3-alpine` and `1.2
 
 ## Features
 
-- Installs dependencies and runs your build command, then serves the output folder.
+- Copies your mounted source into a private build directory, installs dependencies and runs your build command there, then serves the output. The project folder is never written to, so `node_modules` and `dist` do not appear in it.
 - Polls the source tree and rebuilds once the changes settle. A burst of saves makes one build; `DEBOUNCE_SECONDS`, `MIN_BUILD_INTERVAL` and `MAX_WAIT_SECONDS` tune it.
 - Keeps serving the last good build when a new build fails.
 - Serves `index.html` for unknown paths (SPA mode) and can proxy an API path to another port.
@@ -35,9 +35,20 @@ docker run --rm -p 8080:8080 ghcr.io/newbe36524/node-dev-host:demo
 # open http://localhost:8080
 
 docker run -d --name my-site -p 8080:8080 \
-  -v "$PWD":/workspace \
+  -v "$PWD":/workspace:ro \
+  -v node-dev-host-pnpm:/var/lib/dev-host/pnpm \
   ghcr.io/newbe36524/node-dev-host:latest
 ```
+
+## Share the package cache
+
+The `-v` line above keeps the pnpm store in a named volume, so a new container reuses the packages that are already downloaded. In a test, a second container reused 17 of its 18 packages and downloaded only the one new package. The image sets `PNPM_CONFIG_STORE_DIR` for this. If you override it, keep the store inside the volume, or pnpm ignores the volume and the cache is not shared.
+
+- **Host directory instead of a volume:** add `--user "$(id -u):$(id -g)" -e HOME=/tmp` and mount `"$HOME/.cache/node-dev-host/pnpm"` at `/var/lib/dev-host/pnpm`. A named volume is root-owned and does not work with `--user`.
+- **npm projects:** mount a volume at `/var/lib/dev-host/npm-cache` and set `-e npm_config_cache=/var/lib/dev-host/npm-cache`.
+- **Several containers at once** can share one volume. Removing containers does not remove the volume; `docker volume rm node-dev-host-pnpm` resets it.
+
+The skill has the details and the trade-offs: [`skills/node-dev-host/SKILL.md`](skills/node-dev-host/SKILL.md#share-the-package-cache).
 
 ## Use it with an AI agent
 
