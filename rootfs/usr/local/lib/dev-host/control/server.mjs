@@ -531,7 +531,7 @@ async function serveApi(req, res, url) {
   if (!ACTIONS.has(action)) return sendJson(res, 400, { error: `action not supported: ${action}` });
   if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'POST' });
   let body = {};
-  if (action === 'start' && (req.headers['content-type'] || req.headers['content-length'] || req.headers['transfer-encoding'])) {
+  if (action === 'start' && (req.headers['content-type'] || Number(req.headers['content-length']) > 0 || req.headers['transfer-encoding'])) {
     body = await readJsonBody(req);
     if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => key !== 'autoStart')) {
       throw new HttpError(400, 'start body may contain only autoStart');
