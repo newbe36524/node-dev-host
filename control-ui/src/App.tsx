@@ -1,5 +1,7 @@
 import { Loader2, RefreshCw, ShieldAlert } from "lucide-react"
+import { ThemeProvider } from "next-themes"
 import { ContainerTable } from "@/components/ContainerTable"
+import { ThemeToggle } from "@/components/ThemeToggle"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Toaster } from "@/components/ui/sonner"
@@ -12,6 +14,15 @@ function countText(total: number, running: number) {
 }
 
 export default function App() {
+  // Adds or removes the `dark` class on <html>. The default follows the OS setting until the user picks one.
+  return (
+    <ThemeProvider attribute="class" defaultTheme="system" enableSystem storageKey="dev-host-theme">
+      <Dashboard />
+    </ThemeProvider>
+  )
+}
+
+function Dashboard() {
   const { data, error, stale, updatedAt, polling, refresh } = usePolling(listContainers)
   const running = data?.containers.filter((c) => c.state === "running").length ?? 0
 
@@ -25,6 +36,7 @@ export default function App() {
           </p>
         </div>
         <div className="flex items-center gap-3">
+          <ThemeToggle />
           {data?.readOnly && (
             <Badge variant="secondary" data-testid="read-only-status">
               <ShieldAlert />
