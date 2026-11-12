@@ -10,6 +10,12 @@ DIST_DIR="${DIST_DIR:-dist}"
 INSTALL_CMD="${INSTALL_CMD:-}"
 BUILD_CMD="${BUILD_CMD:-pnpm build}"
 POLL_INTERVAL="${POLL_INTERVAL:-2}"
+# Build only after the tree has been quiet this long (a burst of saves gives one build).
+DEBOUNCE_SECONDS="${DEBOUNCE_SECONDS:-3}"
+# Wait at least this long after a build finishes before the next one.
+MIN_BUILD_INTERVAL="${MIN_BUILD_INTERVAL:-10}"
+# Build anyway when a change has been pending this long, even if edits never stop.
+MAX_WAIT_SECONDS="${MAX_WAIT_SECONDS:-60}"
 HTTP_PORT="${HTTP_PORT:-8080}"
 SPA="${SPA:-true}"
 API_PATH="${API_PATH:-/api/*}"
@@ -116,20 +122,28 @@ run_build() {
 }
 
 build_loop() {
-  local sig prev
+  local sig prev now changed_at=0 pending=0 pending_since=0 last_build
   BUILDS=0; FAILURES=0; LAST_EXIT=null; DEPS_SIG=""
   run_build initial
+  last_build=$(date +%s)
   prev="$(source_sig)"
   while sleep "$POLL_INTERVAL"; do
+    now=$(date +%s)
     if [ -f "$TRIGGER_FILE" ]; then
-      rm -f "$TRIGGER_FILE"; run_build manual; prev="$(source_sig)"; continue
+      rm -f "$TRIGGER_FILE"; run_build manual
+      last_build=$(date +%s); pending=0; prev="$(source_sig)"; continue
     fi
     sig="$(source_sig)"
-    [ "$sig" = "$prev" ] && continue
-    # Wait for the change to settle (editors and git write in bursts).
-    sleep "$POLL_INTERVAL"; prev="$(source_sig)"
-    [ "$prev" != "$sig" ] && continue
+    if [ "$sig" != "$prev" ]; then
+      # Every change restarts the quiet window, so a burst of saves ends in one build.
+      prev="$sig"; changed_at=$now
+      if [ "$pending" -eq 0 ]; then pending=1; pending_since=$now; fi
+    fi
+    [ "$pending" -eq 1 ] || continue
+    [ $(( now - last_build )) -ge "$MIN_BUILD_INTERVAL" ] || continue
+    [ $(( now - changed_at )) -ge "$DEBOUNCE_SECONDS" ] || [ $(( now - pending_since )) -ge "$MAX_WAIT_SECONDS" ] || continue
     run_build "source changed"
+    last_build=$(date +%s); pending=0
     # Files the build itself writes (tsbuildinfo, generated code) must not retrigger it.
     prev="$(source_sig)"
   done
