@@ -10,16 +10,22 @@ Image: `ghcr.io/newbe36524/node-dev-host` (`linux/amd64`, `linux/arm64`)
 | --- | --- |
 | `latest` | Plain host. Mount your project at `/workspace`. |
 | `demo` | Same host plus a small Vite + TypeScript project, already built and served. |
+| `alpine` | Plain host on Alpine (musl libc). About 28% smaller uncompressed. |
+| `demo-alpine` | The demo on Alpine. |
 
-A git tag `v1.2.3` also publishes `1.2.3` (host) and `1.2.3-demo` (demo).
+Use the Alpine tags if your project has no glibc-only native dependencies; the Debian tags are the default.
+
+A git tag `v1.2.3` also publishes `1.2.3`, `1.2.3-demo`, `1.2.3-alpine` and `1.2.3-demo-alpine`.
 
 ## Features
 
 - Installs dependencies and runs your build command, then serves the output folder.
-- Polls the source tree and rebuilds after changes settle.
+- Polls the source tree and rebuilds once the changes settle. A burst of saves makes one build; `DEBOUNCE_SECONDS`, `MIN_BUILD_INTERVAL` and `MAX_WAIT_SECONDS` tune it.
 - Keeps serving the last good build when a new build fails.
 - Serves `index.html` for unknown paths (SPA mode) and can proxy an API path to another port.
 - Reports build state as JSON at `/__dev-host/status.json` and `dev-host status`, and lets you trigger a rebuild with `dev-host rebuild`.
+- Adds `X-Build-Time` (UTC, when the served build finished) and `X-Build-Duration` (seconds) response headers, so a client can tell how fresh `dist` is.
+- Prunes unused pnpm packages after each dependency install, so the store does not grow without bound.
 - Configured with environment variables.
 
 ## Quick start
@@ -59,7 +65,11 @@ The demo project is in [`demo/`](demo) if you want a template.
 ```sh
 docker build -t node-dev-host:latest .               # host
 docker build --target demo -t node-dev-host:demo .   # demo
+docker build --target host-alpine -t node-dev-host:alpine .        # alpine host
+docker build --target demo-alpine -t node-dev-host:demo-alpine .   # alpine demo
 ```
+
+The image is kept small on purpose: each build step removes what it creates, and package caches are BuildKit cache mounts that never reach a layer. The published tags use zstd layers (about 24% smaller to pull than gzip), which needs a Docker client that can read zstd.
 
 Build args: `NODE_VERSION`, `CADDY_VERSION`, `PNPM_VERSION`, `TYPESCRIPT_VERSION`, `TSX_VERSION`.
 

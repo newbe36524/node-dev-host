@@ -15,8 +15,10 @@ Inside the image: Node 24, `pnpm`, `typescript` (`tsc`), `tsx`, `git`, `curl`, a
 | --- | --- |
 | `ghcr.io/newbe36524/node-dev-host:latest` | The user has their own project. Mount it. |
 | `ghcr.io/newbe36524/node-dev-host:demo` | The user wants to see the image work with no project. Nothing to mount. |
+| `ghcr.io/newbe36524/node-dev-host:alpine` | The user has their own project and wants a smaller image. Alpine (musl). Use only if the project has no glibc-only native dependencies. |
+| `ghcr.io/newbe36524/node-dev-host:demo-alpine` | The demo on Alpine. |
 
-Use an exact version tag (`1.2.3` or `1.2.3-demo`) when the user needs a pinned image. Both variants run `linux/amd64` and `linux/arm64`.
+Use an exact version tag (`1.2.3`, `1.2.3-demo`, `1.2.3-alpine` or `1.2.3-demo-alpine`) when the user needs a pinned image. All variants run `linux/amd64` and `linux/arm64`. The Debian tags are the default; choose Alpine only on request or when the image size matters.
 
 ## Run it
 
@@ -44,7 +46,7 @@ Rules:
 1. `dev-host` writes the Caddyfile (or copies `CADDYFILE`) and writes `status.json` with state `starting`.
 2. Caddy starts on `HTTP_PORT` and serves `/workspace/$DIST_DIR`.
 3. The build loop runs install (when needed), then the build. This is the initial build.
-4. Every `POLL_INTERVAL` seconds it hashes the source tree. When the hash changes and stays stable for one more interval, it rebuilds.
+4. Every `POLL_INTERVAL` seconds it hashes the source tree. A change starts a build only after the tree has been quiet for `DEBOUNCE_SECONDS`. Builds are at least `MIN_BUILD_INTERVAL` seconds apart, and a change that never settles still builds after `MAX_WAIT_SECONDS`. A burst of saves therefore gives one build, not one per save.
 
 Polling is deliberate: file-watch events are unreliable across Docker bind mounts on macOS and Windows.
 
@@ -69,6 +71,13 @@ curl http://localhost:<host-port>/__dev-host/status.json
 
 The container health check requests `status.json` on `HTTP_PORT`. A container that stays unhealthy while running usually has an `HTTP_PORT` that does not match the port Caddy serves, or a custom Caddyfile that listens elsewhere.
 
+Responses for `dist` carry the build that produced them:
+
+- `X-Build-Time`: UTC time the last successful build finished, for example `2026-11-11T08:00:00Z`.
+- `X-Build-Duration`: seconds that build took, including the install when one ran.
+
+Both are blank until this container completes a build. A failed build leaves them unchanged, because the served `dist` is still the earlier one. A custom `CADDYFILE` does not get these headers unless it adds them itself with `header X-Build-Time "{file./var/lib/dev-host/build-time}"`.
+
 ## Configuration
 
 All variables are optional.
@@ -83,6 +92,9 @@ All variables are optional.
 | `API_UPSTREAM` | empty | For example `host.docker.internal:3000`. Enables the reverse proxy. Add `--add-host=host.docker.internal:host-gateway` on Linux. |
 | `API_PATH` | `/api/*` | Path matcher forwarded to `API_UPSTREAM`. |
 | `POLL_INTERVAL` | `2` | Seconds between source checks. |
+| `DEBOUNCE_SECONDS` | `3` | Quiet time the source must have before a build starts. Raise it if saves come in slow bursts (for example from a formatter on save). |
+| `MIN_BUILD_INTERVAL` | `10` | Minimum seconds between the end of one build and the start of the next. |
+| `MAX_WAIT_SECONDS` | `60` | Longest a pending change waits even if edits keep coming. |
 | `CADDYFILE` | unset | Path inside the container to a custom Caddyfile, copied over the generated one. `API_UPSTREAM`, `API_PATH` and `SPA` then have no effect. `HTTP_PORT` still drives the health check, so keep it matching the custom file's listen port. Mount the file with `-v`. |
 | `WORKSPACE` | `/workspace` | Source root inside the container. Change only if the mount point changes. |
 
@@ -97,6 +109,9 @@ Dependencies are reinstalled when `package.json`, `pnpm-lock.yaml`, `pnpm-worksp
 - **Demo image installs once at start.** The demo image already has dependencies, but the first build after start still runs the install command once, against the lockfile.
 - **A failed first build leaves nothing to serve.** If no build has ever succeeded, `dist` is missing or empty, so requests return 404 until a build works.
 - **Ports.** A changed `HTTP_PORT` must be matched in `-p`, and it is also used by the health check.
+- **Disk use.** pnpm keeps its store in `node_modules/.pnpm-store` inside the mounted project, so the store uses host disk. The loop runs `pnpm store prune` after each successful install to drop packages no project uses. Docker keeps container logs without a size limit by default; add `--log-opt max-size=10m --log-opt max-file=3` to `docker run` on a long-lived container.
+- **Memory use.** An idle container uses about 14 MiB of RAM (Caddy plus the polling loop). Memory peaks during `pnpm install` and the build, which exit when done. Use `--memory` to cap a large build on a small host.
+- **Polling cost.** Each poll walks the source tree (not `node_modules`). Measured at about 50 ms of CPU for 10,000 source files. Raise `POLL_INTERVAL` on very large trees.
 - **Not a production server.** The image is for development previews and local work. Deploy the built `dist` with the project's own hosting.
 
 ## Build the image locally
@@ -104,13 +119,15 @@ Dependencies are reinstalled when `package.json`, `pnpm-lock.yaml`, `pnpm-worksp
 ```sh
 docker build -t node-dev-host:latest .               # host
 docker build --target demo -t node-dev-host:demo .   # demo
+docker build --target host-alpine -t node-dev-host:alpine .        # alpine host
+docker build --target demo-alpine -t node-dev-host:demo-alpine .   # alpine demo
 ```
 
 Build args: `NODE_VERSION` (24), `CADDY_VERSION` (2), `PNPM_VERSION`, `TYPESCRIPT_VERSION`, `TSX_VERSION`.
 
 ## Files in this repo
 
-- `Dockerfile`: `base` (shared), `demo`, and `host` targets. `host` stays last so a bare `docker build .` produces it.
+- `Dockerfile`: Debian targets `base`, `demo`, `host`; Alpine targets `base-alpine`, `demo-alpine`, `host-alpine`. `host` stays last so a bare `docker build .` produces the Debian host image.
 - `rootfs/usr/local/bin/dev-host`: the entrypoint script with `run`, `rebuild`, and `status` commands.
 - `demo/`: the demo project copied into the `demo` image.
 - `.github/workflows/publish.yml`: publishes both variants on push to `main`, on `v*` tags, weekly, and on manual dispatch.
