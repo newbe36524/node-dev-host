@@ -1,0 +1,121 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-11T12:00:00Z",
+  "title": "Design System: node-dev-host control dashboard",
+  "extensions": {
+    "colorMeta": {
+      "graphite": { "role": "primary", "displayName": "Graphite", "canonical": "oklch(0.205 0 0)", "tonalRamp": ["oklch(0.15 0 0)", "oklch(0.205 0 0)", "oklch(0.3 0 0)", "oklch(0.44 0 0)", "oklch(0.556 0 0)", "oklch(0.708 0 0)", "oklch(0.922 0 0)", "oklch(0.97 0 0)"] },
+      "signal-ok": { "role": "secondary", "displayName": "Signal Ok", "canonical": "oklch(0.508 0.118 165.612)", "tonalRamp": ["oklch(0.28 0.06 165)", "oklch(0.4 0.09 165)", "oklch(0.508 0.118 165.6)", "oklch(0.596 0.145 163.2)", "oklch(0.696 0.15 162.5)", "oklch(0.79 0.13 162)", "oklch(0.9 0.07 162)", "oklch(0.96 0.03 162)"] },
+      "signal-building": { "role": "secondary", "displayName": "Signal Building", "canonical": "oklch(0.5 0.134 242.749)", "tonalRamp": ["oklch(0.29 0.07 242)", "oklch(0.4 0.1 242)", "oklch(0.5 0.134 242.7)", "oklch(0.588 0.158 242)", "oklch(0.685 0.16 242)", "oklch(0.78 0.12 237)", "oklch(0.9 0.06 235)", "oklch(0.96 0.02 235)"] },
+      "fault-red": { "role": "tertiary", "displayName": "Fault Red", "canonical": "oklch(0.577 0.245 27.325)", "tonalRamp": ["oklch(0.28 0.1 27)", "oklch(0.4 0.15 27)", "oklch(0.5 0.21 27)", "oklch(0.577 0.245 27.3)", "oklch(0.704 0.191 22.2)", "oklch(0.8 0.12 22)", "oklch(0.9 0.06 22)", "oklch(0.97 0.02 22)"] },
+      "paper": { "role": "neutral", "displayName": "Paper", "canonical": "oklch(1 0 0)", "tonalRamp": ["oklch(0.145 0 0)", "oklch(0.269 0 0)", "oklch(0.4 0 0)", "oklch(0.556 0 0)", "oklch(0.708 0 0)", "oklch(0.922 0 0)", "oklch(0.97 0 0)", "oklch(1 0 0)"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Page Title", "purpose": "The single page heading, 'Dev host control'." },
+      "body": { "displayName": "Body", "purpose": "Table cells, alerts and the container count line." },
+      "label": { "displayName": "Status Label", "purpose": "Status badges and the refresh indicator." }
+    },
+    "shadows": [
+      { "name": "shadow-xs", "value": "0 1px 2px 0 rgb(0 0 0 / 0.05)", "purpose": "Only on the outline button. The data surface has no shadows." }
+    ],
+    "motion": [
+      { "name": "refresh-spin", "value": "spin 1s linear infinite", "purpose": "Spinner shown while a poll request is in flight." },
+      { "name": "state-transition", "value": "all 150ms cubic-bezier(0.4, 0, 0.2, 1)", "purpose": "Hover and focus transitions on buttons and badges." }
+    ],
+    "breakpoints": [
+      { "name": "md", "value": "768px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Build State Badge (ok)",
+      "kind": "chip",
+      "refersTo": "badge-build-ok",
+      "description": "Signature status pill. Shows the build state word on a solid signal colour.",
+      "html": "<span class=\"ds-badge ds-badge-ok\">ok</span> <span class=\"ds-badge ds-badge-building\">building</span> <span class=\"ds-badge ds-badge-failed\">failed</span> <span class=\"ds-badge ds-badge-waiting\">waiting</span> <span class=\"ds-badge ds-badge-stopped\">stopped</span>",
+      "css": ".ds-badge { display: inline-flex; align-items: center; height: 20px; padding: 2px 8px; border-radius: 1.625rem; border: 1px solid transparent; font: 500 0.75rem/1.33 ui-sans-serif, system-ui, sans-serif; white-space: nowrap; } .ds-badge-ok { background: oklch(0.508 0.118 165.612); color: oklch(0.985 0 0); } .ds-badge-building { background: oklch(0.5 0.134 242.749); color: oklch(0.985 0 0); } .ds-badge-failed { background: oklch(0.577 0.245 27.325 / 10%); color: oklch(0.577 0.245 27.325); } .ds-badge-waiting { border-color: oklch(0.922 0 0); color: oklch(0.145 0 0); } .ds-badge-stopped { border: 1px dashed oklch(0.922 0 0); color: oklch(0.556 0 0); }"
+    },
+    {
+      "name": "Default Button",
+      "kind": "button",
+      "refersTo": "button-default",
+      "description": "Primary neutral action button.",
+      "html": "<button class=\"ds-btn\">Rebuild</button>",
+      "css": ".ds-btn { height: 36px; padding: 0 10px; border: 1px solid transparent; border-radius: 0.5rem; background: oklch(0.205 0 0); color: oklch(0.985 0 0); font: 500 0.875rem/1.43 ui-sans-serif, system-ui, sans-serif; transition: all 150ms; cursor: pointer; } .ds-btn:hover { background: oklch(0.205 0 0 / 80%); } .ds-btn:focus-visible { outline: none; border-color: oklch(0.708 0 0); box-shadow: 0 0 0 3px oklch(0.708 0 0 / 50%); } .ds-btn:active { transform: translateY(1px); }"
+    },
+    {
+      "name": "Outline Button",
+      "kind": "button",
+      "refersTo": "button-outline",
+      "description": "Row action: Rebuild, Restart, Stop. Quiet on purpose.",
+      "html": "<button class=\"ds-btn-outline\">Restart</button>",
+      "css": ".ds-btn-outline { height: 32px; padding: 0 10px; border: 1px solid oklch(0.922 0 0); border-radius: 0.5rem; background: oklch(1 0 0); color: oklch(0.145 0 0); font: 500 0.875rem/1.43 ui-sans-serif, system-ui, sans-serif; box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05); transition: all 150ms; cursor: pointer; } .ds-btn-outline:hover { background: oklch(0.97 0 0); } .ds-btn-outline:focus-visible { outline: none; border-color: oklch(0.708 0 0); box-shadow: 0 0 0 3px oklch(0.708 0 0 / 50%); }"
+    },
+    {
+      "name": "Refresh Indicator",
+      "kind": "custom",
+      "refersTo": "label",
+      "description": "Header readout of the panel's own freshness.",
+      "html": "<span class=\"ds-refresh\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8\"/><path d=\"M21 3v5h-5\"/><path d=\"M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16\"/><path d=\"M8 16H3v5\"/></svg>Updated 14:02:31</span>",
+      "css": ".ds-refresh { display: inline-flex; align-items: center; gap: 6px; font: 400 0.75rem/1.33 ui-sans-serif, system-ui, sans-serif; color: oklch(0.556 0 0); font-variant-numeric: tabular-nums; }"
+    },
+    {
+      "name": "Stale-Data Alert",
+      "kind": "card",
+      "refersTo": "alert-stale",
+      "description": "Shown above the rows when the latest refresh failed. Rows below stay visible.",
+      "html": "<div class=\"ds-alert\" role=\"alert\"><div class=\"ds-alert-title\">Data may be stale</div><div class=\"ds-alert-body\">The last refresh failed (Request failed with HTTP 502). The rows below are from the last good refresh.</div></div>",
+      "css": ".ds-alert { padding: 12px 16px; border: 1px solid oklch(0.922 0 0); border-radius: 0.625rem; background: oklch(1 0 0); color: oklch(0.577 0.245 27.325); font: 400 0.875rem/1.43 ui-sans-serif, system-ui, sans-serif; } .ds-alert-title { font-weight: 500; } .ds-alert-body { color: oklch(0.577 0.245 27.325 / 90%); }"
+    },
+    {
+      "name": "Container Row",
+      "kind": "card",
+      "refersTo": "container-table",
+      "description": "One container: identity, then build state and freshness, then actions.",
+      "html": "<div class=\"ds-row\"><span class=\"ds-name\">nd-my-site</span><span class=\"ds-port\">43101</span><span class=\"ds-badge ds-badge-out\">running</span><span class=\"ds-badge ds-badge-ok2\">ok</span><span class=\"ds-time\">11/11/2026, 14:02:11</span></div>",
+      "css": ".ds-row { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border: 1px solid oklch(0.922 0 0); border-radius: 0.5rem; background: oklch(1 0 0); color: oklch(0.145 0 0); font: 400 0.875rem/1.43 ui-sans-serif, system-ui, sans-serif; } .ds-row:hover { background: oklch(0.97 0 0 / 50%); } .ds-name { font-weight: 500; } .ds-port { font-variant-numeric: tabular-nums; } .ds-badge-out { display: inline-flex; align-items: center; height: 20px; padding: 2px 8px; border: 1px solid oklch(0.922 0 0); border-radius: 1.625rem; font: 500 0.75rem/1.33 ui-sans-serif, system-ui, sans-serif; } .ds-badge-ok2 { display: inline-flex; align-items: center; height: 20px; padding: 2px 8px; border-radius: 1.625rem; background: oklch(0.508 0.118 165.612); color: oklch(0.985 0 0); font: 500 0.75rem/1.33 ui-sans-serif, system-ui, sans-serif; } .ds-time { color: oklch(0.556 0 0); font-variant-numeric: tabular-nums; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Bridge Instrument Panel",
+    "overview": "node-dev-host does its real work out of sight. A container copies a project, builds it, and serves it with Caddy, and you never open a window onto any of that. The control dashboard is the only place the work becomes visible. It is the product's observation deck, not an admin extra. If a build fails, a refresh stalls, or a container sits in `unknown`, the dashboard is the single surface that tells you, so the whole design is arranged to make that answer readable at a glance.",
+    "keyCharacteristics": [
+      "State first: build state, freshness and health are the loudest things on screen; actions are the quietest.",
+      "Neutral by default, colour only as signal. Three hues, each tied to one meaning.",
+      "Every status is carried by a word as well as a colour, so it survives colour blindness and greyscale.",
+      "The panel reports on itself: last-refresh time, refreshing indicator, stale warning, read-only mode.",
+      "Flat and calm. Depth is a hairline border; motion is limited to the refresh spinner and state transitions.",
+      "Same hierarchy on a wide table and on a phone-width stacked card."
+    ],
+    "rules": [
+      { "name": "The Three Signals Rule", "body": "Green, blue and red each mean one thing: ok, building, failed. No other element on the dashboard may use those hues.", "section": "colors" },
+      { "name": "The Word Beside the Colour Rule", "body": "A status is never colour alone. Every badge prints its state name.", "section": "colors" },
+      { "name": "The Quiet Normal Rule", "body": "The healthy path is the quietest. Only `failed` and a stale refresh are allowed to raise the visual volume.", "section": "colors" },
+      { "name": "The Tabular Numbers Rule", "body": "Ports, counts and times use fixed-width figures so a polled value changing does not shift the layout.", "section": "typography" },
+      { "name": "The One Title Rule", "body": "The page has one heading. Hierarchy below it comes from weight, colour and position.", "section": "typography" },
+      { "name": "The Flat-By-Default Rule", "body": "Surfaces are flat at rest. Nothing on the data surface casts a shadow.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do lead every container row with state: the build badge and the last-build time are the first things a scan should land on after the name.",
+      "Do print the state name inside every status badge (The Word Beside the Colour Rule).",
+      "Do show the panel's own health in the header: last update time, refreshing indicator, read-only mode.",
+      "Do keep the last good data on screen when a refresh fails, and put the stale alert above it.",
+      "Do show `unknown` or an em dash when a value cannot be read. Never invent a state, never leave a blank cell.",
+      "Do keep layout stable across polls: fixed-width figures, content-driven widths, rows keyed by container id.",
+      "Do keep Logs reachable in every mode, including read-only and for stopped containers.",
+      "Do keep the status hues to their three meanings (green ok, blue building, red failed) in both themes.",
+      "Do check any new status colour in light and dark for 4.5:1 text contrast before shipping it."
+    ],
+    "donts": [
+      "Don't use green, blue or red for decoration, links, hover states or branding.",
+      "Don't communicate a state by colour alone, or by an icon without a word.",
+      "Don't hide, collapse or silently clear failure information.",
+      "Don't add a hero, a marketing banner, illustrations or large decorative empty space above the table.",
+      "Don't add shadows, gradients or glass effects to the data surface.",
+      "Don't reorder rows or reflow columns when data refreshes.",
+      "Don't let actions outrank status.",
+      "Don't colour the Docker container state badge.",
+      "Don't add a custom font, a second accent colour or a bespoke component where a shadcn primitive already fits."
+    ]
+  }
+}
