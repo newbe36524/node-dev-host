@@ -66,6 +66,9 @@ jobs:
       - name: Unit and component tests
         run: pnpm test
 
+      - name: Control server unit tests
+        run: node --test tests/unit
+
       - name: Build the dashboard
         run: pnpm build
 
