@@ -4,7 +4,7 @@ ARG CADDY_VERSION=2
 
 FROM caddy:${CADDY_VERSION}-alpine AS caddy
 
-# ---- base: everything shared by both published variants ----
+# ---- base: everything shared by all published variants ----
 FROM node:${NODE_VERSION}-bookworm-slim AS base
 LABEL org.opencontainers.image.source="https://github.com/newbe36524/node-dev-host" \
       org.opencontainers.image.description="Node dev host: Caddy + pnpm + TypeScript, builds mounted source to dist in one container" \
