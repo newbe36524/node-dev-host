@@ -22,7 +22,10 @@ with_store_lock() {
     *) echo "with_store_lock: mode must be shared or exclusive" >&2; return 2 ;;
   esac
   (
-    if command -v flock >/dev/null 2>&1 && exec 9>>"$STORE_LOCK" 2>/dev/null; then
+    # The folder may not exist yet (a container without the store volume). The redirection's own error goes to
+    # /dev/null too, because it is inside the braces.
+    mkdir -p "$(dirname "$STORE_LOCK")" 2>/dev/null
+    if command -v flock >/dev/null 2>&1 && { exec 9>>"$STORE_LOCK"; } 2>/dev/null; then
       if ! flock "$flag" 9; then
         echo "[store-lock] could not take the lock on $STORE_LOCK, running without it" >&2
       fi

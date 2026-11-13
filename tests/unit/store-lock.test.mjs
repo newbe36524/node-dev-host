@@ -58,10 +58,25 @@ test('an unknown mode is refused without running the command', () => {
   assert.deepEqual(lines, []);
 });
 
-test('when the lock file cannot be opened, the command still runs and says so', () => {
-  const missing = path.join(os.tmpdir(), `no-such-dir-${process.pid}`, 'store.lock');
-  const { status, lines, stderr } = runBash('with_store_lock exclusive bash -c \'echo ran >> "$LOG"\'', { storeLock: missing });
+test('a missing store folder is created, so the lock works in a container without the store volume', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'store-lock-parent-'));
+  const storeLock = path.join(dir, 'pnpm', 'store.lock');
+  const { status, lines, stderr } = runBash('with_store_lock exclusive bash -c \'echo ran >> "$LOG"\'', { storeLock });
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.equal(status, 0, stderr);
+  assert.deepEqual(lines, ['ran']);
+  assert.equal(stderr, '');
+});
+
+test('when the lock file cannot be opened, the command still runs, and the shell says nothing about the redirection', () => {
+  // The parent is a regular file, so the lock file can be opened by no user, root included.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'store-lock-blocked-'));
+  const blocker = path.join(dir, 'pnpm');
+  fs.writeFileSync(blocker, '');
+  const { status, lines, stderr } = runBash('with_store_lock exclusive bash -c \'echo ran >> "$LOG"\'', { storeLock: path.join(blocker, 'store.lock') });
+  fs.rmSync(dir, { recursive: true, force: true });
   assert.equal(status, 0);
   assert.deepEqual(lines, ['ran']);
   assert.match(stderr, /running without it/);
+  assert.doesNotMatch(stderr, /No such file|Not a directory/);
 });
