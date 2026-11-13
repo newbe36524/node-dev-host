@@ -120,7 +120,7 @@ start() {
 port()    { docker port "$(cn "$1")" 8080/tcp | head -n1 | sed 's/.*://'; }
 url()     { echo "http://127.0.0.1:$(port "$1")$2"; }
 status()  { docker exec "$(cn "$1")" dev-host status 2>/dev/null; }
-state()   { status "$1" | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p'; }
+state()   { status "$1" | sed -n 's/^{"state":"\([a-z]*\)".*/\1/p'; }
 builds()  { status "$1" | sed -n 's/.*"builds":\([0-9]*\).*/\1/p'; }
 # service_field SHORT FIELD: one field of the status "service" object (empty when there is none).
 service_field() { status "$1" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s).service?.[process.argv[1]];console.log(v ?? "")})' "$2"; }
@@ -227,6 +227,9 @@ test_api_proxy() {
   check "other paths are still served from the build" body_has api / marker-v1
 }
 
+service_pid_differs()      { [ "$(service_field service pid)" != "$1" ]; }
+service_restarts_at_least() { [ "$(service_field service restarts)" -ge "$1" ]; }
+
 test_service() {
   log "service: a process started from the workspace config serves /api/*, and a build or a crash restarts it"
   fresh_project service
@@ -251,12 +254,12 @@ SERVER
   before="$(builds service)"
   docker exec "$(cn service)" dev-host rebuild >/dev/null
   check "the rebuild finishes" poll 120 builds_above service "$before"
-  check "a successful build starts the service again with a new pid" poll 60 [ "$(service_field service pid)" != "$pid" ]
+  check "a successful build starts the service again with a new pid" poll 60 service_pid_differs "$pid"
   check "the restarted service answers" poll 60 body_has service /api/again '"from":"service"'
 
   pid="$(service_field service pid)"
   docker exec "$(cn service)" bash -c "kill -9 $pid"
-  check "a service that exits is restarted and the restart is counted" poll 60 [ "$(service_field service restarts)" -ge 1 ]
+  check "a service that exits is restarted and the restart is counted" poll 60 service_restarts_at_least 1
   check "the service answers after the restart" poll 60 body_has service /api/after-crash '"from":"service"'
 }
 
