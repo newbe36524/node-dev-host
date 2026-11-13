@@ -11,9 +11,10 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const mod = await import(path.join(here, '../../../rootfs/usr/local/lib/dev-host/workspace-config.mjs'));
 const {
-  buildExcludes, envFile, loadWorkspace, parseConfig, resolveSettings, ruleLines, statusFragment,
-  validateConfig, validateIgnoreEntry,
+  attachExternal, buildExcludes, envFile, externalOutputClash, loadWorkspace, parseConfig, resolveSettings,
+  ruleLines, statusFragment, validateConfig, validateIgnoreEntry,
 } = mod;
+const script = path.join(here, '../../../rootfs/usr/local/lib/dev-host/workspace-config.mjs');
 
 const reject = (text, pattern) => {
   assert.throws(() => validateConfig(parseConfig(text)), (err) => {
@@ -342,4 +343,352 @@ test('loadWorkspace refuses a symbolic link and an oversized file with a reason'
   fs.rmSync(path.join(dirs.workspace, '.node-dev-host.yaml'));
   fs.writeFileSync(path.join(dirs.workspace, '.node-dev-host.yaml'), `version: 1\nname: "${'x'.repeat(65 * 1024)}"\n`);
   assert.match(loadWorkspace(dirs.workspace, dirs.state, {}).error, /could not be read as configuration: larger than 64 KiB/);
+});
+
+// ---- external folders: 1.1 validation ---------------------------------------------------------------
+
+const withExternal = (external) => validateConfig({ version: 1, external });
+const lstatIf = (file) => {
+  try {
+    return fs.lstatSync(file);
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+};
+// The refusal names the entry as JSON, the way the reason is written.
+const refusesEntry = (entry) => assert.throws(() => withExternal([entry]), (err) => {
+  assert.match(err.message, /^external entry /);
+  assert.ok(err.message.includes(JSON.stringify(entry)), err.message);
+  return true;
+}, JSON.stringify(entry));
+
+test('external is optional, defaults to an empty list, and entries are normalized and merged', () => {
+  assert.deepEqual(validateConfig(parseConfig('version: 1')).external, []);
+  assert.deepEqual(validateConfig(parseConfig('version: 1\nexternal: [data/covers]')).external, ['data/covers']);
+  assert.deepEqual(withExternal(['data/covers/']).external, ['data/covers']);
+  assert.deepEqual(withExternal(['./data/covers']).external, ['data/covers']);
+  assert.deepEqual(withExternal(['data//covers']).external, ['data/covers']);
+  assert.deepEqual(withExternal(['data/covers', 'data/covers/']).external, ['data/covers']);
+  assert.deepEqual(withExternal(['data/covers', 'cache/images']).external, ['data/covers', 'cache/images']);
+});
+
+test('the external field is spelled exactly; a misspelling is an unknown field', () => {
+  reject('version: 1\nexternals: [data/covers]', /unknown field "externals"/);
+});
+
+test('external must be a list of strings', () => {
+  reject('version: 1\nexternal: data/covers', /external must be a list of strings/);
+  assert.throws(() => withExternal('data/covers'), /external must be a list of strings/);
+  assert.throws(() => withExternal([5]), /external must be a list of strings/);
+});
+
+test('restrict external entries: wildcards, escaping paths, the workspace root, blanks and spaces are refused by name', () => {
+  for (const entry of [
+    'data/*', 'cache/[a-z]', 'data/?x', // wildcards
+    '/srv/covers', '~/covers', '../covers', 'a/../../b', 'C:/covers', // escaping
+    'data\\covers', // backslash
+    '', '   ', ' data/covers', 'data/covers ', // blank and edge spaces
+    '.', './', // the workspace root
+    'a\nb', // control character
+  ]) {
+    refusesEntry(entry);
+  }
+});
+
+test('keep external entries clear of built-in names, the output folder and each other', () => {
+  for (const entry of ['node_modules/.cache', '.git/hooks', 'apps/node_modules']) refusesEntry(entry);
+  assert.throws(() => withExternal(['data', 'data/covers']), (err) => {
+    assert.equal(err.message, 'external entry "data/covers" lies inside external entry "data"');
+    return true;
+  });
+  // The output folder comes from the resolved settings, so the overlap is checked in loadWorkspace (see 1.2).
+  assert.match(externalOutputClash(['dist/media'], 'dist'), /external entry "dist\/media" overlaps the output folder "dist"/);
+  assert.match(externalOutputClash(['dist'], 'dist'), /overlaps the output folder "dist"/);
+  assert.equal(externalOutputClash(['data/covers'], 'dist'), null);
+  assert.match(externalOutputClash(['apps/web'], 'apps/web/dist'), /overlaps/);
+});
+
+// ---- 1.2 output folder overlap, from the file or the environment ------------------------------------
+
+test('an external entry that overlaps the output folder rejects the file, whether the folder comes from the file or the environment', () => {
+  const dirs = tempDirs();
+  const file = path.join(dirs.workspace, '.node-dev-host.yaml');
+  fs.writeFileSync(file, 'version: 1\nexternal: [data/covers]\nbuild:\n  distDir: data/covers/out\n');
+  let result = loadWorkspace(dirs.workspace, dirs.state, {});
+  assert.match(result.error, /external entry "data\/covers" overlaps the output folder "data\/covers\/out"/);
+  assert.equal(readStatus(dirs.state).external.length, 0);
+
+  fs.writeFileSync(file, 'version: 1\nexternal: [data/covers]\n');
+  result = loadWorkspace(dirs.workspace, dirs.state, { ENV_DIST_DIR: 'data' });
+  assert.match(result.error, /external entry "data\/covers" overlaps the output folder "data"/);
+
+  result = loadWorkspace(dirs.workspace, dirs.state, {});
+  assert.equal(result.error, null);
+  assert.deepEqual(readStatus(dirs.state).external, ['data/covers']);
+});
+
+// ---- 1.3 and 1.4 state and status ---------------------------------------------------------------------
+
+test('workspace-config.external is written for a valid or absent file and kept when a later file is rejected', () => {
+  const dirs = tempDirs();
+  const file = path.join(dirs.workspace, '.node-dev-host.yaml');
+  const listFile = path.join(dirs.state, 'workspace-config.external');
+  fs.writeFileSync(file, 'version: 1\nexternal: [data/covers, cache/images]\n');
+  assert.equal(loadWorkspace(dirs.workspace, dirs.state, {}).error, null);
+  assert.equal(fs.readFileSync(listFile, 'utf8'), 'data/covers\ncache/images\n');
+
+  fs.writeFileSync(file, 'version: 1\nexternal: [data/*]\n');
+  assert.match(loadWorkspace(dirs.workspace, dirs.state, {}).error, /external entry "data\/\*" must not contain a wildcard/);
+  assert.equal(fs.readFileSync(listFile, 'utf8'), 'data/covers\ncache/images\n');
+  assert.deepEqual(readStatus(dirs.state).external, []);
+
+  fs.rmSync(file);
+  assert.equal(loadWorkspace(dirs.workspace, dirs.state, {}).error, null);
+  assert.equal(fs.readFileSync(listFile, 'utf8'), '');
+  assert.deepEqual(readStatus(dirs.state).external, []);
+});
+
+test('the status fragment carries external: empty without a file, and JSON-encoded with quotes and backslashes', () => {
+  assert.deepEqual(JSON.parse(`{${statusFragment({}).slice(1)}}`).external, []);
+  const config = { external: ['data/"quoted"', 'back\\slash'] };
+  const parsed = JSON.parse(`{${statusFragment({ config }).slice(1)}}`);
+  assert.deepEqual(parsed.external, ['data/"quoted"', 'back\\slash']);
+});
+
+// ---- 2.1 and 2.2 exclusion rules and the rules command -------------------------------------------------
+
+test('without external entries the rule lines are exactly the ones from before the field existed', () => {
+  const before = [
+    'protect\t--filter=P node_modules', 'protect\t--filter=P .git', 'protect\t--filter=P .vite', 'protect\t--filter=P .turbo',
+    'protect\t--filter=P .cache', 'protect\t--filter=P coverage', 'protect\t--filter=P .pnpm-store', 'protect\t--filter=P /apps/web/dist',
+    'copy\t--exclude=node_modules', 'copy\t--exclude=.git', 'copy\t--exclude=.vite', 'copy\t--exclude=.turbo',
+    'copy\t--exclude=.cache', 'copy\t--exclude=coverage', 'copy\t--exclude=.pnpm-store', 'copy\t--exclude=/apps/web/dist',
+    'copy\t--exclude=.browser-profile/', 'copy\t--exclude=*.log', 'copy\t--exclude=apps/scraper/cache/',
+    'hash\t--exclude=node_modules', 'hash\t--exclude=.git', 'hash\t--exclude=.vite', 'hash\t--exclude=.turbo',
+    'hash\t--exclude=.cache', 'hash\t--exclude=coverage', 'hash\t--exclude=.pnpm-store', 'hash\t--exclude=/apps/web/dist',
+    'hash\t--exclude=.browser-profile/', 'hash\t--exclude=*.log', 'hash\t--exclude=apps/scraper/cache/', 'hash\t--exclude=dist',
+    'deps\t--exclude=node_modules', 'deps\t--exclude=.browser-profile/', 'deps\t--exclude=*.log', 'deps\t--exclude=.cache/',
+    'deps\t--exclude=apps/scraper/cache/', 'deps\t--include=*/', 'deps\t--include=package.json', 'deps\t--include=pnpm-lock.yaml',
+    'deps\t--include=pnpm-workspace.yaml', 'deps\t--include=.npmrc', 'deps\t--include=.pnpmfile.cjs', 'deps\t--exclude=*',
+  ].join('\n') + '\n';
+  assert.equal(ruleLines(['.browser-profile/', '*.log', '.cache/', 'apps/scraper/cache/'], 'apps/web/dist'), before);
+  assert.equal(ruleLines(['.browser-profile/', '*.log', '.cache/', 'apps/scraper/cache/'], 'apps/web/dist', []), before);
+});
+
+test('external entries are excluded in every view, anchored at the workspace root, and protected from deletion', () => {
+  const views = buildExcludes(['.browser-profile/'], 'dist', ['data/covers']);
+  for (const kind of ['copy', 'hash', 'deps']) {
+    assert.ok(views[kind].includes('--exclude=/data/covers'), kind);
+    assert.ok(!views[kind].includes('--exclude=data/covers'), `${kind} is not unanchored`);
+  }
+  assert.ok(views.protect.includes('--filter=P /data/covers'));
+  assert.ok(views.copy.includes('--exclude=.browser-profile/'));
+});
+
+test('an external entry that is also in ignore yields one exclusion', () => {
+  const views = buildExcludes(['data/covers/', '.browser-profile/'], 'dist', ['data/covers']);
+  for (const kind of ['copy', 'hash', 'deps']) {
+    assert.deepEqual(views[kind].filter((arg) => arg.includes('data/covers')), ['--exclude=/data/covers'], kind);
+  }
+  assert.deepEqual(views.protect.filter((arg) => arg.includes('data/covers')), ['--filter=P /data/covers']);
+});
+
+test('rules takes an external file as an optional third argument, and a missing file is an empty list', () => {
+  const dirs = tempDirs();
+  const ignore = path.join(dirs.root, 'ignore');
+  const external = path.join(dirs.root, 'external');
+  fs.writeFileSync(ignore, '.browser-profile/\n');
+  fs.writeFileSync(external, 'data/covers\n');
+  const run = (args) => spawnSync(process.execPath, [script, ...args], { encoding: 'utf8' });
+
+  const two = run(['rules', 'dist', ignore]);
+  assert.equal(two.status, 0, two.stderr);
+  assert.equal(two.stdout, ruleLines(['.browser-profile/'], 'dist'));
+
+  const three = run(['rules', 'dist', ignore, external]);
+  assert.equal(three.status, 0, three.stderr);
+  assert.equal(three.stdout, ruleLines(['.browser-profile/'], 'dist', ['data/covers']));
+  assert.match(three.stdout, /^copy\t--exclude=\/data\/covers$/m);
+
+  const missing = run(['rules', 'dist', ignore, path.join(dirs.root, 'no-such-file')]);
+  assert.equal(missing.status, 0, missing.stderr);
+  assert.equal(missing.stdout, two.stdout);
+
+  assert.equal(run(['rules']).status, 64);
+});
+
+// A real rsync pass with the same flags as dev-host, so the protect rules are tested against rsync itself.
+const RSYNC = spawnSync('rsync', ['--version']).status === 0;
+test('a real rsync copy keeps a protected external link, removes an unprotected one, and copies a dropped entry', { skip: !RSYNC }, () => {
+  const dirs = tempDirs();
+  const ws = dirs.workspace;
+  const build = path.join(dirs.root, 'build');
+  const original = path.join(ws, 'data/covers');
+  fs.mkdirSync(original, { recursive: true });
+  fs.writeFileSync(path.join(original, '1.jpg'), 'one');
+  fs.writeFileSync(path.join(ws, 'index.js'), 'x');
+  const copy = (ignore, external, protect) => {
+    const views = buildExcludes(ignore, 'dist', external);
+    const args = [...(protect ? views.protect : []), ...views.copy];
+    const r = spawnSync('rsync', ['-a', '--delete', '--delete-excluded', ...args, `${ws}/`, `${build}/`], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+  };
+  const linkAt = path.join(build, 'data/covers');
+
+  copy([], ['data/covers'], true);
+  assert.equal(lstatIf(linkAt), null, 'nothing is copied for an external entry');
+  attachExternal(ws, build, ['data/covers']);
+  assert.ok(lstatIf(linkAt).isSymbolicLink());
+
+  copy([], ['data/covers'], true);
+  assert.ok(lstatIf(linkAt).isSymbolicLink(), 'a protected link survives the copy');
+  assert.equal(fs.readFileSync(path.join(original, '1.jpg'), 'utf8'), 'one');
+
+  copy([], ['data/covers'], false);
+  assert.equal(lstatIf(linkAt), null, 'an unprotected link is removed by --delete-excluded');
+  assert.equal(fs.readFileSync(path.join(original, '1.jpg'), 'utf8'), 'one', 'the original survives the removal');
+
+  attachExternal(ws, build, ['data/covers']);
+  copy([], [], true);
+  const dropped = lstatIf(linkAt);
+  assert.ok(dropped.isDirectory() && !dropped.isSymbolicLink(), 'a dropped entry becomes a copied folder');
+  assert.equal(fs.readFileSync(path.join(linkAt, '1.jpg'), 'utf8'), 'one');
+  assert.equal(fs.readFileSync(path.join(original, '1.jpg'), 'utf8'), 'one', 'the original is intact');
+
+  copy(['data/covers'], [], true);
+  assert.equal(lstatIf(linkAt), null, 'an entry moved to ignore leaves the build copy');
+  assert.equal(fs.readFileSync(path.join(original, '1.jpg'), 'utf8'), 'one', 'and the original is intact');
+});
+
+// ---- 3.1 and 3.2 attach ----------------------------------------------------------------------------
+
+test('attach links an external folder at the same path, creates missing parents, and never changes the original', () => {
+  const dirs = tempDirs();
+  const build = path.join(dirs.root, 'build');
+  fs.mkdirSync(build);
+  fs.mkdirSync(path.join(dirs.workspace, 'data/covers'), { recursive: true });
+  fs.writeFileSync(path.join(dirs.workspace, 'data/covers/1.jpg'), 'one');
+  const before = snapshotTree(dirs.workspace);
+  assert.deepEqual(attachExternal(dirs.workspace, build, ['data/covers']), []);
+  const link = path.join(build, 'data/covers');
+  assert.ok(lstatIf(link).isSymbolicLink());
+  assert.equal(fs.readlinkSync(link), path.join(dirs.workspace, 'data/covers'));
+  assert.equal(fs.readFileSync(path.join(link, '1.jpg'), 'utf8'), 'one');
+  assert.equal(snapshotTree(dirs.workspace), before, 'attaching changes nothing in the original');
+  fs.writeFileSync(path.join(link, '2.jpg'), 'two');
+  assert.equal(fs.readFileSync(path.join(dirs.workspace, 'data/covers/2.jpg'), 'utf8'), 'two', 'a write reaches the original');
+});
+
+test('attach leaves a correct link alone and replaces a link with another target through a temporary name', () => {
+  const dirs = tempDirs();
+  const build = path.join(dirs.root, 'build');
+  fs.mkdirSync(build);
+  fs.mkdirSync(path.join(dirs.workspace, 'data/covers'), { recursive: true });
+  attachExternal(dirs.workspace, build, ['data/covers']);
+  const link = path.join(build, 'data/covers');
+  const ino = fs.lstatSync(link).ino;
+  attachExternal(dirs.workspace, build, ['data/covers']);
+  assert.equal(fs.lstatSync(link).ino, ino, 'a correct link is not recreated');
+
+  const elsewhere = path.join(dirs.root, 'elsewhere');
+  fs.mkdirSync(elsewhere);
+  fs.rmSync(link);
+  fs.symlinkSync(elsewhere, link);
+  assert.deepEqual(attachExternal(dirs.workspace, build, ['data/covers']), []);
+  assert.equal(fs.readlinkSync(link), path.join(dirs.workspace, 'data/covers'));
+  assert.deepEqual(fs.readdirSync(path.join(build, 'data')), ['covers'], 'no temporary name is left behind');
+});
+
+test('attach replaces a stale real folder or file, and a link inside the stale folder never removes the original', () => {
+  const dirs = tempDirs();
+  const build = path.join(dirs.root, 'build');
+  const original = path.join(dirs.workspace, 'data/covers');
+  fs.mkdirSync(original, { recursive: true });
+  fs.writeFileSync(path.join(original, '1.jpg'), 'one');
+  fs.mkdirSync(path.join(build, 'data/covers'), { recursive: true });
+  fs.writeFileSync(path.join(build, 'data/covers/stale.jpg'), 'stale');
+  fs.symlinkSync(original, path.join(build, 'data/covers/inner'));
+  attachExternal(dirs.workspace, build, ['data/covers']);
+  assert.ok(lstatIf(path.join(build, 'data/covers')).isSymbolicLink());
+  assert.deepEqual(fs.readdirSync(original), ['1.jpg'], 'the original keeps every file');
+  assert.equal(fs.readFileSync(path.join(original, '1.jpg'), 'utf8'), 'one');
+
+  fs.rmSync(path.join(build, 'data/covers'));
+  fs.writeFileSync(path.join(build, 'data/covers'), 'a file');
+  attachExternal(dirs.workspace, build, ['data/covers']);
+  assert.ok(lstatIf(path.join(build, 'data/covers')).isSymbolicLink());
+});
+
+test('attach skips a missing original, a file, and an original behind a link, with JSON-encoded warnings', () => {
+  const dirs = tempDirs();
+  const build = path.join(dirs.root, 'build');
+  fs.mkdirSync(build);
+  fs.writeFileSync(path.join(dirs.workspace, 'notes.txt'), 'x');
+  fs.mkdirSync(path.join(dirs.workspace, 'data'));
+  fs.symlinkSync(path.join(dirs.workspace, 'data'), path.join(dirs.workspace, 'linked'));
+  const warnings = [];
+  attachExternal(dirs.workspace, build, ['data/missing', 'notes.txt', 'linked/covers'], warnings);
+  assert.deepEqual(warnings, [
+    JSON.stringify('external entry "data/missing" skipped: the original folder is missing'),
+    JSON.stringify('external entry "notes.txt" skipped: the original is not a folder'),
+    JSON.stringify('external entry "linked/covers" skipped: the original is reached through a symbolic link'),
+  ]);
+  assert.equal(lstatIf(path.join(build, 'data/missing')), null, 'nothing is created for a skipped entry');
+  assert.equal(lstatIf(path.join(build, 'notes.txt')), null);
+  assert.equal(lstatIf(path.join(dirs.workspace, 'data/missing')), null, 'the workspace is not created in');
+});
+
+test('attach skips an entry whose build-copy path is reached through a symbolic link', () => {
+  const dirs = tempDirs();
+  const build = path.join(dirs.root, 'build');
+  const elsewhere = path.join(dirs.root, 'elsewhere');
+  fs.mkdirSync(build);
+  fs.mkdirSync(elsewhere);
+  fs.mkdirSync(path.join(dirs.workspace, 'data/covers'), { recursive: true });
+  fs.symlinkSync(elsewhere, path.join(build, 'data'));
+  const warnings = attachExternal(dirs.workspace, build, ['data/covers'], []);
+  assert.deepEqual(warnings, [JSON.stringify('external entry "data/covers" skipped: its path in the build copy is reached through a symbolic link')]);
+  assert.deepEqual(fs.readdirSync(elsewhere), [], 'nothing is created through the link');
+});
+
+test('the warning is cleared once the original exists and a later attach runs', () => {
+  const dirs = tempDirs();
+  const build = path.join(dirs.root, 'build');
+  fs.mkdirSync(build);
+  assert.equal(attachExternal(dirs.workspace, build, ['data/covers'], []).length, 1);
+  fs.mkdirSync(path.join(dirs.workspace, 'data/covers'), { recursive: true });
+  assert.deepEqual(attachExternal(dirs.workspace, build, ['data/covers'], []), []);
+  assert.ok(lstatIf(path.join(build, 'data/covers')).isSymbolicLink());
+});
+
+test('attach prints each warning as a JSON string and exits 0 for skipped entries', () => {
+  const dirs = tempDirs();
+  const build = path.join(dirs.root, 'build');
+  fs.mkdirSync(build);
+  const list = path.join(dirs.root, 'external');
+  fs.writeFileSync(list, 'data/"q"\n');
+  const result = spawnSync(process.execPath, [script, 'attach', dirs.workspace, build, list], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  const lines = result.stdout.trim().split('\n');
+  assert.equal(lines.length, 1);
+  assert.equal(JSON.parse(lines[0]), 'external entry "data/\\"q\\"" skipped: the original folder is missing');
+});
+
+test('an unexpected filesystem error makes attach exit 1 after reporting the warnings already found', { skip: process.getuid?.() === 0 }, () => {
+  const dirs = tempDirs();
+  const build = path.join(dirs.root, 'build');
+  fs.mkdirSync(build);
+  fs.mkdirSync(path.join(dirs.workspace, 'data/covers'), { recursive: true });
+  const list = path.join(dirs.root, 'external');
+  fs.writeFileSync(list, 'data/missing\ndata/covers\n');
+  fs.chmodSync(build, 0o500);
+  try {
+    const result = spawnSync(process.execPath, [script, 'attach', dirs.workspace, build, list], { encoding: 'utf8' });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /external folders could not be attached/);
+    assert.equal(JSON.parse(result.stdout.trim()), 'external entry "data/missing" skipped: the original folder is missing');
+  } finally {
+    fs.chmodSync(build, 0o700);
+  }
 });

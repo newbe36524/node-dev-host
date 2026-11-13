@@ -758,6 +758,72 @@ EOF
   check "BUILD_CMD runs, so the failing build.command does not" poll 300 state_is wsprec ok
   check "the copy was retried once" docker exec "$(cn wsprec)" test -e /var/lib/dev-host/shim-used
   check "the retry is a warning on the status" grep -q retried <<< "$(field wsprec 'j.warnings.join("|")')"
+
+  log "external folders: a read-write mount over data/covers is reached through a link; writes there start no build"
+  fresh_project wsext
+  mkdir -p "$WORK/wsext/data/covers" "$WORK/wsext-covers"
+  echo seed > "$WORK/wsext-covers/seed.jpg"
+  local ext_cfg plain_cfg
+  ext_cfg='version: 1
+external: [data/covers]
+build:
+  command: "node scripts/build.mjs && test -f data/covers/seed.jpg && echo built > data/covers/built.txt"'
+  plain_cfg='version: 1
+build:
+  command: "node scripts/build.mjs && test -f data/covers/seed.jpg && echo built > data/covers/built.txt"'
+  printf '%s\n' "$ext_cfg" > "$WORK/wsext/.node-dev-host.yaml"
+  start wsext -v "$WORK/wsext:/workspace:ro" -v "$WORK/wsext-covers:/workspace/data/covers"
+  check "reaches state ok" poll 300 state_is wsext ok
+  check "the build wrote a new file through the link into the host folder" test -f "$WORK/wsext-covers/built.txt"
+  check "the build copy holds a link at data/covers" docker exec "$(cn wsext)" test -L /var/lib/dev-host/build/data/covers
+  check "status lists external" [ "$(field wsext 'j.external')" = '["data/covers"]' ]
+  local before i
+  before="$(builds wsext)"
+  for i in 1 2 3; do echo "$i" > "$WORK/wsext-covers/cache-$i.jpg"; sleep 1; done
+  rm -f "$WORK/wsext-covers/cache-1.jpg"
+  sleep 15
+  check "no build from creating and deleting files in the folder" [ "$(builds wsext)" = "$before" ]
+  check "a file written into the folder is read through the link" docker exec "$(cn wsext)" test -f /var/lib/dev-host/build/data/covers/cache-2.jpg
+
+  log "external folders: removing the entry copies the folder back and leaves the original intact"
+  original_intact() { [ "$(cat "$WORK/wsext-covers/seed.jpg" 2>/dev/null)" = seed ] && [ -f "$WORK/wsext-covers/cache-2.jpg" ]; }
+  printf '%s\n' "$plain_cfg" > "$WORK/wsext/.node-dev-host.yaml"
+  check "the removal starts a build" poll 120 builds_above wsext "$before"
+  check "that build reaches ok" poll 120 state_is wsext ok
+  check "the build copy holds a real folder again" docker exec "$(cn wsext)" sh -c 'test -d /var/lib/dev-host/build/data/covers && test ! -L /var/lib/dev-host/build/data/covers'
+  check "the original keeps its files" original_intact
+  check "status no longer lists external" [ "$(field wsext 'j.external')" = '[]' ]
+
+  log "external folders: adding the entry again replaces the stale real folder with a link"
+  before="$(builds wsext)"
+  printf '%s\n' "$ext_cfg" > "$WORK/wsext/.node-dev-host.yaml"
+  check "the entry starts a build" poll 120 builds_above wsext "$before"
+  check "that build reaches ok" poll 120 state_is wsext ok
+  check "the stale folder is a link again" docker exec "$(cn wsext)" test -L /var/lib/dev-host/build/data/covers
+  check "the original keeps its files" original_intact
+
+  log "external folders: a read-only workspace fails a write through the link without failing the build; a missing original warns, then clears"
+  fresh_project wsro
+  mkdir -p "$WORK/wsro/data"
+  cat > "$WORK/wsro/.node-dev-host.yaml" <<'EOF'
+version: 1
+external: [data/covers]
+build:
+  command: "node scripts/build.mjs && (echo x > data/covers/built.txt || echo refused > dist/refused.txt)"
+EOF
+  start wsro -v "$WORK/wsro:/workspace:ro"
+  check "a missing original is a warning and the build still ends ok" poll 300 state_is wsro ok
+  check "the warning names the entry" grep -q 'data/covers' <<< "$(field wsro 'j.warnings.join("|")')"
+  check "status lists the entry" [ "$(field wsro 'j.external')" = '["data/covers"]' ]
+  check "the write without a folder fails inside the build" body_has wsro /refused.txt refused
+  mkdir -p "$WORK/wsro/data/covers"
+  before="$(builds wsro)"
+  docker exec "$(cn wsro)" dev-host rebuild >/dev/null
+  check "the rebuild starts" poll 120 builds_above wsro "$before"
+  check "that build reaches ok" poll 120 state_is wsro ok
+  check "the link appears once the folder exists" docker exec "$(cn wsro)" test -L /var/lib/dev-host/build/data/covers
+  check "the warning is gone" [ "$(field wsro 'j.warnings.length')" = 0 ]
+  check "the write through the read-only link fails and the workspace is unchanged" test ! -e "$WORK/wsro/data/covers/built.txt"
 }
 
 # ---- run ----------------------------------------------------------------------

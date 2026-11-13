@@ -50,10 +50,12 @@ BUILD_DURATION_FILE="$STATE_DIR/build-duration"
 WS_CLI="$(dirname "${BASH_SOURCE[0]}")/../lib/dev-host/workspace-config.mjs"
 
 # status.json fields that describe the workspace configuration, as a JSON fragment (values JSON-encoded).
-NULL_META=',"name":null,"description":null,"configSource":null,"configHash":null,"configError":null,"ignore":[]'
+NULL_META=',"name":null,"description":null,"configSource":null,"configHash":null,"configError":null,"ignore":[],"external":[]'
 META_JSON="$NULL_META"
 # Warnings of the current build, fixed texts; written as the "warnings" array of every status write.
 WARNINGS=()
+# Warnings from the attach step, already JSON-encoded strings (see workspace-config.mjs attach).
+ATTACH_WARNINGS=()
 # The effective settings, their rules and the change signature they were computed under.
 RULES_KEY=""; RULES_IN_SIG=""; PREV_SIG=""
 COPY_ARGS=(); PROTECT_ARGS=(); HASH_ARGS=(); DEPS_ARGS=()
@@ -66,6 +68,7 @@ log() { printf '[dev-host %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 warnings_json() {
   local out="" w
   for w in "${WARNINGS[@]}"; do out="${out:+$out,}\"$w\""; done
+  for w in "${ATTACH_WARNINGS[@]}"; do out="${out:+$out,}$w"; done
   printf '[%s]' "$out"
 }
 
@@ -131,7 +134,7 @@ write_caddyfile() {
 # Reads .node-dev-host.yaml through workspace-config.mjs, which writes the effective settings, the status fields
 # and the exclusion rules into STATE_DIR. Sets the build settings, META_JSON and the rules. Returns 0 when the
 # file is valid or absent, 2 when it is rejected, 1 when the loader itself fails. A rejected file keeps the last
-# valid ignore list, so the change signature does not move while the file is broken.
+# valid ignore and external lists, so the change signature and the attach step do not move while the file is broken.
 load_config() {
   local out rc=0 rules kind arg
   out="$(ENV_INSTALL_CMD="$ENV_INSTALL_CMD" ENV_BUILD_CMD="$ENV_BUILD_CMD" ENV_DIST_DIR="$ENV_DIST_DIR" \
@@ -139,7 +142,7 @@ load_config() {
     node "$WS_CLI" load "$WORKSPACE" "$STATE_DIR" 2>&1)" || rc=$?
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
     log "workspace configuration could not be loaded (exit $rc): $out"
-    META_JSON=',"name":null,"description":null,"configSource":null,"configHash":null,"configError":"workspace configuration could not be loaded","ignore":[]'
+    META_JSON=',"name":null,"description":null,"configSource":null,"configHash":null,"configError":"workspace configuration could not be loaded","ignore":[],"external":[]'
     return 1
   fi
   [ -n "$out" ] && log "$out"
@@ -148,7 +151,7 @@ load_config() {
   RESOLVED_SPA="$WS_SPA"; RESOLVED_API_UPSTREAM="$WS_API_UPSTREAM"
   META_JSON="$(cat "$STATE_DIR/workspace-config.status.json")"
   # The rules come from the same module as the status fields, so the copy, the hashes and the status never disagree.
-  rules="$(node "$WS_CLI" rules "$DIST_DIR" "$STATE_DIR/workspace-config.ignore")" || return 1
+  rules="$(node "$WS_CLI" rules "$DIST_DIR" "$STATE_DIR/workspace-config.ignore" "$STATE_DIR/workspace-config.external")" || return 1
   RULES_KEY="$rules"
   COPY_ARGS=(); PROTECT_ARGS=(); HASH_ARGS=(); DEPS_ARGS=()
   while IFS=$'\t' read -r kind arg; do
@@ -184,9 +187,22 @@ sync_source() {
   return "$rc"
 }
 
+# Attaches each external folder to BUILD_DIR as a link to its original in WORKSPACE. Runs after every copy, so a
+# link removed or replaced by the copy is back before install and build. Skipped entries become ATTACH_WARNINGS
+# (already JSON-encoded). Returns nonzero on any other failure, and the build then fails with the previous dist kept.
+attach_external() {
+  local out rc=0 line
+  out="$(node "$WS_CLI" attach "$WORKSPACE" "$BUILD_DIR" "$STATE_DIR/workspace-config.external")" || rc=$?
+  while IFS= read -r line; do
+    [ -n "$line" ] && ATTACH_WARNINGS+=("$line")
+  done <<< "$out"
+  if [ "$rc" -ne 0 ]; then log "external folders could not be attached (exit $rc)"; return 1; fi
+  return 0
+}
+
 run_build() {
   local reason="$1" start rc=0 secs lrc=0
-  WARNINGS=()
+  WARNINGS=(); ATTACH_WARNINGS=()
   load_config || lrc=$?
   if [ "$lrc" -ne 0 ]; then
     # A rejected configuration fails the build before anything is copied, installed or built, and the previous dist stays.
@@ -210,6 +226,7 @@ run_build() {
     LAST_EXIT=null; write_status waiting; return 0
   fi
   if ! sync_source; then log "copy of $WORKSPACE to $BUILD_DIR failed"; rc=1; fi
+  if [ "$rc" -eq 0 ]; then attach_external || rc=1; fi
   if [ "$rc" -eq 0 ]; then cd "$BUILD_DIR" || rc=1; fi
   if [ "$rc" -eq 0 ] && { [ ! -d node_modules ] || [ "$(deps_sig)" != "$DEPS_SIG" ]; }; then
     local icmd="$INSTALL_CMD"

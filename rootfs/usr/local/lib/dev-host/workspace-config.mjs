@@ -9,10 +9,15 @@
 //   node workspace-config.mjs load <workspace> <stateDir>
 //     Environment ENV_INSTALL_CMD, ENV_BUILD_CMD, ENV_DIST_DIR, ENV_SPA and ENV_API_UPSTREAM hold the
 //     variables as set before dev-host's own defaults. Writes workspace-config.env,
-//     workspace-config.status.json and, for a valid or absent file, workspace-config.ignore into <stateDir>.
+//     workspace-config.status.json and, for a valid or absent file, workspace-config.ignore and
+//     workspace-config.external into <stateDir>.
 //     Never writes into <workspace>. Exit 0: valid or absent. Exit 2: rejected, the reason goes to stderr.
-//   node workspace-config.mjs rules <distDir> <ignoreFile>
-//     Prints "kind<TAB>rsync-argument" lines. kind is protect, copy, hash or deps.
+//   node workspace-config.mjs rules <distDir> <ignoreFile> [externalFile]
+//     Prints "kind<TAB>rsync-argument" lines. kind is protect, copy, hash or deps. A missing file is an empty list.
+//   node workspace-config.mjs attach <workspace> <buildDir> <externalFile>
+//     Makes each external entry in <buildDir> a symbolic link to the folder of the same path in <workspace>.
+//     Prints one JSON-encoded string per skipped entry on stdout. Exit 0: done or skipped. Exit 1: a filesystem
+//     error the build must fail on; the reason goes to stderr.
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -26,7 +31,7 @@ export const BUILT_IN_EXCLUDES = Object.freeze([
 ]);
 // The only files whose changes can require a reinstall; the dependency hash looks at these.
 const DEPENDENCY_FILES = ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', '.pnpmfile.cjs'];
-const TOP_FIELDS = ['version', 'name', 'description', 'ignore', 'build', 'serve'];
+const TOP_FIELDS = ['version', 'name', 'description', 'ignore', 'external', 'build', 'serve'];
 const BUILD_FIELDS = ['install', 'command', 'distDir', 'spa'];
 const SERVE_FIELDS = ['apiUpstream'];
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/;
@@ -280,6 +285,63 @@ function checkIgnore(value) {
   return value.slice();
 }
 
+// The folder segments of a path: "./data//covers/" gives ["data", "covers"].
+const segmentsOf = (folder) => folder.split(/[\\/]/).filter((segment) => segment !== '' && segment !== '.');
+
+// True when one folder is the other or lies inside it. Both are normalized folder paths.
+const overlaps = (a, b) => {
+  const x = segmentsOf(a);
+  const y = segmentsOf(b);
+  const shared = Math.min(x.length, y.length);
+  return x.slice(0, shared).every((segment, i) => segment === y[i]);
+};
+
+// One external entry: a concrete folder below the workspace root. Returns the normalized entry, or refuses it
+// by naming the entry. The output folder and the entries among themselves are checked elsewhere.
+export function checkExternalEntry(entry) {
+  const refuse = (why) => fail(`external entry ${JSON.stringify(entry)} ${why}`);
+  if (typeof entry !== 'string') fail('external must be a list of strings');
+  if (entry.trim() === '') refuse('is blank');
+  if (CONTROL_CHARS.test(entry)) refuse('contains a control character');
+  if (entry.includes('\\')) refuse('must use "/" between folders, not "\\"');
+  if (entry !== entry.trim()) refuse('must not start or end with a space');
+  if (/[*?[]/.test(entry)) refuse('must not contain a wildcard (*, ? or [)');
+  if (/^[/~]/.test(entry) || /^[A-Za-z]:/.test(entry)) refuse('must be relative to the workspace root');
+  const segments = segmentsOf(entry);
+  if (segments.includes('..')) refuse('must not contain a ".." segment');
+  if (segments.length === 0) refuse('names the workspace root, not a folder inside it');
+  if (segments.some((segment) => BUILT_IN_EXCLUDES.includes(segment))) {
+    refuse(`uses a built-in name (${BUILT_IN_EXCLUDES.join(', ')})`);
+  }
+  return segments.join('/');
+}
+
+// The list is normalized: an entry given twice (with or without a trailing "/") counts once. An entry inside
+// another one is refused, because the attach step would link the same folder twice.
+export function checkExternal(value) {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+    fail('external must be a list of strings');
+  }
+  const entries = [];
+  for (const raw of value) {
+    const entry = checkExternalEntry(raw);
+    if (!entries.includes(entry)) entries.push(entry);
+  }
+  for (const entry of entries) {
+    const outer = entries.find((other) => other !== entry && entry.startsWith(`${other}/`));
+    if (outer) fail(`external entry ${JSON.stringify(entry)} lies inside external entry ${JSON.stringify(outer)}`);
+  }
+  return entries;
+}
+
+// The entries that overlap the output folder. The output folder comes from the file or the environment, so this
+// runs after the settings are resolved (see loadWorkspace).
+export function externalOutputClash(external, distDir) {
+  const clash = external.find((entry) => overlaps(entry, distDir));
+  if (clash === undefined) return null;
+  return `external entry ${JSON.stringify(clash)} overlaps the output folder ${JSON.stringify(distDir)}`;
+}
+
 function checkBuild(value) {
   rejectUnknown(value, BUILD_FIELDS, 'build.');
   const out = { install: null, command: null, distDir: null, spa: null };
@@ -310,13 +372,14 @@ export function validateConfig(obj) {
   rejectUnknown(obj, TOP_FIELDS, '');
   if (obj.version !== 1) fail('version must be the integer 1');
   const out = {
-    version: 1, name: null, description: null, ignore: [],
+    version: 1, name: null, description: null, ignore: [], external: [],
     build: { install: null, command: null, distDir: null, spa: null },
     serve: { apiUpstream: null },
   };
   if (obj.name !== undefined) out.name = checkText('name', obj.name, 1, 80);
   if (obj.description !== undefined) out.description = checkText('description', obj.description, 0, 500);
   if (obj.ignore !== undefined) out.ignore = checkIgnore(obj.ignore);
+  if (obj.external !== undefined) out.external = checkExternal(obj.external);
   if (obj.build !== undefined) {
     if (!isMapping(obj.build)) fail('build must be a mapping of fields');
     out.build = checkBuild(obj.build);
@@ -349,18 +412,23 @@ export function resolveSettings(config, env = {}) {
 const ruleKey = (entry) => entry.replace(/\/+$/, '');
 
 // The exclusion views, as rsync arguments. One list of built-ins and configured entries feeds all of them.
-//   protect: keeps built-in names and the output folder when --delete-excluded purges a newly ignored path
-//   copy:    the build copy. Built-ins, the output folder at the root, then the configured entries
+//   protect: keeps built-in names, the output folder and the external entries when --delete-excluded purges
+//            a path that became ignored. The external entries must stay, or the attached links would go
+//   copy:    the build copy. Built-ins, the output folder at the root, the ignore entries, then the external
+//            entries, anchored at the workspace root so they match only there
 //   hash:    the change signature. The copy rules plus any "dist", as the old find-based signature skipped it
 //   deps:    the dependency signature. node_modules and the configured entries, then the dependency files only
-// A configured entry that names a built-in (".cache/" for ".cache") adds no second rule.
-export function buildExcludes(ignore = [], distDir = 'dist') {
+// A configured entry that names a built-in (".cache/" for ".cache") adds no second rule. An ignore entry that is
+// also an external entry is treated as external: it yields one exclusion, the anchored one.
+export function buildExcludes(ignore = [], distDir = 'dist', external = []) {
   const anchoredDist = `/${distDir}`;
+  const externalKeys = new Set(external.map(ruleKey));
+  const anchoredExternal = [...externalKeys].map((entry) => `/${entry}`);
   const unique = [];
   const seenKeys = new Set();
   for (const entry of ignore) {
     const key = ruleKey(entry);
-    if (seenKeys.has(key)) continue;
+    if (seenKeys.has(key) || externalKeys.has(key)) continue;
     seenKeys.add(key);
     unique.push(entry);
   }
@@ -369,14 +437,16 @@ export function buildExcludes(ignore = [], distDir = 'dist') {
     ...BUILT_IN_EXCLUDES.map((name) => `--exclude=${name}`),
     `--exclude=${anchoredDist}`,
     ...extra.map((entry) => `--exclude=${entry}`),
+    ...anchoredExternal.map((entry) => `--exclude=${entry}`),
   ];
   return {
-    protect: [...BUILT_IN_EXCLUDES, anchoredDist].map((name) => `--filter=P ${name}`),
+    protect: [...BUILT_IN_EXCLUDES, anchoredDist, ...anchoredExternal].map((name) => `--filter=P ${name}`),
     copy,
     hash: [...copy, '--exclude=dist'],
     deps: [
       '--exclude=node_modules',
       ...unique.map((entry) => `--exclude=${entry}`),
+      ...anchoredExternal.map((entry) => `--exclude=${entry}`),
       '--include=*/',
       ...DEPENDENCY_FILES.map((name) => `--include=${name}`),
       '--exclude=*',
@@ -384,8 +454,8 @@ export function buildExcludes(ignore = [], distDir = 'dist') {
   };
 }
 
-export function ruleLines(ignore, distDir) {
-  const views = buildExcludes(ignore, distDir);
+export function ruleLines(ignore, distDir, external = []) {
+  const views = buildExcludes(ignore, distDir, external);
   return Object.entries(views)
     .flatMap(([kind, args]) => args.map((arg) => `${kind}\t${arg}`))
     .join('\n') + '\n';
@@ -414,6 +484,7 @@ export function statusFragment({ config = null, configSource = null, configHash 
     configHash,
     configError,
     ignore: config?.ignore ?? [],
+    external: config?.external ?? [],
   };
   return Object.entries(fields).map(([key, value]) => `,${JSON.stringify(key)}:${JSON.stringify(value)}`).join('');
 }
@@ -432,9 +503,9 @@ function decodeUtf8(bytes) {
   }
 }
 
-// Reads the workspace file, resolves the settings and writes the three state files. Returns { error }, where
-// error is the rejection reason or null. A rejected file leaves workspace-config.ignore as it was, so the change
-// signature keeps the last valid rules.
+// Reads the workspace file, resolves the settings and writes the state files. Returns { error }, where error is
+// the rejection reason or null. A rejected file leaves workspace-config.ignore and workspace-config.external as
+// they were, so the change signature and the attach step keep the last valid lists.
 export function loadWorkspace(workspace, stateDir, env = {}) {
   const file = path.join(workspace, CONFIG_FILE);
   let stat = null;
@@ -460,17 +531,28 @@ export function loadWorkspace(workspace, stateDir, env = {}) {
       error = err.message;
     }
   }
-  const settings = resolveSettings(config, {
+  const envSettings = {
     INSTALL_CMD: env.ENV_INSTALL_CMD,
     BUILD_CMD: env.ENV_BUILD_CMD,
     DIST_DIR: env.ENV_DIST_DIR,
     SPA: env.ENV_SPA,
     API_UPSTREAM: env.ENV_API_UPSTREAM,
-  });
+  };
+  let settings = resolveSettings(config, envSettings);
+  // The output folder can come from the environment, so an external entry is checked against the resolved one.
+  if (config && config.external.length > 0) {
+    const clash = externalOutputClash(config.external, settings.distDir);
+    if (clash) {
+      config = null;
+      error = clash;
+      settings = resolveSettings(null, envSettings);
+    }
+  }
   fs.mkdirSync(stateDir, { recursive: true });
   writeAtomic(path.join(stateDir, 'workspace-config.env'), envFile(settings));
   if (!error) {
     writeAtomic(path.join(stateDir, 'workspace-config.ignore'), (config?.ignore ?? []).map((entry) => `${entry}\n`).join(''));
+    writeAtomic(path.join(stateDir, 'workspace-config.external'), (config?.external ?? []).map((entry) => `${entry}\n`).join(''));
   }
   writeAtomic(path.join(stateDir, 'workspace-config.status.json'), statusFragment({
     config,
@@ -481,9 +563,92 @@ export function loadWorkspace(workspace, stateDir, env = {}) {
   return { error };
 }
 
-function readIgnore(file) {
+// One entry per line. A missing file is an empty list.
+function readList(file) {
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, 'utf8').split('\n').filter((line) => line !== '');
+}
+
+// ---- attach ------------------------------------------------------------------------------------------
+
+const lstatOrNull = (file) => {
+  try {
+    return fs.lstatSync(file);
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+};
+
+// Why the original of an external entry cannot be attached, or null when it can. Every part of the path below
+// the workspace root is checked with lstat, so a link anywhere on the way is never followed.
+function originalProblem(workspace, segments) {
+  let current = workspace;
+  for (let i = 0; i < segments.length; i += 1) {
+    current = path.join(current, segments[i]);
+    const st = lstatOrNull(current);
+    if (!st) return 'the original folder is missing';
+    if (st.isSymbolicLink()) return 'the original is reached through a symbolic link';
+    const last = i === segments.length - 1;
+    if (last && !st.isDirectory()) return 'the original is not a folder';
+    if (!last && !st.isDirectory()) return 'the original folder is missing';
+  }
+  return null;
+}
+
+// Makes the parent folders of an entry in the build copy, creating missing ones. Returns a reason to skip the
+// entry when one of them is a link. A folder that is neither a link nor a folder is a filesystem error.
+function buildParentsProblem(buildDir, segments) {
+  let current = buildDir;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    const st = lstatOrNull(current);
+    if (!st) {
+      fs.mkdirSync(current);
+      continue;
+    }
+    if (st.isSymbolicLink()) return 'its path in the build copy is reached through a symbolic link';
+    if (!st.isDirectory()) throw Object.assign(new Error(`${current} is not a folder in the build copy`), { code: 'ENOTDIR' });
+  }
+  return null;
+}
+
+// Puts a link at target that points to original. A correct link stays. A link with another target is replaced
+// through a temporary name, so the path never disappears. A real folder or file is removed; lstat showed it is not
+// a link, and rm does not follow the links inside it, so the original is never touched.
+function placeLink(target, original) {
+  const st = lstatOrNull(target);
+  if (st && st.isSymbolicLink()) {
+    if (fs.readlinkSync(target) === original) return;
+    const tmp = `${target}.${process.pid}.tmp`;
+    fs.rmSync(tmp, { force: true });
+    fs.symlinkSync(original, tmp);
+    fs.renameSync(tmp, target);
+    return;
+  }
+  if (st) fs.rmSync(target, { recursive: true, force: true });
+  fs.symlinkSync(original, target);
+}
+
+// Attaches every external entry to the build copy after a copy. Skipped entries are appended to warnings as
+// JSON-encoded strings; any other filesystem error throws.
+export function attachExternal(workspace, buildDir, entries, warnings = []) {
+  for (const entry of entries) {
+    const segments = segmentsOf(entry);
+    const skip = (why) => warnings.push(JSON.stringify(`external entry ${JSON.stringify(entry)} skipped: ${why}`));
+    const problem = originalProblem(workspace, segments);
+    if (problem) {
+      skip(problem);
+      continue;
+    }
+    const parentProblem = buildParentsProblem(buildDir, segments.slice(0, -1));
+    if (parentProblem) {
+      skip(parentProblem);
+      continue;
+    }
+    placeLink(path.join(buildDir, ...segments), path.resolve(workspace, ...segments));
+  }
+  return warnings;
 }
 
 export function main(argv, env = process.env) {
@@ -496,11 +661,25 @@ export function main(argv, env = process.env) {
     }
     return 0;
   }
-  if (command === 'rules' && args.length === 2) {
-    process.stdout.write(ruleLines(readIgnore(args[1]), args[0]));
+  if (command === 'rules' && (args.length === 2 || args.length === 3)) {
+    const external = args.length === 3 ? readList(args[2]) : [];
+    process.stdout.write(ruleLines(readList(args[1]), args[0], external));
     return 0;
   }
-  process.stderr.write('usage: workspace-config.mjs load <workspace> <stateDir> | rules <distDir> <ignoreFile>\n');
+  if (command === 'attach' && args.length === 3) {
+    const warnings = [];
+    let code = 0;
+    try {
+      attachExternal(args[0], args[1], readList(args[2]), warnings);
+    } catch (err) {
+      process.stderr.write(`external folders could not be attached: ${err.message}\n`);
+      code = 1;
+    }
+    // Warnings of the entries handled before a failure are still reported.
+    for (const warning of warnings) process.stdout.write(`${warning}\n`);
+    return code;
+  }
+  process.stderr.write('usage: workspace-config.mjs load <workspace> <stateDir> | rules <distDir> <ignoreFile> [externalFile] | attach <workspace> <buildDir> <externalFile>\n');
   return 64;
 }
 
