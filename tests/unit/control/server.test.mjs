@@ -560,3 +560,154 @@ test('console npm registry setting is guarded, validated and saved in the node s
   assert.equal((await save({ npmRegistry: '' })).status, 200);
   assert.deepEqual((await (await fetch(`${base}/api/containers`)).json()).settings, { npmRegistry: null });
 });
+
+test('list rows carry project metadata from each node status, sanitized, and null defaults for older or unreadable status', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'node-control-project-'));
+  const socket = path.join(dir, 'docker.sock');
+  const statusBodies = {
+    'nd-full': {
+      state: 'ok', builds: 3, failures: 0, finishedAt: '2026-11-12T10:00:00Z',
+      name: 'jjb', description: 'Personal JJB site', configSource: '.node-dev-host.yaml', configHash: 'a'.repeat(64),
+      configError: null, ignore: ['.browser-profile/'], warnings: ['copy retried once: files changed while copying'],
+    },
+    'nd-old': { state: 'ok', builds: 1, failures: 0, finishedAt: '2026-11-12T10:00:00Z' },
+    'nd-broken': 'not json',
+    'nd-long': {
+      state: 'failed', builds: 2, failures: 2, finishedAt: null,
+      name: 42, description: 'd'.repeat(5000), configSource: '.node-dev-host.yaml', configError: 'e'.repeat(400),
+      warnings: Array.from({ length: 7 }, () => 'w'.repeat(300)),
+    },
+  };
+  const statusServers = [];
+  const serveStatus = async (body) => {
+    const server = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(typeof body === 'string' ? body : JSON.stringify(body));
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    statusServers.push(server);
+    return server.address().port;
+  };
+  // Containers bind 0.0.0.0, which the startup scan skips, so they stay unregistered and only the listing is tested.
+  const containers = new Map();
+  let labelPort = 43171;
+  for (const name of ['nd-full', 'nd-old', 'nd-broken', 'nd-long', 'nd-stopped']) {
+    const running = name !== 'nd-stopped';
+    const httpPort = running ? await serveStatus(statusBodies[name]) : 8080;
+    containers.set(name, {
+      Id: `id-${name}`,
+      Name: `/${name}`,
+      Config: {
+        Image: 'node-dev-host:latest',
+        Labels: { 'node-dev-host.port': String(labelPort), 'node-dev-host.name': name },
+        Env: [`HTTP_PORT=${httpPort}`],
+        Tty: false,
+      },
+      HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '0.0.0.0' }] }, Privileged: false, RestartPolicy: { Name: 'no' } },
+      Mounts: [],
+      NetworkSettings: { Networks: running ? { bridge: { IPAddress: '127.0.0.1' } } : {} },
+      State: { Running: running },
+    });
+    labelPort += 1;
+  }
+  const dockerServer = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://docker');
+    const json = (status, value) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(value));
+    };
+    if (url.pathname === '/_ping') return json(200, {});
+    if (url.pathname === '/containers/json') {
+      return json(200, [...containers.values()].map((item) => ({
+        Id: item.Id,
+        Names: [item.Name],
+        Image: item.Config.Image,
+        State: item.State.Running ? 'running' : 'exited',
+        Labels: item.Config.Labels,
+      })));
+    }
+    const match = url.pathname.match(/^\/containers\/([^/]+)\/json$/);
+    if (match) {
+      const item = containers.get(decodeURIComponent(match[1]));
+      return item ? json(200, item) : json(404, { message: 'not found' });
+    }
+    return json(404, { message: 'not found' });
+  });
+  await new Promise((resolve) => dockerServer.listen(socket, resolve));
+  t.after(async () => {
+    await new Promise((resolve) => dockerServer.close(resolve));
+    await Promise.all(statusServers.map((server) => new Promise((resolve) => server.close(resolve))));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const portServer = net.createServer();
+  await new Promise((resolve) => portServer.listen(0, '127.0.0.1', resolve));
+  const port = portServer.address().port;
+  await new Promise((resolve) => portServer.close(resolve));
+  const base = `http://127.0.0.1:${port}`;
+  const child = spawn(process.execPath, [path.resolve('rootfs/usr/local/lib/dev-host/control/server.mjs')], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HTTP_PORT: String(port),
+      DOCKER_SOCKET: socket,
+      CONTROL_DATA_DIR: path.join(dir, 'data'),
+      CONTROL_ALLOWED_IMAGES: 'node-dev-host',
+      CONTROL_WORKSPACE_ROOTS: '/home',
+    },
+    stdio: 'ignore',
+  });
+  t.after(async () => {
+    child.kill('SIGTERM');
+    await new Promise((resolve) => child.once('exit', resolve));
+  });
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      if ((await fetch(`${base}/__dev-host/status.json`)).status === 200) break;
+    } catch {}
+    if (attempt > 100) throw new Error('control server did not start');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  // A registered node without a container: its row has the null project and the node record stays as it was.
+  const added = await fetch(`${base}/api/nodes`, {
+    method: 'POST',
+    headers: { Origin: base, 'X-Dev-Host-Control': '1', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'nd-pending', workspace: '/home/pending', port: 43176, image: 'node-dev-host:latest' }),
+  });
+  assert.equal(added.status, 201);
+
+  const list = await (await fetch(`${base}/api/containers`)).json();
+  const row = (name) => list.containers.find((item) => item.name === name);
+  const nullProject = { name: null, description: null, configSource: null, configError: null, warnings: [] };
+
+  assert.deepEqual(row('nd-full').project, {
+    name: 'jjb',
+    description: 'Personal JJB site',
+    configSource: '.node-dev-host.yaml',
+    configError: null,
+    warnings: ['copy retried once: files changed while copying'],
+  });
+  assert.equal(row('nd-full').build.state, 'ok');
+  assert.deepEqual(row('nd-old').project, nullProject);
+  assert.equal(row('nd-old').build.state, 'ok');
+  assert.deepEqual(row('nd-broken').project, nullProject);
+  assert.equal(row('nd-broken').build.state, 'unknown');
+
+  const long = row('nd-long');
+  assert.equal(long.project.name, null, 'a numeric name is dropped');
+  assert.equal(long.project.description.length, 500);
+  assert.equal(long.project.configError.length, 300);
+  assert.equal(long.project.warnings.length, 5);
+  assert.ok(long.project.warnings.every((warning) => warning.length === 200));
+  assert.equal(long.build.state, 'failed');
+
+  assert.equal(row('nd-stopped').state, 'exited');
+  assert.deepEqual(row('nd-stopped').project, nullProject);
+  assert.equal(row('nd-stopped').build.state, 'unknown');
+  assert.deepEqual(row('nd-pending').project, nullProject);
+  assert.equal(row('nd-pending').registered, true);
+
+  const stored = await fs.readFile(path.join(dir, 'data', 'nodes.json'), 'utf8');
+  assert.equal(stored.includes('"project"'), false, 'project metadata is never stored in the node records');
+});

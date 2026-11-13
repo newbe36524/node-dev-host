@@ -48,6 +48,9 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const ACTIONS = new Set(['start', 'stop', 'restart', 'rebuild', 'recreate']);
 const BUILD_STATES = new Set(['starting', 'building', 'ok', 'failed', 'waiting']);
 const UNKNOWN_BUILD = Object.freeze({ state: 'unknown', builds: null, failures: null, finishedAt: null });
+// Project metadata a node publishes in its status.json (see dev-host, workspace configuration). Its values come
+// from a container, so they are kept as text and cut to these limits.
+const PROJECT_LIMITS = Object.freeze({ name: 80, description: 500, configSource: 80, configError: 300, warning: 200, warnings: 5 });
 const MAX_TAIL = 1000;
 const DEFAULT_TAIL = 200;
 
@@ -89,26 +92,48 @@ function httpPortOf(info) {
   return port > 0 ? port : 8080;
 }
 
-// Reads /__dev-host/status.json from the container's own IP. A timeout or any error means "unknown" for
-// that row only. Stopped containers are not probed.
+const clipText = (value, max) => (typeof value === 'string' ? Array.from(value).slice(0, max).join('') : null);
+const unknownProject = () => ({ name: null, description: null, configSource: null, configError: null, warnings: [] });
+const unknownProbe = () => ({ build: { ...UNKNOWN_BUILD }, project: unknownProject() });
+
+// The project metadata of one status.json. Fields an older image does not write come out as null.
+function projectOf(status) {
+  const warnings = Array.isArray(status.warnings)
+    ? status.warnings.filter((w) => typeof w === 'string').slice(0, PROJECT_LIMITS.warnings)
+      .map((w) => clipText(w, PROJECT_LIMITS.warning))
+    : [];
+  return {
+    name: clipText(status.name, PROJECT_LIMITS.name),
+    description: clipText(status.description, PROJECT_LIMITS.description),
+    configSource: clipText(status.configSource, PROJECT_LIMITS.configSource),
+    configError: clipText(status.configError, PROJECT_LIMITS.configError),
+    warnings,
+  };
+}
+
+// Reads /__dev-host/status.json from the container's own IP and returns { build, project }. A timeout or any
+// error means "unknown" for that row only. Stopped containers are not probed.
 async function probeBuild(info) {
   const ip = Object.values(info.NetworkSettings?.Networks || {}).map((n) => n.IPAddress).find(Boolean);
-  if (!ip) return { ...UNKNOWN_BUILD };
+  if (!ip) return unknownProbe();
   try {
     const res = await fetch(`http://${ip}:${httpPortOf(info)}/__dev-host/status.json`, {
       signal: AbortSignal.timeout(2000),
     });
-    if (!res.ok) return { ...UNKNOWN_BUILD };
+    if (!res.ok) return unknownProbe();
     const status = await res.json();
     const count = (v) => (Number.isInteger(v) ? v : null);
     return {
-      state: BUILD_STATES.has(status.state) ? status.state : 'unknown',
-      builds: count(status.builds),
-      failures: count(status.failures),
-      finishedAt: typeof status.finishedAt === 'string' ? status.finishedAt : null,
+      build: {
+        state: BUILD_STATES.has(status.state) ? status.state : 'unknown',
+        builds: count(status.builds),
+        failures: count(status.failures),
+        finishedAt: typeof status.finishedAt === 'string' ? status.finishedAt : null,
+      },
+      project: projectOf(status),
     };
   } catch {
-    return { ...UNKNOWN_BUILD };
+    return unknownProbe();
   }
 }
 
@@ -138,6 +163,7 @@ async function listContainers() {
     const running = info.State?.Running === true;
     const record = byName.get(name);
     const operation = operations.get(name);
+    const probe = running ? await probeBuild(info) : unknownProbe();
     return {
       name,
       id: c.Id.slice(0, 12),
@@ -145,7 +171,8 @@ async function listContainers() {
       port: record?.port ?? Number(c.Labels?.[PORT_LABEL]),
       state: c.State,
       health: info.State?.Health?.Status ?? null,
-      build: running ? await probeBuild(info) : { ...UNKNOWN_BUILD },
+      build: probe.build,
+      project: probe.project,
       registered: Boolean(record),
       schedule: scheduleState(record?.autoStartUntil),
       operation: operation?.phase ? { phase: operation.phase, since: operation.since } : null,
@@ -166,6 +193,7 @@ async function listContainers() {
       state: 'not created',
       health: null,
       build: { ...UNKNOWN_BUILD },
+      project: unknownProject(),
       registered: true,
       schedule: scheduleState(record.autoStartUntil),
       operation: operation?.phase ? { phase: operation.phase, since: operation.since } : null,
