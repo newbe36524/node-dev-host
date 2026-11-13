@@ -25,6 +25,7 @@ A git tag `v1.2.3` also publishes `1.2.3`, `1.2.3-demo`, `1.2.3-alpine` and `1.2
 - Polls the source tree and rebuilds once the changes settle. A burst of saves makes one build; `DEBOUNCE_SECONDS`, `MIN_BUILD_INTERVAL` and `MAX_WAIT_SECONDS` tune it.
 - Keeps serving the last good build when a new build fails.
 - Serves `index.html` for unknown paths (SPA mode) and can proxy an API path to another port.
+- Can run a long-running service beside the output, for example an API, started after every successful build and restarted when it exits. See [Workspace configuration](#workspace-configuration), the Service paragraph.
 - Reports build state as JSON at `/__dev-host/status.json` and `dev-host status`, and lets you trigger a rebuild with `dev-host rebuild`.
 - Adds `X-Build-Time` (UTC, when the served build finished) and `X-Build-Duration` (seconds) response headers, so a client can tell how fresh `dist` is.
 - Prunes unused pnpm packages after each dependency install, so the store does not grow without bound.
@@ -89,7 +90,9 @@ serve:
 | `build.command` | Not empty. The build command, run in the build copy. |
 | `build.distDir` | Not empty, relative to the project root, no `..` segment. The folder that is served after a build. |
 | `build.spa` | `true` or `false`. |
-| `serve.apiUpstream` | `host:port`, for example `172.25.0.1:3001`. Nothing else: no scheme, path, spaces or Caddy syntax. |
+| `serve.apiUpstream` | `host:port`, for example `172.25.0.1:3001`. Nothing else: no scheme, path, spaces or Caddy syntax. Not allowed together with `service`. |
+| `service.command` | Not empty, at most 500 characters. The command that starts the service, run in the build copy. Required with `service.port`. |
+| `service.port` | An integer from 1024 to 65535. The loopback port the service listens on; see the Service paragraph below. Required with `service.command`. |
 
 The file is at most 64 KiB. A field not listed above is refused at any level, and so is any field that would choose a network: networks stay in the control node's node record. The top level must be a mapping of fields, and a file with more than one document is refused.
 
@@ -103,7 +106,8 @@ The file is at most 64 KiB. A field not listed above is refused at any level, an
 | Build command | `BUILD_CMD` | `build.command` | `pnpm build` |
 | Output folder | `DIST_DIR` | `build.distDir` | `dist` |
 | SPA mode | `SPA` | `build.spa` | `true` |
-| API upstream | `API_UPSTREAM` | `serve.apiUpstream` | unset |
+| API upstream | `API_UPSTREAM` | `service.port` (as `127.0.0.1:<port>`), else `serve.apiUpstream` | unset |
+| Service command and port | none | `service.command`, `service.port` | unset |
 
 A container with no file and the same variables behaves exactly as before. The variables are not checked by the file validation, as before.
 
@@ -165,11 +169,15 @@ volumes:
 
 **An invalid file fails the build.** A file that does not validate fails the build before anything is installed or built. The reason goes to the status as `configError`, naming the field or the line, and the last good output keeps being served, as for any failed build. Fix the file and the next build clears the error.
 
+**Service.** The `service` section starts one long-running process beside Caddy, for example an API. It runs from the build copy, so its dependencies come from the install step and its code from the last successful build. It is started after the first successful build, and every later successful build stops it and starts it again, so it runs the code of that build. dev-host sets `PORT` to `service.port` and `HOST` to `127.0.0.1`, and Caddy proxies `API_PATH` (`/api/*` by default) to it. Its other environment variables come from the container, so put paths such as `DATA_DIR` and `DB_PATH` in the node's environment, not in the file. Its output goes to the container log.
+
+If the service exits, dev-host starts it again after 5 seconds, doubling the pause up to 60 seconds; the pause returns to 5 seconds after a run of 60 seconds. A restart runs from the current build copy, which a failed build may have changed. A file that removes `service` stops the service at the next build; a rejected file keeps it running. Changing `service.port` needs a container restart, as `serve.apiUpstream` does. Changing `service.command` takes effect at the next successful build. `service` and `serve.apiUpstream` cannot both be set. Stopping the container stops the service.
+
 **Serving settings need a restart.** `build.spa` and `serve.apiUpstream` are applied when the container starts. A later edit does not change the running Caddy; the next build reports `serve settings changed: restart the container to apply` and the container keeps the values it started with. A custom `CADDYFILE` makes both settings ineffective.
 
 **Copy retry.** When `rsync` exits with 24 (files vanished during the copy, usually because a tool is still writing), the copy runs once more and the status keeps the warning `copy retried once: files changed while copying`. A second 24 or any other `rsync` error fails the build. Putting the directory in `ignore` is the lasting fix.
 
-**Status and dashboard.** `/__dev-host/status.json` and `dev-host status` gain these fields on every write: `name`, `description`, `configSource` (`.node-dev-host.yaml`, or `null` without a file), `configHash` (the SHA-256 of the file, or `null`), `configError`, `ignore` (the configured entries only, not the built-ins), `external` (the normalized external folders, or an empty list without a file) and `warnings`. The control node's list gives each row a read-only `project` object with `name`, `description`, `configSource`, `configError` and `warnings`. The dashboard shows the name and description under the container name, a `Config:` line for a rejected file, and the warnings.
+**Status and dashboard.** `/__dev-host/status.json` and `dev-host status` gain these fields on every write: `name`, `description`, `configSource` (`.node-dev-host.yaml`, or `null` without a file), `configHash` (the SHA-256 of the file, or `null`), `configError`, `ignore` (the configured entries only, not the built-ins), `external` (the normalized external folders, or an empty list without a file), `service` (`null` without a `service` section; otherwise `state`, `port`, `pid`, `restarts` and `lastExit`, where `state` is `waiting` before the first successful build, then `running` or `exited`) and `warnings`. The control node's list gives each row a read-only `project` object with `name`, `description`, `configSource`, `configError` and `warnings`. The dashboard shows the name and description under the container name, a `Config:` line for a rejected file, and the warnings.
 
 ## Control node
 
