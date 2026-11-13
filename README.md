@@ -28,7 +28,7 @@ A git tag `v1.2.3` also publishes `1.2.3`, `1.2.3-demo`, `1.2.3-alpine` and `1.2
 - Reports build state as JSON at `/__dev-host/status.json` and `dev-host status`, and lets you trigger a rebuild with `dev-host rebuild`.
 - Adds `X-Build-Time` (UTC, when the served build finished) and `X-Build-Duration` (seconds) response headers, so a client can tell how fresh `dist` is.
 - Prunes unused pnpm packages after each dependency install, so the store does not grow without bound.
-- Configured with environment variables.
+- Configured with environment variables, and optionally by a `.node-dev-host.yaml` at the project root: a name and description for the dashboard, directories that never reach the build copy, and build and serve settings. See [Workspace configuration](#workspace-configuration).
 - Optional control node: `dev-host control` runs a dashboard and JSON API for the node-dev-host containers on the Docker host. It lists them with their build state and starts, stops, restarts, rebuilds, removes and shows the logs of them. See [Control node](#control-node).
 
 ## Quick start
@@ -58,6 +58,70 @@ The `-v` line above keeps the pnpm store in a named volume, so a new container r
 - **Several containers at once** can share one volume. Removing containers does not remove the volume; `docker volume rm node-dev-host-pnpm` resets it.
 
 The skill has the details and the trade-offs: [`skills/node-dev-host/SKILL.md`](skills/node-dev-host/SKILL.md#share-the-package-cache).
+
+## Workspace configuration
+
+A project can describe itself with `.node-dev-host.yaml` at the root of the mounted folder. dev-host reads the file at the start of every build, so an edit applies from the next build without a restart. The file is optional: without it, everything behaves as before. dev-host reads the file and never writes to the folder.
+
+```yaml
+# Project settings for node-dev-host. Put this file at the root of the project folder.
+version: 1
+name: jjb
+description: Personal JJB site
+ignore: [.browser-profile/, apps/scraper/cache/, "*.log"]
+build:
+  install: pnpm install --frozen-lockfile
+  command: pnpm build:site
+  distDir: apps/web/dist
+  spa: true
+serve:
+  apiUpstream: 172.25.0.1:3001
+```
+
+| Field | Type and limits |
+| --- | --- |
+| `version` | Required. The integer `1`. |
+| `name` | 1 to 80 characters, no control characters. Shown on the dashboard. |
+| `description` | At most 500 characters, no control characters. Shown on the dashboard. |
+| `ignore` | A list of strings. Each entry is an exclude pattern relative to the project root; see below. |
+| `build.install` | Not empty. The install command, run in the build copy. |
+| `build.command` | Not empty. The build command, run in the build copy. |
+| `build.distDir` | Not empty, relative to the project root, no `..` segment. The folder that is served after a build. |
+| `build.spa` | `true` or `false`. |
+| `serve.apiUpstream` | `host:port`, for example `172.25.0.1:3001`. Nothing else: no scheme, path, spaces or Caddy syntax. |
+
+The file is at most 64 KiB. A field not listed above is refused at any level, and so is any field that would choose a network: networks stay in the control node's node record. The top level must be a mapping of fields, and a file with more than one document is refused.
+
+**YAML that is accepted:** block mappings indented with spaces, block lists of scalars, plain, `"double"` and `'single'` quoted strings, integers, `true` and `false`, `null` or `~`, comments that start with ` #` on their own line or after a value, and one-line flow lists such as `[a, "b/"]`. **Refused, with the line number:** anchors, aliases, tags, flow mappings, multi-line strings, multiple documents, lists of mappings, and tabs in indentation. Quote a value that starts with `*`, `&`, `!`, `%`, `@`, `` ` ``, `|`, `>`, `?`, `,`, `{` or `}`, and a value with `: ` inside it.
+
+**Precedence.** Each setting takes the first of these that is set. An empty variable counts as unset.
+
+| Setting | Environment variable | File | Default |
+| --- | --- | --- | --- |
+| Install command | `INSTALL_CMD` | `build.install` | `pnpm install` (with `--frozen-lockfile` when `pnpm-lock.yaml` exists) |
+| Build command | `BUILD_CMD` | `build.command` | `pnpm build` |
+| Output folder | `DIST_DIR` | `build.distDir` | `dist` |
+| SPA mode | `SPA` | `build.spa` | `true` |
+| API upstream | `API_UPSTREAM` | `serve.apiUpstream` | unset |
+
+A container with no file and the same variables behaves exactly as before. The variables are not checked by the file validation, as before.
+
+**Exclusions.** These are always excluded from the build copy and from the change check, at any depth, and no file can remove them: `node_modules`, `.git`, `.vite`, `.turbo`, `.cache`, `coverage`, `.pnpm-store`, and the output folder at the project root. `ignore` adds to them. Entries follow rsync's exclude rules:
+
+- `.browser-profile/` matches a directory of that name at any depth.
+- `apps/scraper/cache/` matches only that path, because a slash in the entry anchors it to the project root.
+- `*.log` matches with a wildcard.
+- Refused: a blank entry; an absolute path, `~` or a drive letter (`/data`); a `..` segment (`../secrets`, `a/../../b`); an entry starting with `!`, `#`, `;`, `+ ` or `- `; a newline or NUL.
+
+Files inside an ignored path do not trigger builds and are not copied. An entry added to a running project removes that directory from the existing build copy at the next build. `node_modules`, caches and the build output in that copy are kept.
+
+**An invalid file fails the build.** A file that does not validate fails the build before anything is installed or built. The reason goes to the status as `configError`, naming the field or the line, and the last good output keeps being served, as for any failed build. Fix the file and the next build clears the error.
+
+**Serving settings need a restart.** `build.spa` and `serve.apiUpstream` are applied when the container starts. A later edit does not change the running Caddy; the next build reports `serve settings changed: restart the container to apply` and the container keeps the values it started with. A custom `CADDYFILE` makes both settings ineffective.
+
+**Copy retry.** When `rsync` exits with 24 (files vanished during the copy, usually because a tool is still writing), the copy runs once more and the status keeps the warning `copy retried once: files changed while copying`. A second 24 or any other `rsync` error fails the build. Putting the directory in `ignore` is the lasting fix.
+
+**Status and dashboard.** `/__dev-host/status.json` and `dev-host status` gain these fields on every write: `name`, `description`, `configSource` (`.node-dev-host.yaml`, or `null` without a file), `configHash` (the SHA-256 of the file, or `null`), `configError`, `ignore` (the configured entries only, not the built-ins) and `warnings`. The control node's list gives each row a read-only `project` object with `name`, `description`, `configSource`, `configError` and `warnings`. The dashboard shows the name and description under the container name, a `Config:` line for a rejected file, and the warnings.
 
 ## Control node
 
@@ -263,7 +327,7 @@ Build args: `NODE_VERSION`, `CADDY_VERSION`, `PNPM_VERSION`, `TYPESCRIPT_VERSION
 
 ## Integration tests
 
-`tests/integration/run.sh <image> <target>` runs real containers against a built image and checks what they build and serve: the read-only workspace, rebuilds on edit, failed builds, the `/api` proxy, a custom `CADDYFILE`, the shared pnpm store volume and the control node. It needs Docker, curl, Node.js (for the `/api` upstream), GNU `find` and coreutils (`cksum`, `sha256sum`), and either `ss` or `lsof`. The control scenarios also mount `/var/run/docker.sock`.
+`tests/integration/run.sh <image> <target>` runs real containers against a built image and checks what they build and serve: the read-only workspace, rebuilds on edit, failed builds, the `/api` proxy, a custom `CADDYFILE`, the shared pnpm store volume, the control node, and the workspace configuration (`test_workspace_config`: an ignored directory stays out of the copy and starts no build, the purge of a copy made before the rule, a rejected file that keeps the last page, ten manual builds while the ignored directory is written, `BUILD_CMD` taking precedence, and the retry on exit 24). It needs Docker, curl, Node.js (for the `/api` upstream), GNU `find` and coreutils (`cksum`, `sha256sum`), and either `ss` or `lsof`. The control scenarios also mount `/var/run/docker.sock`.
 
 ```sh
 docker build --target host -t node-dev-host:test-host .

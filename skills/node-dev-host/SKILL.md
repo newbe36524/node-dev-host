@@ -152,7 +152,7 @@ docker logs <name>                        # build output, prefixed with [dev-hos
 curl http://127.0.0.1:<PORT>/__dev-host/status.json
 ```
 
-`status.json` example: `{"state":"ok","builds":3,"failures":0,"lastExitCode":0,"finishedAt":"2026-11-11T08:00:00Z"}`. While a build runs, it also carries `"reason"`.
+`status.json` example: `{"state":"ok","builds":3,"failures":0,"lastExitCode":0,"finishedAt":"2026-11-11T08:00:00Z","name":"jjb","description":"Personal JJB site","configSource":".node-dev-host.yaml","configHash":"<64 hex characters>","configError":null,"ignore":[".browser-profile/"],"warnings":[]}`. Without a configuration file, `name`, `description`, `configSource`, `configHash` and `configError` are `null`, `ignore` is `[]`, and `warnings` holds what the last build reported. While a build runs, it also carries `"reason"`. The project fields are described under [Workspace configuration](#workspace-configuration).
 
 | `state` | Meaning | What to do |
 | --- | --- | --- |
@@ -300,9 +300,38 @@ All variables are optional.
 | `CADDYFILE` | unset | Path inside the container to a custom Caddyfile, copied over the generated one. `API_UPSTREAM`, `API_PATH` and `SPA` then have no effect. `HTTP_PORT` still drives the health check, so keep it matching the custom file's listen port. Its `root` must be `/var/lib/dev-host/www`. It must also keep the `/__dev-host/status.json` route, which the health check uses. Mount the file with `-v`. |
 | `WORKSPACE` | `/workspace` | Mount point of the project. It is read, never written. Change only if the mount point changes. |
 
-Rebuilds are triggered by changes to any file in `/workspace`, except `node_modules`, `.git`, `dist`, `.vite`, `.turbo`, `.cache`, `coverage` and `.pnpm-store`, which are excluded at any depth. `/$DIST_DIR` (for example `build` when `DIST_DIR=build`) is excluded at the project root only.
+Rebuilds are triggered by changes to any file in `/workspace`, except `node_modules`, `.git`, `dist`, `.vite`, `.turbo`, `.cache`, `coverage` and `.pnpm-store`, which are excluded at any depth. `/$DIST_DIR` (for example `build` when `DIST_DIR=build`) is excluded at the project root only. Every `ignore` entry of `.node-dev-host.yaml` is excluded too: a change inside it starts no build. The built-in names cannot be removed by the file; an entry only adds to them.
 
-The copy into the build directory skips `node_modules`, `.git`, `.vite`, `.turbo`, `.cache`, `coverage` and `.pnpm-store` at any depth, and `/$DIST_DIR` at the project root. Nested `dist` folders are copied.
+The copy into the build directory skips the same built-in names at any depth, `/$DIST_DIR` at the project root and every `ignore` entry. Nested `dist` folders are copied. A path that becomes ignored is removed from an existing build copy at the next build, and `node_modules`, caches and the build output in that copy are kept.
+
+### Workspace configuration
+
+A project can describe itself in `.node-dev-host.yaml` at the root of its folder. The build reads it at the start of every build, so an edit applies from the next build. The file is optional. Its fields:
+
+- `version`: required, the integer `1`.
+- `name`: 1 to 80 characters. `description`: at most 500 characters. Neither may hold control characters. Both show on the dashboard.
+- `ignore`: a list of rsync exclude patterns relative to the project root. Refused: blank entries, absolute paths (`/data`, `~`, a drive letter), `..` segments (`../secrets`, `a/../b`), entries starting with `!`, `#`, `;`, `+ ` or `- `, and newline or NUL. `.browser-profile/` matches at any depth, and a slash inside an entry anchors it (`apps/scraper/cache/`).
+- `build.install`, `build.command`: not empty. `build.distDir`: not empty, relative, no `..`. `build.spa`: `true` or `false`.
+- `serve.apiUpstream`: `host:port` only.
+
+Any other field is refused at every level, including any field that would choose a network. The file is at most 64 KiB. Each setting takes the first of: its environment variable when non-empty, the file, the default. The variables are `INSTALL_CMD`, `BUILD_CMD`, `DIST_DIR`, `SPA` and `API_UPSTREAM`, mapped to `build.install`, `build.command`, `build.distDir`, `build.spa` and `serve.apiUpstream`. Accepted YAML is block mappings indented with spaces, block lists of scalars, plain and quoted strings, integers, booleans, `null`, comments and one-line flow lists such as `[a, "b/"]`. Anchors, aliases, tags, flow mappings, multi-line strings, multiple documents and lists of mappings are refused with the line number.
+
+```yaml
+# Project settings for node-dev-host. Put this file at the root of the project folder.
+version: 1
+name: jjb
+description: Personal JJB site
+ignore: [.browser-profile/, apps/scraper/cache/, "*.log"]
+build:
+  install: pnpm install --frozen-lockfile
+  command: pnpm build:site
+  distDir: apps/web/dist
+  spa: true
+serve:
+  apiUpstream: 172.25.0.1:3001
+```
+
+`build.spa` and `serve.apiUpstream` (and `SPA` and `API_UPSTREAM`) apply when the container starts. A later edit changes nothing in the running Caddy; the next build reports `serve settings changed: restart the container to apply`. A custom `CADDYFILE` makes both ineffective.
 
 Inside the container: `/workspace` is the read-only input, `/var/lib/dev-host/build` is the copy (with its `node_modules` and the build output), `/var/lib/dev-host/www` is the served output, and `/var/lib/dev-host` holds the status files. The pnpm store is `/var/lib/dev-host/pnpm/store`, which the run command mounts as a volume (see Share the package cache).
 
@@ -310,6 +339,9 @@ Dependencies are reinstalled when `package.json`, `pnpm-lock.yaml`, `pnpm-worksp
 
 ## Gotchas
 
+- **A rejected configuration file fails the build.** The build stops before install or build. `configError` names the field or the line, `failures` counts the build, and `www` keeps the last good output. Read the reason with `docker exec <name> dev-host status`. Correct the file: the next build clears `configError`. The file is refused if it is a link, larger than 64 KiB, or not valid UTF-8.
+- **rsync exit 24 is retried once.** It means files vanished during the copy, usually a tool still writing in the project. The copy runs once more and `warnings` records `copy retried once: files changed while copying`. A second 24, or any other `rsync` error, fails the build. The lasting fix is to put the writing directory in `ignore`.
+- **Serve settings need a restart.** `build.spa`, `serve.apiUpstream`, `SPA` and `API_UPSTREAM` are applied at container start. After an edit the running container keeps its values and `warnings` says to restart it: `docker restart <name>`.
 - **Recovering a failed install.** A failed install still records the dependency state, so while `node_modules` exists in the build copy, later builds do not run the install again until a dependency file changes. A partial `node_modules` can also break every later build. Recover inside the container: `docker exec <name> rm -rf /var/lib/dev-host/build/node_modules`, then `docker exec <name> dev-host rebuild`. Do not delete it from the host; the build copy lives in the container.
 - **Builds never touch `/workspace`.** Files the build writes (for example `tsconfig.tsbuildinfo`) stay in the build copy, so they cannot start a build. An edit saved during a build starts another build after it.
 - **Demo installs at first start.** The demo image does not install during the image build, so its first start installs dependencies and needs network access.
@@ -338,6 +370,7 @@ Build args: `NODE_VERSION` (24), `CADDY_VERSION` (2), `PNPM_VERSION`, `TYPESCRIP
 
 - `Dockerfile`: Debian targets `base`, `demo`, `host`; Alpine targets `base-alpine`, `demo-alpine`, `host-alpine`. `host` stays last so a bare `docker build .` produces the Debian host image. A `control-ui` stage builds the dashboard on `$BUILDPLATFORM`, and `base` and `base-alpine` copy its output to `/usr/local/lib/dev-host/control/ui`.
 - `rootfs/usr/local/bin/dev-host`: the entrypoint script with `run`, `rebuild`, `status`, and `control` commands.
+- `rootfs/usr/local/lib/dev-host/workspace-config.mjs`: reads and validates `.node-dev-host.yaml` for `dev-host` and writes its results into the state directory. See [Workspace configuration](#workspace-configuration). It uses no npm packages.
 - `rootfs/usr/local/lib/dev-host/control/server.mjs`: the control node server (`dev-host control`). It has the routes, guards and config in [Control node](#control-node). It uses no npm packages.
 - `control-ui/`: the React dashboard, a pnpm project with `dev`, `build`, `test` and `typecheck` scripts. `pnpm dev` proxies `/api` to `CONTROL_URL` (default `http://127.0.0.1:43180`).
 - `demo/`: the demo project copied into the `demo` image.
