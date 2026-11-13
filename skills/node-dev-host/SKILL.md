@@ -131,7 +131,9 @@ In a test, the second container's `npm install` took 1 s, against 15 s for the f
 **What sharing changes:**
 
 - Two containers started at the same time on one volume both reached `ok`, with no store errors.
-- After each successful install the loop runs `pnpm store prune`. That also removes packages that only another container's project uses, so that container downloads them again on its next install. In the test, one package was downloaded again.
+- Installs and the prune share a lock file, `store.lock`, next to the store folder (`/var/lib/dev-host/pnpm/store.lock` by default). Each install takes it shared, so containers can install at the same time. The prune after a successful install takes it exclusively, so it waits for running installs and blocks new ones while it runs. Without this lock, a prune could delete a file that another container's install was importing, and that install failed with `No such file or directory`. The lock covers the containers that mount the same volume at the same path. Without `flock` (or if the lock file cannot be opened), dev-host logs `[store-lock] ... running without it` and continues.
+- The prune still removes packages that only another container's project uses, so that container downloads them again on its next install. In the test, one package was downloaded again.
+- A container built from an image before the store lock existed prunes without it. Recreate such containers on the current image.
 - Containers do not remove the volume. To reset the cache, stop the containers that use it, then run `docker volume rm node-dev-host-pnpm`. To check its size, run `docker exec <name> du -sh /var/lib/dev-host/pnpm/store`.
 
 ## What happens at start
@@ -341,6 +343,67 @@ Inside the container: `/workspace` is the read-only input, `/var/lib/dev-host/bu
 
 Dependencies are reinstalled when `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`, `.npmrc` or `.pnpmfile.cjs` changes.
 
+## Projects with a backend
+
+One container serves one project. The output is always served by Caddy. A project with a backend adds one process beside it, declared as `service` in `.node-dev-host.yaml`. Choose the pattern from the table; the rest of this section covers the first one.
+
+| Project shape | Pattern | Supported |
+| --- | --- | --- |
+| Static frontend, or a frontend that calls a backend elsewhere | One node, `build` only. Set `serve.apiUpstream` to the backend's `host:port` when the backend is reached through the host. | Yes |
+| Frontend and one backend process (for example a Node API) | One node with `service`. | Yes |
+| One frontend, two or more backend processes | Wrap them in one command, or split the project into more than one node. dev-host restarts only when the whole command exits. | Limited |
+| Several projects | One node per project, each with its own name, workspace and port. | Yes |
+| A backend in a node of its own, reached from another node | Not supported. The service listens on `127.0.0.1` inside its container, so other containers cannot reach it. | No |
+
+### One node with a service
+
+Declare the process in the project's `.node-dev-host.yaml`:
+
+```yaml
+version: 1
+name: jjb
+build:
+  command: pnpm build
+  distDir: apps/web/dist
+service:
+  command: pnpm --filter @jjb/api start
+  port: 3001
+```
+
+What dev-host does with it:
+
+- After the first successful build, it starts the command in the build copy (the copy has the dependencies from the install step). Every later successful build stops it and starts it again, so the service runs the code of that build. A web-only change therefore restarts the API too.
+- It sets `PORT` to `service.port` and `HOST=127.0.0.1`, and the rest of its environment comes from the container. Caddy proxies `API_PATH` (default `/api/*`, set as an environment variable, not in the file) to `127.0.0.1:<port>`.
+- If the process exits, it is started again after 5 seconds, and the pause doubles up to 60 seconds. A restart runs from the current build copy, which a failed build may have changed.
+- Its output goes to the container log. `status.json` shows `service` with `state` (`waiting` until the first successful build, then `running` or `exited`), `port`, `pid`, `restarts` and `lastExit`.
+- `service` and `serve.apiUpstream` cannot be set together. Changing `service.port` needs a container restart; changing `service.command` takes effect at the next successful build.
+
+Put paths and secrets that the service needs in the container's environment, not in the file. Do not set `API_UPSTREAM` in the environment either: an environment variable wins over the file, so it would replace the service's upstream.
+
+Keep the data where the container's rules put it:
+
+- `/workspace` is read-only. Read data from it (`DATA_DIR=/workspace/data`).
+- Write state under `/var/lib/dev-host`, which the container keeps until it is recreated (`DB_PATH=/var/lib/dev-host/catalog.db`). A database there is lost when the container is recreated, so the service must be able to rebuild it from its source data.
+- Folders the service must write to in the project are `external` entries, with a read-write mount over the path (see External folders).
+
+```sh
+docker run -d --name nd-jjb -p 127.0.0.1:43103:8080 \
+  --label node-dev-host.port=43103 --label node-dev-host.name=nd-jjb \
+  -v "$PWD":/workspace:ro \
+  -v "$PWD/data/covers":/workspace/data/covers \
+  -v node-dev-host-pnpm:/var/lib/dev-host/pnpm \
+  -e DATA_DIR=/workspace/data -e DB_PATH=/var/lib/dev-host/catalog.db \
+  ghcr.io/newbe36524/node-dev-host:latest
+```
+
+Through the control node, put the same two variables in the node record's `env` (see nd-console, `references/extending.md`).
+
+### What a service cannot do
+
+- **Two services in one node.** The file takes one `service`. Use one command that starts both and accept that dev-host restarts only when that command exits, or split the project into two nodes.
+- **A backend reached from another node.** `HOST=127.0.0.1` is set for the service, so it listens on loopback inside its container. A backend that honours `HOST` cannot be reached by another container. Keep the backend in the same node as the frontend.
+- **A service that needs a second port.** dev-host passes one `PORT`.
+
 ## Gotchas
 
 - **A rejected configuration file fails the build.** The build stops before install or build. `configError` names the field or the line, `failures` counts the build, and `www` keeps the last good output. Read the reason with `docker exec <name> dev-host status`. Correct the file: the next build clears `configError`. The file is refused if it is a link, larger than 64 KiB, or not valid UTF-8.
@@ -352,7 +415,7 @@ Dependencies are reinstalled when `package.json`, `pnpm-lock.yaml`, `pnpm-worksp
 - **Demo installs at first start.** The demo image does not install during the image build, so its first start installs dependencies and needs network access.
 - **A failed first build leaves nothing to serve.** If no build has ever succeeded, `www` is empty, so requests return 404 until a build works.
 - **Ports.** A changed `HTTP_PORT` must be matched in `-p`, and it is also used by the health check.
-- **Disk use.** The build copy and its `node_modules` live in the container and are removed with `docker rm`. The pnpm store lives in the `node-dev-host-pnpm` volume, which is kept until you remove it. The loop runs `pnpm store prune` after each successful install to drop packages no project uses. Docker keeps container logs without a size limit by default; add `--log-opt max-size=10m --log-opt max-file=3` to `docker run` on a long-lived container.
+- **Disk use.** The build copy and its `node_modules` live in the container and are removed with `docker rm`. The pnpm store lives in the `node-dev-host-pnpm` volume, which is kept until you remove it. The loop runs `pnpm store prune` after each successful install, under the store lock, to drop packages no project uses. Docker keeps container logs without a size limit by default; add `--log-opt max-size=10m --log-opt max-file=3` to `docker run` on a long-lived container.
 - **Memory use.** An idle container uses about 14 MiB of RAM (Caddy plus the polling loop). Memory peaks during `pnpm install` and the build, which exit when done. Use `--memory` to cap a large build on a small host.
 - **Polling cost.** Each poll walks the source tree (not `node_modules`). Measured at about 50 ms of CPU for 10,000 source files. Raise `POLL_INTERVAL` on very large trees.
 - **Not a production server.** The image is for development previews and local work. Deploy the built `dist` with the project's own hosting.
