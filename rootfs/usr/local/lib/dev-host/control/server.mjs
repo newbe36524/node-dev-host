@@ -144,8 +144,16 @@ async function labelledSummaries() {
   return JSON.parse(r.body.toString('utf8'));
 }
 
+// Host ports that running containers publish, labelled or not: nextPort must not hand one of them out.
+async function publishedHostPorts() {
+  const r = await dockerRaw('GET', '/containers/json');
+  if (r.status !== 200) throw new HttpError(502, dockerMessage(r));
+  return JSON.parse(r.body.toString('utf8')).flatMap((c) => (c.Ports || []).map((p) => p.PublicPort).filter(Boolean));
+}
+
 async function listContainers() {
   const summaries = await labelledSummaries();
+  const published = await publishedHostPorts();
   const [records, persistence, settings] = await Promise.all([store.getNodes(), store.status(), store.getSettings()]);
   const byName = new Map(records.map((record) => [record.name, record]));
 
@@ -208,7 +216,7 @@ async function listContainers() {
       ...persistence,
       warning: persistence.warning || (persistence.mounted ? null : `node records are not on a separate mount at ${DATA_DIR}`),
     },
-    nextPort: nextPort(records, summaries),
+    nextPort: nextPort(records, summaries, published),
     settings: { npmRegistry: settings.npmRegistry ?? null },
   };
 }

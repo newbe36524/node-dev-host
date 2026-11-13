@@ -134,12 +134,15 @@ export function createBody(record, { httpPort = DEFAULT_HTTP_PORT, npmRegistry =
   return body;
 }
 
-export function nextPort(records = [], containers = []) {
+// published: host ports that running containers publish, labelled or not. A port in use by any of them is skipped,
+// so the port handed out is one Docker can bind.
+export function nextPort(records = [], containers = [], published = []) {
   const used = new Set(records.map((record) => Number(record.port)));
   for (const container of containers) {
     const port = container.port ?? container.Config?.Labels?.[PORT_LABEL] ?? container.Labels?.[PORT_LABEL];
     if (Number.isInteger(Number(port))) used.add(Number(port));
   }
+  for (const port of published) if (Number.isInteger(Number(port))) used.add(Number(port));
   for (let port = MIN_PORT; port <= MAX_PORT; port += 1) {
     if (!used.has(port)) return port;
   }
