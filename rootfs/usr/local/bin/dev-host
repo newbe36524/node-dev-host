@@ -7,6 +7,14 @@
 #                      (needs the Docker socket mounted; see README "Control node")
 set -uo pipefail
 
+# The variables as the operator set them, before the defaults below. The workspace configuration file
+# (.node-dev-host.yaml) fills in the ones left empty here; see load_config.
+ENV_INSTALL_CMD="${INSTALL_CMD:-}"
+ENV_BUILD_CMD="${BUILD_CMD:-}"
+ENV_DIST_DIR="${DIST_DIR:-}"
+ENV_SPA="${SPA:-}"
+ENV_API_UPSTREAM="${API_UPSTREAM:-}"
+
 WORKSPACE="${WORKSPACE:-/workspace}"
 DIST_DIR="${DIST_DIR:-dist}"
 INSTALL_CMD="${INSTALL_CMD:-}"
@@ -38,30 +46,52 @@ TRIGGER_FILE="$STATE_DIR/rebuild"
 # Read by Caddy on every request (X-Build-Time / X-Build-Duration headers).
 BUILD_TIME_FILE="$STATE_DIR/build-time"
 BUILD_DURATION_FILE="$STATE_DIR/build-duration"
+# The configuration loader and the state files it writes into STATE_DIR (never into the workspace).
+WS_CLI="$(dirname "${BASH_SOURCE[0]}")/../lib/dev-host/workspace-config.mjs"
+
+# status.json fields that describe the workspace configuration, as a JSON fragment (values JSON-encoded).
+NULL_META=',"name":null,"description":null,"configSource":null,"configHash":null,"configError":null,"ignore":[]'
+META_JSON="$NULL_META"
+# Warnings of the current build, fixed texts; written as the "warnings" array of every status write.
+WARNINGS=()
+# The effective settings, their rules and the change signature they were computed under.
+RULES_KEY=""; RULES_IN_SIG=""; PREV_SIG=""
+COPY_ARGS=(); PROTECT_ARGS=(); HASH_ARGS=(); DEPS_ARGS=()
+RESOLVED_SPA=""; RESOLVED_API_UPSTREAM=""
+# Set when the operator supplies CADDYFILE: then the serving settings from the file and environment are ignored.
+CUSTOM_CADDYFILE=""
 
 log() { printf '[dev-host %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
+warnings_json() {
+  local out="" w
+  for w in "${WARNINGS[@]}"; do out="${out:+$out,}\"$w\""; done
+  printf '[%s]' "$out"
+}
+
 write_status() { # state, extra json fields (optional)
   local tmp="$STATUS_FILE.tmp"
-  printf '{"state":"%s","builds":%d,"failures":%d,"lastExitCode":%s,"finishedAt":"%s"%s}\n' \
-    "$1" "$BUILDS" "$FAILURES" "${LAST_EXIT:-null}" "$(date -u +%FT%TZ)" "${2:-}" > "$tmp" \
+  printf '{"state":"%s","builds":%d,"failures":%d,"lastExitCode":%s,"finishedAt":"%s"%s%s,"warnings":%s}\n' \
+    "$1" "$BUILDS" "$FAILURES" "${LAST_EXIT:-null}" "$(date -u +%FT%TZ)" "${2:-}" "$META_JSON" "$(warnings_json)" > "$tmp" \
     && mv "$tmp" "$STATUS_FILE"
 }
 
-# Hash of all source files; build output and tool caches are ignored.
-source_sig() {
-  find "$WORKSPACE" \
-    \( -name node_modules -o -name .git -o -name dist -o -name .vite -o -name .turbo \
-       -o -name .cache -o -name coverage -o -name .pnpm-store -o -path "$WORKSPACE/$DIST_DIR" \) -prune \
-    -o -type f -printf '%P %T@ %s\n' 2>/dev/null | sort | sha1sum | cut -d' ' -f1
+# rsync's own listing applies the rules, so the signature and the copy always agree on what is ignored. Each
+# line is "size date time path" with the mode dropped: contents are not read, but size and mtime to the second
+# (rsync's quick-check granularity) change the signature. Exit 24 (files vanished while listing) still gives a
+# usable list; any other nonzero exit fails the signature, and the caller skips that poll.
+list_sig() {
+  local out rc=0
+  out="$(rsync -r --list-only "$@" "$WORKSPACE/" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 24 ]; then return 1; fi
+  { printf '%s\n' "$out" | grep '^-' || true; } | sed 's/^[^ ]* *//' | sort | sha1sum | cut -d' ' -f1
 }
 
+# Hash of all source files; build output, tool caches and ignored paths are left out.
+source_sig() { list_sig "${HASH_ARGS[@]}"; }
+
 # Hash of the files that decide whether dependencies must be reinstalled.
-deps_sig() {
-  find "$WORKSPACE" -name node_modules -prune -o -type f \
-    \( -name package.json -o -name pnpm-lock.yaml -o -name pnpm-workspace.yaml -o -name .npmrc -o -name .pnpmfile.cjs \) \
-    -printf '%P %T@ %s\n' 2>/dev/null | sort | sha1sum | cut -d' ' -f1
-}
+deps_sig() { list_sig "${DEPS_ARGS[@]}"; }
 
 write_caddyfile() {
   local root="$SERVE_DIR" file="$STATE_DIR/Caddyfile"
@@ -98,19 +128,81 @@ write_caddyfile() {
   } > "$file"
 }
 
+# Reads .node-dev-host.yaml through workspace-config.mjs, which writes the effective settings, the status fields
+# and the exclusion rules into STATE_DIR. Sets the build settings, META_JSON and the rules. Returns 0 when the
+# file is valid or absent, 2 when it is rejected, 1 when the loader itself fails. A rejected file keeps the last
+# valid ignore list, so the change signature does not move while the file is broken.
+load_config() {
+  local out rc=0 rules kind arg
+  out="$(ENV_INSTALL_CMD="$ENV_INSTALL_CMD" ENV_BUILD_CMD="$ENV_BUILD_CMD" ENV_DIST_DIR="$ENV_DIST_DIR" \
+    ENV_SPA="$ENV_SPA" ENV_API_UPSTREAM="$ENV_API_UPSTREAM" \
+    node "$WS_CLI" load "$WORKSPACE" "$STATE_DIR" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+    log "workspace configuration could not be loaded (exit $rc): $out"
+    META_JSON=',"name":null,"description":null,"configSource":null,"configHash":null,"configError":"workspace configuration could not be loaded","ignore":[]'
+    return 1
+  fi
+  [ -n "$out" ] && log "$out"
+  . "$STATE_DIR/workspace-config.env" || return 1
+  INSTALL_CMD="$WS_INSTALL_CMD"; BUILD_CMD="$WS_BUILD_CMD"; DIST_DIR="$WS_DIST_DIR"
+  RESOLVED_SPA="$WS_SPA"; RESOLVED_API_UPSTREAM="$WS_API_UPSTREAM"
+  META_JSON="$(cat "$STATE_DIR/workspace-config.status.json")"
+  # The rules come from the same module as the status fields, so the copy, the hashes and the status never disagree.
+  rules="$(node "$WS_CLI" rules "$DIST_DIR" "$STATE_DIR/workspace-config.ignore")" || return 1
+  RULES_KEY="$rules"
+  COPY_ARGS=(); PROTECT_ARGS=(); HASH_ARGS=(); DEPS_ARGS=()
+  while IFS=$'\t' read -r kind arg; do
+    case "$kind" in
+      protect) PROTECT_ARGS+=("$arg") ;;
+      copy) COPY_ARGS+=("$arg") ;;
+      hash) HASH_ARGS+=("$arg") ;;
+      deps) DEPS_ARGS+=("$arg") ;;
+    esac
+  done <<< "$rules"
+  return "$rc"
+}
+
+# One rsync pass. Files outside the rules are copied; the protect rules keep node_modules, caches and the build
+# output (and the output folder) in BUILD_DIR, and --delete-excluded removes a path that became ignored.
+copy_source() {
+  rsync -a --delete --delete-excluded "${PROTECT_ARGS[@]}" "${COPY_ARGS[@]}" "$WORKSPACE/" "$BUILD_DIR/"
+}
+
 # Copy WORKSPACE into BUILD_DIR. node_modules, caches and the build output are left out of the copy and
 # protected from --delete, so they persist in BUILD_DIR between builds and never land in the workspace.
 sync_source() {
-  mkdir -p "$BUILD_DIR" &&
-  rsync -a --delete \
-    --exclude=node_modules --exclude=.git --exclude=.vite --exclude=.turbo \
-    --exclude=.cache --exclude=coverage --exclude=.pnpm-store \
-    --exclude="/$DIST_DIR" \
-    "$WORKSPACE/" "$BUILD_DIR/"
+  local rc=0
+  mkdir -p "$BUILD_DIR" || return 1
+  copy_source || rc=$?
+  if [ "$rc" -eq 24 ]; then
+    # Files changed while being copied, typically a tool still writing in the tree. One more copy gives a whole
+    # tree or fails the build. The warning keeps the retry visible in status.json.
+    WARNINGS+=("copy retried once: files changed while copying")
+    log "copy: files vanished during the copy (exit 24), retrying once"
+    rc=0; copy_source || rc=$?
+  fi
+  return "$rc"
 }
 
 run_build() {
-  local reason="$1" start rc=0 secs
+  local reason="$1" start rc=0 secs lrc=0
+  WARNINGS=()
+  load_config || lrc=$?
+  if [ "$lrc" -ne 0 ]; then
+    # A rejected configuration fails the build before anything is copied, installed or built, and the previous dist stays.
+    BUILDS=$((BUILDS + 1)); FAILURES=$((FAILURES + 1)); LAST_EXIT=$lrc
+    log "build FAILED (configuration exit $lrc), serving the previous dist"
+    write_status failed; return 1
+  fi
+  # A change of the exclusion rules moves the change signature. Re-baseline it before the copy, so the edit that
+  # changed the rules starts one build and not a second one.
+  if [ "$RULES_KEY" != "$RULES_IN_SIG" ]; then
+    PREV_SIG="$(source_sig)"; RULES_IN_SIG="$RULES_KEY"
+  fi
+  # Caddy keeps the serving settings it was started with; a later build that resolves other values only warns.
+  if [ -z "$CUSTOM_CADDYFILE" ] && { [ "$RESOLVED_SPA" != "$SPA" ] || [ "$RESOLVED_API_UPSTREAM" != "$API_UPSTREAM" ]; }; then
+    WARNINGS+=("serve settings changed: restart the container to apply")
+  fi
   write_status building ',"reason":"'"$reason"'"'
   start=$(date +%s)
   if [ ! -f "$WORKSPACE/package.json" ]; then
@@ -153,10 +245,10 @@ run_build() {
 }
 
 build_loop() {
-  local sig prev now changed_at=0 pending=0 pending_since=0 last_build
+  local sig now changed_at=0 pending=0 pending_since=0 last_build
   BUILDS=0; FAILURES=0; LAST_EXIT=null; DEPS_SIG=""
   # Baseline before the first build: an edit saved during a build then shows up at the next poll.
-  prev="$(source_sig)"
+  PREV_SIG="$(source_sig)"; RULES_IN_SIG="$RULES_KEY"
   run_build initial
   last_build=$(date +%s)
   while sleep "$POLL_INTERVAL"; do
@@ -165,10 +257,11 @@ build_loop() {
       rm -f "$TRIGGER_FILE"; run_build manual
       last_build=$(date +%s); pending=0; continue
     fi
-    sig="$(source_sig)"
-    if [ "$sig" != "$prev" ]; then
+    # A listing that fails skips this poll: a broken read is never taken for a change.
+    sig="$(source_sig)" || continue
+    if [ "$sig" != "$PREV_SIG" ]; then
       # Every change restarts the quiet window, so a burst of saves ends in one build.
-      prev="$sig"; changed_at=$now
+      PREV_SIG="$sig"; changed_at=$now
       if [ "$pending" -eq 0 ]; then pending=1; pending_since=$now; fi
     fi
     [ "$pending" -eq 1 ] || continue
@@ -204,8 +297,13 @@ if [ -n "$NPM_REGISTRY" ]; then
 fi
 
 mkdir -p "$STATE_DIR" "$SERVE_DIR"
+# The serving settings are read once, here: environment first, then the workspace file, then the defaults.
+# A rejected file still yields values (from the environment and defaults) and is reported by the first build.
+load_config || log "workspace configuration not applied at start (see status.json); serving with the environment and defaults"
+SPA="${RESOLVED_SPA:-$SPA}"
+API_UPSTREAM="${RESOLVED_API_UPSTREAM:-$API_UPSTREAM}"
 if [ -f "${CADDYFILE:-}" ]; then
-  cp "$CADDYFILE" "$STATE_DIR/Caddyfile"
+  cp "$CADDYFILE" "$STATE_DIR/Caddyfile"; CUSTOM_CADDYFILE=1
 else
   write_caddyfile
 fi

@@ -660,6 +660,106 @@ EOF
   REG_PID=""
 }
 
+# field NAME EXPRESSION: one value of the container's status.json. EXPRESSION sees the parsed object as j.
+# Strings print bare; anything else prints as JSON.
+field() {
+  status "$1" | node -e 'let s="";process.stdin.on("data",(d)=>s+=d).on("end",()=>{const j=JSON.parse(s);const r=eval(process.argv[1]);console.log(typeof r==="string"?r:JSON.stringify(r))})' "$2" 2>/dev/null
+}
+
+test_workspace_config() {
+  log "workspace config: the file sets the name and ignores a directory; the status and the copy follow it"
+  fresh_project wsconf
+  cp "$FIXTURE/../workspace-config/.node-dev-host.yaml" "$WORK/wsconf/"
+  mkdir -p "$WORK/wsconf/.browser-profile"
+  echo cache > "$WORK/wsconf/.browser-profile/Cache_Data.bin"
+  start wsconf -v "$WORK/wsconf:/workspace:ro"
+  check "reaches state ok" poll 300 state_is wsconf ok
+  check "status names the project" [ "$(field wsconf 'j.name')" = jjb ]
+  check "status carries the description" [ "$(field wsconf 'j.description')" = "Personal JJB site" ]
+  check "status names the configuration file" [ "$(field wsconf 'j.configSource')" = .node-dev-host.yaml ]
+  check "status carries a 64-character configHash" [ "$(field wsconf 'j.configHash.length')" = 64 ]
+  check "status lists the configured ignore entry" [ "$(field wsconf 'j.ignore')" = '[".browser-profile/"]' ]
+  check ".browser-profile is absent from the build copy" docker exec "$(cn wsconf)" test ! -e /var/lib/dev-host/build/.browser-profile
+
+  log "workspace config: creating, changing and deleting ignored files starts no build"
+  local before i
+  before="$(builds wsconf)"
+  for i in 1 2 3; do
+    echo "$i" > "$WORK/wsconf/.browser-profile/w$i.bin"; sleep 1
+    echo "$i$i" >> "$WORK/wsconf/.browser-profile/Cache_Data.bin"
+    rm -f "$WORK/wsconf/.browser-profile/w$i.bin"; sleep 1
+  done
+  sleep 15
+  check "no build from the ignored files" [ "$(builds wsconf)" = "$before" ]
+  echo "changed" > "$WORK/wsconf/public/extra.txt"
+  check "a change to another file still rebuilds" poll 120 builds_above wsconf "$before"
+  check "the change is served" poll 120 body_has wsconf /extra.txt changed
+
+  log "workspace config: ten manual builds with the ignored directory written all the time"
+  ( while :; do echo "$RANDOM" > "$WORK/wsconf/.browser-profile/churn.bin"; sleep 0.2; done ) &
+  local writer=$! ok=0 warned=0 leftover=0 n
+  for i in $(seq 1 10); do
+    n="$(builds wsconf)"
+    docker exec "$(cn wsconf)" dev-host rebuild >/dev/null
+    poll 180 builds_above wsconf "$n" || true
+    poll 120 state_is wsconf ok && ok=$((ok + 1))
+    [ "$(field wsconf 'j.warnings.length')" = 0 ] || warned=$((warned + 1))
+    docker exec "$(cn wsconf)" test ! -e /var/lib/dev-host/build/.browser-profile || leftover=$((leftover + 1))
+  done
+  kill "$writer" 2>/dev/null; wait "$writer" 2>/dev/null
+  check "all ten manual builds end ok" [ "$ok" = 10 ]
+  check "none carries a warning" [ "$warned" = 0 ]
+  check ".browser-profile is absent from the build copy after each build" [ "$leftover" = 0 ]
+
+  log "workspace config: adding an ignore entry purges a copy made before it; a rejected file keeps the last page"
+  fresh_project wsadd
+  mkdir -p "$WORK/wsadd/.browser-profile"
+  echo cache > "$WORK/wsadd/.browser-profile/Cache_Data.bin"
+  start wsadd -v "$WORK/wsadd:/workspace:ro"
+  check "reaches state ok without a configuration" poll 300 state_is wsadd ok
+  check "the first build copied .browser-profile" docker exec "$(cn wsadd)" test -e /var/lib/dev-host/build/.browser-profile
+  before="$(builds wsadd)"
+  cp "$FIXTURE/../workspace-config/.node-dev-host.yaml" "$WORK/wsadd/"
+  check "the rule edit starts a build" poll 120 builds_above wsadd "$before"
+  check "that build reaches ok" poll 120 state_is wsadd ok
+  sleep 15
+  check "exactly one build for the edit" [ "$(builds wsadd)" = "$((before + 1))" ]
+  check ".browser-profile is purged from the copy" docker exec "$(cn wsadd)" test ! -e /var/lib/dev-host/build/.browser-profile
+  check "node_modules survives the purge" docker exec "$(cn wsadd)" test -d /var/lib/dev-host/build/node_modules
+  printf 'version: 1\nignor: [.cache-x/]\n' > "$WORK/wsadd/.node-dev-host.yaml"
+  check "a rejected file fails the build" poll 180 state_is wsadd failed
+  check "the reason names the unknown field" grep -q 'ignor' <<< "$(field wsadd 'j.configError')"
+  check "the earlier page is still served" body_has wsadd / marker-v1
+  cp "$FIXTURE/../workspace-config/.node-dev-host.yaml" "$WORK/wsadd/"
+  check "a corrected file recovers to ok" poll 180 state_is wsadd ok
+  check "configError is cleared" [ "$(field wsadd 'j.configError')" = null ]
+
+  log "workspace config: BUILD_CMD from the environment beats build.command; a copy that loses files once is retried"
+  fresh_project wsprec
+  printf 'version: 1\nbuild:\n  command: "exit 1"\n' > "$WORK/wsprec/.node-dev-host.yaml"
+  mkdir -p "$WORK/shim"
+  cat > "$WORK/shim/rsync" <<'EOF'
+#!/bin/sh
+# Test shim: the first copy from the workspace exits 24 (files vanished); every other call is the real rsync.
+case " $* " in
+  *" --delete-excluded "*)
+    if [ ! -e /var/lib/dev-host/shim-used ]; then
+      touch /var/lib/dev-host/shim-used
+      echo "rsync: shim reports files vanished" >&2
+      exit 24
+    fi ;;
+esac
+exec /usr/bin/rsync "$@"
+EOF
+  chmod +x "$WORK/shim/rsync"
+  start wsprec -v "$WORK/wsprec:/workspace:ro" -v "$WORK/shim:/shim:ro" \
+    -e "BUILD_CMD=pnpm build" \
+    -e "PATH=/shim:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  check "BUILD_CMD runs, so the failing build.command does not" poll 300 state_is wsprec ok
+  check "the copy was retried once" docker exec "$(cn wsprec)" test -e /var/lib/dev-host/shim-used
+  check "the retry is a warning on the status" grep -q retried <<< "$(field wsprec 'j.warnings.join("|")')"
+}
+
 # ---- run ----------------------------------------------------------------------
 
 if [ "$VARIANT" = demo ]; then
@@ -670,6 +770,7 @@ else
   test_api_proxy
   test_custom_caddyfile
   test_shared_cache
+  test_workspace_config
 fi
 test_control_runtime
 test_control_dashboard_api

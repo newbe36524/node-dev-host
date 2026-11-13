@@ -1,0 +1,6 @@
+# Workspace configuration for the test_workspace_config scenario in run.sh. It is copied over a fresh copy of
+# the app fixture; the scenario creates the volatile .browser-profile/ directory itself.
+version: 1
+name: jjb
+description: Personal JJB site
+ignore: [.browser-profile/]

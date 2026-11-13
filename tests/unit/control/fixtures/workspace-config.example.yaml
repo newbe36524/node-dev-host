@@ -1,0 +1,12 @@
+# Project settings for node-dev-host. Put this file at the root of the project folder.
+version: 1
+name: jjb
+description: Personal JJB site
+ignore: [.browser-profile/, apps/scraper/cache/, "*.log"]
+build:
+  install: pnpm install --frozen-lockfile
+  command: pnpm build:site
+  distDir: apps/web/dist
+  spa: true
+serve:
+  apiUpstream: 172.25.0.1:3001
