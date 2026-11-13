@@ -72,7 +72,7 @@ ARG PNPM_VERSION=12.18.0
 ARG TYPESCRIPT_VERSION=7.0.2
 ARG TSX_VERSION=4.23.15
 
-# bash, findutils and coreutils: dev-host needs bash and GNU `find -printf` (busybox has neither).
+# bash, findutils and coreutils: dev-host needs bash and the coreutils it calls (sort, sha1sum, cut, dirname).
 RUN apk add --no-cache ca-certificates git tini curl rsync bash findutils coreutils
 
 COPY --from=caddy /usr/bin/caddy /usr/local/bin/caddy
