@@ -366,6 +366,16 @@ row_phase_is() {
     node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s).containers.find(c=>c.name===process.argv[1]);process.exit(r?.operation?.phase===process.argv[2]?0:1)})' \
       "$(cn "$2")" "$3"
 }
+# row_idle_is SHORT NAME STATE BUILD: the row shows STATE and BUILD and no operation is in progress.
+row_idle_is() {
+  curl -fsS "$(url "$1" /api/containers)" |
+    node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s).containers.find(c=>c.name===process.argv[1]);process.exit(r&&r.state===process.argv[2]&&r.build?.state===process.argv[3]&&!r.operation?0:1)})' \
+      "$(cn "$2")" "$3" "$4"
+}
+# dump_row SHORT NAME: prints the control node's row for a node, for a failed check.
+dump_row() {
+  curl -fsS "$(url "$1" /api/containers)" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s).containers.find(c=>c.name===process.argv[1]);console.log("        row:", JSON.stringify(r))})' "$(cn "$2")" 2>/dev/null
+}
 # row_failed_is SHORT NAME: the row is not created, has no operation in progress, and keeps an error.
 row_failed_is() {
   curl -fsS "$(url "$1" /api/containers)" |
@@ -566,10 +576,11 @@ test_control_nodes() {
   check "Start with autoStart answers 202" \
     [ "$(guarded_code nodes-ctrl POST "/api/containers/$node_name/start" -H 'Content-Type: application/json' --data '{"autoStart":true}')" = 202 ]
   check "Start with autoStart saves an active window" poll 30 body_any nodes-ctrl /api/containers '"state":"active"'
-  check "start creates and builds a container from the local test image" poll 420 row_is nodes-ctrl lifecycle running ok
+  if poll 420 row_idle_is nodes-ctrl lifecycle running ok; then pass "start creates and builds a container from the local test image"
+  else fail "start creates and builds a container from the local test image"; dump_row nodes-ctrl lifecycle; fi
 
   check "recreate answers 202" [ "$(guarded_code nodes-ctrl POST "/api/containers/$node_name/recreate")" = 202 ]
-  check "recreate returns the node to running" poll 420 row_is nodes-ctrl lifecycle running ok
+  check "recreate returns the node to running" poll 420 row_idle_is nodes-ctrl lifecycle running ok
   remove_reply="$(guarded_reply nodes-ctrl DELETE "/api/containers/$node_name" -w '\n%{http_code}')"
   remove_status="${remove_reply##*$'\n'}"
   [ "$remove_status" = 200 ] || printf '  Remove container answered %s: %s\n' "$remove_status" "${remove_reply%$'\n'*}"
@@ -591,7 +602,7 @@ test_control_nodes() {
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v "$VOLUME:/var/lib/dev-host/control"
   check "the record survives control-container recreation and its active window starts the node" \
-    poll 420 row_is nodes-ctrl lifecycle running ok
+    poll 420 row_idle_is nodes-ctrl lifecycle running ok
   check "a node with an ended startup window stays uncreated" \
     row_is nodes-ctrl lifecycle-ended "not created" unknown
   check "the ended window remains ended" row_schedule_is nodes-ctrl lifecycle-ended ended
