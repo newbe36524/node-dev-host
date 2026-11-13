@@ -93,6 +93,7 @@ serve:
 | `serve.apiUpstream` | `host:port`, for example `172.25.0.1:3001`. Nothing else: no scheme, path, spaces or Caddy syntax. Not allowed together with `service`. |
 | `service.command` | Not empty, at most 500 characters. The command that starts the service, run in the build copy. Required with `service.port`. |
 | `service.port` | An integer from 1024 to 65535. The loopback port the service listens on; see the Service paragraph below. Required with `service.command`. |
+| `image` | A non-empty string without whitespace or control characters, for example `jjb-ndh:local`. It names the image the node runs. The nd-console registration helper reads it, and the build ignores it. An image older than this field rejects it and fails the build, so add the field only after the node runs an image that has it. See [Derived images](#derived-images). |
 
 The file is at most 64 KiB. A field not listed above is refused at any level, and so is any field that would choose a network: networks stay in the control node's node record. The top level must be a mapping of fields, and a file with more than one document is refused.
 
@@ -178,6 +179,42 @@ If the service exits, dev-host starts it again after 5 seconds, doubling the pau
 **Copy retry.** When `rsync` exits with 24 (files vanished during the copy, usually because a tool is still writing), the copy runs once more and the status keeps the warning `copy retried once: files changed while copying`. A second 24 or any other `rsync` error fails the build. Putting the directory in `ignore` is the lasting fix.
 
 **Status and dashboard.** `/__dev-host/status.json` and `dev-host status` gain these fields on every write: `name`, `description`, `configSource` (`.node-dev-host.yaml`, or `null` without a file), `configHash` (the SHA-256 of the file, or `null`), `configError`, `ignore` (the configured entries only, not the built-ins), `external` (the normalized external folders, or an empty list without a file), `service` (`null` without a `service` section; otherwise `state`, `port`, `pid`, `restarts` and `lastExit`, where `state` is `waiting` before the first successful build, then `running` or `exited`) and `warnings`. The control node's list gives each row a read-only `project` object with `name`, `description`, `configSource`, `configError` and `warnings`. The dashboard shows the name and description under the container name, a `Config:` line for a rejected file, and the warnings.
+
+## Derived images
+
+A project that needs system packages or a timezone the plain image lacks can build its own image `FROM` the official one. A derived image runs as a node like the official one, as long as it keeps the items in the table below. The values are those of the `host` stage of the [`Dockerfile`](Dockerfile), the Debian base; the Alpine tags use `/sbin/tini` as their entrypoint.
+
+| Item | Value in the image | What it is |
+| --- | --- | --- |
+| Entrypoint | `["/usr/bin/tini", "--", "dev-host"]` | Starts `dev-host` under `tini`, which reaps child processes. A derived image that replaces it is unsupported: the project host no longer starts. |
+| Command | `["run"]` | The service command: the build loop, Caddy and the optional service. |
+| Port | `EXPOSE 8080`, read from `HTTP_PORT` (default `8080`) | The port Caddy serves the output on. The control node maps the record's port on loopback to it. The status endpoint is `/__dev-host/status.json` on that port. |
+| Workspace | `WORKDIR /workspace`, `ENV WORKSPACE=/workspace` | The project folder. The control node mounts the record's workspace read-only at `/workspace`, and dev-host copies it and builds the copy. |
+| `DIST_DIR` | Not set in the image. `dev-host` uses `dist` when it is unset. | The folder that is served after a build. A project sets it in `.node-dev-host.yaml` (`build.distDir`) or in the node's environment. |
+| `DATA_DIR` | Not set in the image. | A location for the project's own data, read by its service. A project sets it in the node record's environment, and a derived image keeps the same variable name. |
+
+A minimal derived Dockerfile adds packages and a timezone, and nothing else:
+
+```Dockerfile
+FROM ghcr.io/newbe36524/node-dev-host:latest
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends jq tzdata \
+ && rm -rf /var/lib/apt/lists/*
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime
+```
+
+Build it with `docker build -t my-node:local .`. It does not redefine the entrypoint, the command, the port or `/workspace`, so the node runs as before.
+
+What stays out of the image:
+
+- **The project's own settings.** Install and build commands, the output folder, ignore rules and the service belong in `.node-dev-host.yaml`, or in the node record's environment. They are not baked into the image.
+- **Dependencies.** dev-host runs the install command in the build copy, so the image does not need `node_modules`.
+- **The workspace, a network or a port other than the node's.** Do not copy the project into `/workspace`, publish a fixed port or name a network in the image. The node's record sets its port and its workspace.
+- **Credentials.** Pass them at run time through the node's environment, not in a layer.
+
+To run a derived image as a project's node, put its name in `.node-dev-host.yaml` as `image`, and register the node with the nd-console registration helper so the record takes that image. A derived image gets a field that the base image added only when it is rebuilt `FROM` the updated base.
 
 ## Control node
 
