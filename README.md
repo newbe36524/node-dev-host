@@ -84,6 +84,7 @@ serve:
 | `name` | 1 to 80 characters, no control characters. Shown on the dashboard. |
 | `description` | At most 500 characters, no control characters. Shown on the dashboard. |
 | `ignore` | A list of strings. Each entry is an exclude pattern relative to the project root; see below. |
+| `external` | A list of folder paths relative to the project root. Each folder stays in the project and appears in the build copy as a link to it; see **External folders** below. |
 | `build.install` | Not empty. The install command, run in the build copy. |
 | `build.command` | Not empty. The build command, run in the build copy. |
 | `build.distDir` | Not empty, relative to the project root, no `..` segment. The folder that is served after a build. |
@@ -115,13 +116,60 @@ A container with no file and the same variables behaves exactly as before. The v
 
 Files inside an ignored path do not trigger builds and are not copied. An entry added to a running project removes that directory from the existing build copy at the next build. `node_modules`, caches and the build output in that copy are kept.
 
+**External folders.** `external` names folders that must stay where they are, such as a cache that a build or a tool writes while it runs. A folder listed there is not copied into the build copy, and a build command that uses it reads and writes the original. Each entry is one folder path relative to the project root, with no wildcard (`*`, `?`, `[`), no leading `/`, `~` or drive letter, no `..` segment, no backslash, no control character and no leading or trailing space. A trailing `/` and a leading `./` are removed, and an entry given twice counts once. Refused, with the entry named: the project root (`.`), a folder whose name is a built-in one (`node_modules/.cache`, `.git/hooks`), a folder that is or lies inside or contains the output folder, and an entry inside another entry (`data` with `data/covers`). An entry that is also in `ignore` is treated as external.
+
+- After every copy, dev-host puts a symbolic link at the same path in the build copy. It points to the folder in `/workspace`, so `data/covers` in the build copy is the original. Installs, builds and tools in the build copy use it like any folder.
+- dev-host never writes to, deletes or moves files in an external folder. Creating, changing or deleting files there starts no build, and they do not change the change check or the dependency check.
+- **Writes need a read-write mount.** `/workspace` stays read-only. Mount the host folder read-write over the entry path. Without that mount, a write through the link fails with the filesystem's read-only error, and the build is not failed for that reason alone.
+- **A missing original is a warning.** When the folder is missing, is a file or is reached through a symbolic link, dev-host creates nothing, skips the entry, and records a warning in `warnings` that names it. The build still runs. Once the folder exists, the next build links it and the warning goes away.
+- **Removing an entry** copies the folder back into the build copy at the next build, and adding it again replaces that copy with the link. The original keeps all its files in both cases.
+- **A build command that deletes the folder is dangerous.** A command such as `rm -rf data` deletes the original files through the link. Keep cleanup commands away from external folders.
+- **The control node cannot create the extra mount.** A container that needs a writable external folder is started with `docker run` or Compose, as below. The control node reports such a container as having an unsupported mount.
+
+A project that keeps covers in `data/covers` (in `.node-dev-host.yaml` at its root):
+
+```yaml
+version: 1
+external: [data/covers]
+```
+
+With `docker run`, mount the folder read-write over the entry, after the read-only project mount:
+
+```sh
+docker run -d --name nd-my-site -p 127.0.0.1:43101:8080 \
+  --label node-dev-host.port=43101 --label node-dev-host.name=nd-my-site \
+  -v "$PWD":/workspace:ro \
+  -v "$PWD/data/covers":/workspace/data/covers \
+  -v node-dev-host-pnpm:/var/lib/dev-host/pnpm \
+  ghcr.io/newbe36524/node-dev-host:latest
+```
+
+The same with Compose:
+
+```yaml
+services:
+  my-site:
+    image: ghcr.io/newbe36524/node-dev-host:latest
+    ports:
+      - "127.0.0.1:43101:8080"
+    labels:
+      node-dev-host.port: "43101"
+      node-dev-host.name: nd-my-site
+    volumes:
+      - ./:/workspace:ro
+      - ./data/covers:/workspace/data/covers
+      - node-dev-host-pnpm:/var/lib/dev-host/pnpm
+volumes:
+  node-dev-host-pnpm:
+```
+
 **An invalid file fails the build.** A file that does not validate fails the build before anything is installed or built. The reason goes to the status as `configError`, naming the field or the line, and the last good output keeps being served, as for any failed build. Fix the file and the next build clears the error.
 
 **Serving settings need a restart.** `build.spa` and `serve.apiUpstream` are applied when the container starts. A later edit does not change the running Caddy; the next build reports `serve settings changed: restart the container to apply` and the container keeps the values it started with. A custom `CADDYFILE` makes both settings ineffective.
 
 **Copy retry.** When `rsync` exits with 24 (files vanished during the copy, usually because a tool is still writing), the copy runs once more and the status keeps the warning `copy retried once: files changed while copying`. A second 24 or any other `rsync` error fails the build. Putting the directory in `ignore` is the lasting fix.
 
-**Status and dashboard.** `/__dev-host/status.json` and `dev-host status` gain these fields on every write: `name`, `description`, `configSource` (`.node-dev-host.yaml`, or `null` without a file), `configHash` (the SHA-256 of the file, or `null`), `configError`, `ignore` (the configured entries only, not the built-ins) and `warnings`. The control node's list gives each row a read-only `project` object with `name`, `description`, `configSource`, `configError` and `warnings`. The dashboard shows the name and description under the container name, a `Config:` line for a rejected file, and the warnings.
+**Status and dashboard.** `/__dev-host/status.json` and `dev-host status` gain these fields on every write: `name`, `description`, `configSource` (`.node-dev-host.yaml`, or `null` without a file), `configHash` (the SHA-256 of the file, or `null`), `configError`, `ignore` (the configured entries only, not the built-ins), `external` (the normalized external folders, or an empty list without a file) and `warnings`. The control node's list gives each row a read-only `project` object with `name`, `description`, `configSource`, `configError` and `warnings`. The dashboard shows the name and description under the container name, a `Config:` line for a rejected file, and the warnings.
 
 ## Control node
 
@@ -327,7 +375,7 @@ Build args: `NODE_VERSION`, `CADDY_VERSION`, `PNPM_VERSION`, `TYPESCRIPT_VERSION
 
 ## Integration tests
 
-`tests/integration/run.sh <image> <target>` runs real containers against a built image and checks what they build and serve: the read-only workspace, rebuilds on edit, failed builds, the `/api` proxy, a custom `CADDYFILE`, the shared pnpm store volume, the control node, and the workspace configuration (`test_workspace_config`: an ignored directory stays out of the copy and starts no build, the purge of a copy made before the rule, a rejected file that keeps the last page, ten manual builds while the ignored directory is written, `BUILD_CMD` taking precedence, and the retry on exit 24). It needs Docker, curl, Node.js (for the `/api` upstream), GNU `find` and coreutils (`cksum`, `sha256sum`), and either `ss` or `lsof`. The control scenarios also mount `/var/run/docker.sock`.
+`tests/integration/run.sh <image> <target>` runs real containers against a built image and checks what they build and serve: the read-only workspace, rebuilds on edit, failed builds, the `/api` proxy, a custom `CADDYFILE`, the shared pnpm store volume, the control node, and the workspace configuration (`test_workspace_config`: an ignored directory stays out of the copy and starts no build, the purge of a copy made before the rule, a rejected file that keeps the last page, ten manual builds while the ignored directory is written, `BUILD_CMD` taking precedence, and the retry on exit 24, and the external folders: a read-write mount over `data/covers` that a build writes through, no build from writes into it, the entry removed and added again, and a read-only workspace whose missing folder warns and then links). It needs Docker, curl, Node.js (for the `/api` upstream), GNU `find` and coreutils (`cksum`, `sha256sum`), and either `ss` or `lsof`. The control scenarios also mount `/var/run/docker.sock`.
 
 ```sh
 docker build --target host -t node-dev-host:test-host .
