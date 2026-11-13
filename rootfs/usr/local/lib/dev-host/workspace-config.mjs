@@ -31,7 +31,7 @@ export const BUILT_IN_EXCLUDES = Object.freeze([
 ]);
 // The only files whose changes can require a reinstall; the dependency hash looks at these.
 const DEPENDENCY_FILES = ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', '.pnpmfile.cjs'];
-const TOP_FIELDS = ['version', 'name', 'description', 'ignore', 'external', 'build', 'serve', 'service'];
+const TOP_FIELDS = ['version', 'name', 'description', 'image', 'ignore', 'external', 'build', 'serve', 'service'];
 const BUILD_FIELDS = ['install', 'command', 'distDir', 'spa'];
 const SERVE_FIELDS = ['apiUpstream'];
 const SERVICE_FIELDS = ['command', 'port'];
@@ -251,6 +251,13 @@ function checkCommand(field, value) {
   return value;
 }
 
+// The image a node runs. The nd-console registration helper reads it; the build and serving never use it.
+function checkImage(value) {
+  if (typeof value !== 'string' || value === '') fail('image must be a non-empty string');
+  if (/\s/.test(value) || CONTROL_CHARS.test(value)) fail('image must not contain whitespace or control characters');
+  return value;
+}
+
 function checkDistDir(value) {
   const field = 'build.distDir';
   if (typeof value !== 'string') fail(`${field} must be a string`);
@@ -400,6 +407,7 @@ export function validateConfig(obj) {
   };
   if (obj.name !== undefined) out.name = checkText('name', obj.name, 1, 80);
   if (obj.description !== undefined) out.description = checkText('description', obj.description, 0, 500);
+  if (obj.image !== undefined) checkImage(obj.image); // validated, then left out of the resolved settings
   if (obj.ignore !== undefined) out.ignore = checkIgnore(obj.ignore);
   if (obj.external !== undefined) out.external = checkExternal(obj.external);
   if (obj.build !== undefined) {

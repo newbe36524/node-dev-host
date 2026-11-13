@@ -4,7 +4,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, test } from 'node:test';
-import { createDockerClient } from '../../../rootfs/usr/local/lib/dev-host/control/docker.mjs';
+import { createDockerClient, isLocalImage } from '../../../rootfs/usr/local/lib/dev-host/control/docker.mjs';
 import { createOperationTracker } from '../../../rootfs/usr/local/lib/dev-host/control/operations.mjs';
 import { createBody, DEFAULT_ALLOWED_IMAGES, nextPort, parseAllowedImages, parseWorkspaceRoots, validateNode, validateNpmRegistry } from '../../../rootfs/usr/local/lib/dev-host/control/nodes.mjs';
 import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from '../../../rootfs/usr/local/lib/dev-host/control/schedule.mjs';
@@ -49,15 +49,49 @@ test('pullImage treats an error line inside HTTP 200 as a failure', async () => 
   await assert.rejects(docker.pullImage('node-dev-host:latest'), /registry denied/);
 });
 
-test('pullImage uses a local image after an offline failure, otherwise throws', async () => {
+test('pullImage uses a local copy after an offline failure, otherwise throws', async () => {
   const { socket } = await fakeDocker((req, res) => {
     if (req.url.startsWith('/images/create')) return reply(res, 500, { message: 'offline' });
-    if (req.url.includes('local')) return reply(res, 200, { Id: 'local' });
+    if (req.url.includes('latest')) return reply(res, 200, { Id: 'present' });
     return reply(res, 404, { message: 'not found' });
   });
   const docker = createDockerClient(socket);
-  assert.match((await docker.pullImage('node-dev-host:local')).warning, /latest image could not be pulled: offline/);
+  assert.match((await docker.pullImage('node-dev-host:latest')).warning, /latest image could not be pulled: offline/);
   await assert.rejects(docker.pullImage('node-dev-host:missing'), /offline/);
+});
+
+test('isLocalImage is true only for a tag of local, not for a registry port or another tag', () => {
+  assert.equal(isLocalImage('jjb-ndh:local'), true);
+  assert.equal(isLocalImage('registry.example:5000/jjb-ndh:local'), true);
+  assert.equal(isLocalImage('registry.example:5000/jjb-ndh'), false);
+  assert.equal(isLocalImage('ghcr.io/newbe36524/node-dev-host:latest'), false);
+  assert.equal(isLocalImage('jjb-ndh:1.0'), false);
+  assert.equal(isLocalImage('jjb-ndh'), false);
+});
+
+test('a local tag is never pulled: a present image is used and no pull request is sent', async () => {
+  const requests = [];
+  const { socket } = await fakeDocker((req, res) => {
+    requests.push(`${req.method} ${req.url}`);
+    if (req.url.startsWith('/images/create')) return reply(res, 500, { message: 'must not pull' });
+    if (req.url.includes('jjb-ndh%3Alocal')) return reply(res, 200, { Id: 'sha256:local' });
+    reply(res, 404, { message: 'not found' });
+  });
+  const docker = createDockerClient(socket);
+  assert.deepEqual(await docker.pullImage('jjb-ndh:local'), { warning: null });
+  assert.equal(requests.some((line) => line.includes('/images/create')), false);
+});
+
+test('a missing local image fails with a message that names it and says to build it first, and sends no pull', async () => {
+  const requests = [];
+  const { socket } = await fakeDocker((req, res) => {
+    requests.push(`${req.method} ${req.url}`);
+    reply(res, 404, { message: 'not found' });
+  });
+  const docker = createDockerClient(socket);
+  await assert.rejects(docker.pullImage('jjb-ndh:local'),
+    (err) => err.message === 'image jjb-ndh:local is not on this Docker host; build it first (docker build -t jjb-ndh:local .)');
+  assert.equal(requests.some((line) => line.includes('/images/create')), false);
 });
 
 test('concurrent pulls of one image are coalesced', async () => {

@@ -8,6 +8,13 @@ export class DockerUnavailable extends HttpError {
   constructor(message) { super(503, message); }
 }
 
+// An image whose tag is `local` (for example `jjb-ndh:local`) is built on this Docker host and is never pulled.
+// A registry host with a port (`registry:5000/app`) has no tag, so its colon does not count.
+export function isLocalImage(image) {
+  const colon = image.lastIndexOf(':');
+  return colon > image.lastIndexOf('/') && image.slice(colon + 1) === 'local';
+}
+
 export function dockerMessage(r) {
   try {
     const parsed = JSON.parse(r.body.toString('utf8'));
@@ -97,7 +104,13 @@ export function createDockerClient(socket = process.env.DOCKER_SOCKET || '/var/r
     throw pullError;
   }
 
+  async function localImage(image) {
+    if (await imageInfo(image)) return { warning: null };
+    throw new HttpError(409, `image ${image} is not on this Docker host; build it first (docker build -t ${image} .)`);
+  }
+
   function pullImage(image) {
+    if (isLocalImage(image)) return localImage(image);
     if (!pulls.has(image)) {
       const pull = pullImageNow(image).finally(() => pulls.delete(image));
       pulls.set(image, pull);

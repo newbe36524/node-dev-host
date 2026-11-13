@@ -143,6 +143,29 @@ test('name is 1 to 80 characters and description at most 500, without control ch
   assert.equal(validateConfig(parseConfig(`version: 1\nname: "${'x'.repeat(80)}"`)).name.length, 80);
 });
 
+test('image is accepted and ignored: the build and serving settings are the same as without it', () => {
+  const body = 'build:\n  command: pnpm build\nserve:\n  apiUpstream: 172.25.0.1:3001';
+  const withImage = validateConfig(parseConfig(`version: 1\nimage: jjb-ndh:local\n${body}`));
+  const without = validateConfig(parseConfig(`version: 1\n${body}`));
+  assert.equal('image' in withImage, false);
+  assert.deepEqual(withImage, without);
+  assert.deepEqual(resolveSettings(withImage, {}), resolveSettings(without, {}));
+});
+
+test('image must be a non-empty string without whitespace or control characters, and the reason names it', () => {
+  reject('version: 1\nimage: [a, b]', /image must be a non-empty string/);
+  reject('version: 1\nimage:', /image must be a non-empty string/);
+  reject('version: 1\nimage: ""', /image must be a non-empty string/);
+  reject('version: 1\nimage: 5', /image must be a non-empty string/);
+  reject('version: 1\nimage: "jjb ndh:local"', /image must not contain whitespace or control characters/);
+  reject('version: 1\nimage: "jjb\\tndh:local"', /image must not contain whitespace or control characters/);
+});
+
+test('an unknown field is still rejected when image is present', () => {
+  reject('version: 1\nimage: jjb-ndh:local\nnetwork: nd-console_default', /unknown field "network"/);
+  reject('version: 1\nimage: jjb-ndh:local\nimages: jjb-ndh:local', /unknown field "images"/);
+});
+
 test('service declares a command and a loopback port, both required, and the port must be 1024 to 65535', () => {
   const ok = validateConfig(parseConfig('version: 1\nservice:\n  command: pnpm --filter @jjb/api start\n  port: 3001'));
   assert.deepEqual(ok.service, { command: 'pnpm --filter @jjb/api start', port: 3001 });

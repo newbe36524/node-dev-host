@@ -711,3 +711,124 @@ test('list rows carry project metadata from each node status, sanitized, and nul
   const stored = await fs.readFile(path.join(dir, 'data', 'nodes.json'), 'utf8');
   assert.equal(stored.includes('"project"'), false, 'project metadata is never stored in the node records');
 });
+
+test('a node on a local image is created on start and on recreate with no pull and no pull warning', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'node-control-local-'));
+  const socket = path.join(dir, 'docker.sock');
+  const containers = new Map();
+  const calls = [];
+  const dockerServer = http.createServer(async (req, res) => {
+    calls.push(`${req.method} ${req.url}`);
+    const url = new URL(req.url, 'http://docker');
+    const { pathname } = url;
+    if (pathname === '/_ping') return json(res, 200, {});
+    if (pathname === '/containers/json') {
+      return json(res, 200, [...containers.values()].map((item) => ({
+        Id: item.Id, Names: [`/${item.name}`], Image: item.Config.Image,
+        State: item.State.Running ? 'running' : 'exited', Labels: item.Config.Labels,
+      })));
+    }
+    if (pathname.startsWith('/images/create')) return json(res, 500, { message: 'a local image must not be pulled' });
+    if (pathname.startsWith('/images/')) {
+      const image = decodeURIComponent(pathname.split('/')[2]);
+      return image === 'jjb-ndh:local' ? json(res, 200, { Config: { Env: [] } }) : json(res, 404, { message: 'no such image' });
+    }
+    if (pathname === '/containers/create') {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      const body = JSON.parse(raw);
+      const name = url.searchParams.get('name');
+      if (containers.has(name)) return json(res, 409, { message: 'name is already in use' });
+      containers.set(name, {
+        Id: `id-${name}-${calls.length}`, name,
+        Config: { Image: body.Image, Labels: body.Labels, Env: body.Env, Tty: false },
+        HostConfig: body.HostConfig, NetworkingConfig: body.NetworkingConfig,
+        NetworkSettings: { Networks: {} }, State: { Running: false },
+      });
+      return json(res, 201, { Id: containers.get(name).Id });
+    }
+    const match = pathname.match(/^\/containers\/([^/]+)(?:\/(json|start|stop))?$/);
+    if (req.method === 'DELETE' && match) {
+      containers.delete(decodeURIComponent(match[1]));
+      res.writeHead(204); return res.end();
+    }
+    if (match) {
+      const item = containers.get(decodeURIComponent(match[1]));
+      if (!item) return json(res, 404, { message: 'not found' });
+      if (!match[2] || match[2] === 'json') return json(res, 200, item);
+      if (match[2] === 'start') {
+        item.State.Running = true;
+        res.writeHead(204); return res.end();
+      }
+    }
+    return json(res, 404, { message: 'not found' });
+  });
+  await new Promise((resolve) => dockerServer.listen(socket, resolve));
+  t.after(async () => {
+    await new Promise((resolve) => dockerServer.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const portServer = net.createServer();
+  await new Promise((resolve) => portServer.listen(0, '127.0.0.1', resolve));
+  const port = portServer.address().port;
+  await new Promise((resolve) => portServer.close(resolve));
+  const base = `http://127.0.0.1:${port}`;
+  const child = spawn(process.execPath, [path.resolve('rootfs/usr/local/lib/dev-host/control/server.mjs')], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HTTP_PORT: String(port),
+      DOCKER_SOCKET: socket,
+      CONTROL_DATA_DIR: path.join(dir, 'data'),
+      CONTROL_ALLOWED_IMAGES: 'node-dev-host,jjb-ndh',
+      CONTROL_WORKSPACE_ROOTS: '/home',
+    },
+    stdio: 'ignore',
+  });
+  t.after(async () => {
+    child.kill('SIGTERM');
+    await new Promise((resolve) => child.once('exit', resolve));
+  });
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      if ((await fetch(`${base}/__dev-host/status.json`)).status === 200) break;
+    } catch {}
+    if (attempt > 100) throw new Error('control server did not start');
+    await sleep(20);
+  }
+  const guardedPost = (pathName, body) => fetch(`${base}${pathName}`, {
+    method: 'POST',
+    headers: { Origin: base, 'X-Dev-Host-Control': '1', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const rowOf = async () => (await (await fetch(`${base}/api/containers`)).json()).containers.find((item) => item.name === 'nd-jjb');
+  const settled = async () => {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const row = await rowOf();
+      if (row.state === 'running' && row.operation === null) return row;
+      await sleep(10);
+    }
+    throw new Error('the row did not settle');
+  };
+
+  assert.equal((await guardedPost('/api/nodes', { name: 'nd-jjb', workspace: '/home/jjb', port: 43100, image: 'jjb-ndh:local' })).status, 201);
+  assert.equal((await rowOf()).image, 'jjb-ndh:local');
+  assert.equal((await rowOf()).state, 'not created');
+
+  assert.equal((await guardedPost('/api/containers/nd-jjb/start')).status, 202);
+  const started = await settled();
+  assert.equal(started.warning, null);
+  assert.equal(started.error, null);
+  assert.equal(started.image, 'jjb-ndh:local');
+
+  assert.equal((await guardedPost('/api/containers/nd-jjb/recreate')).status, 202);
+  const recreated = await settled();
+  assert.equal(recreated.warning, null);
+  assert.equal(recreated.error, null);
+  assert.equal(recreated.image, 'jjb-ndh:local');
+
+  assert.equal(calls.filter((call) => call.startsWith('POST /images/create')).length, 0);
+  assert.equal(calls.filter((call) => call.startsWith('POST /containers/create')).length, 2);
+});
