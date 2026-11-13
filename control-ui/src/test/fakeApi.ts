@@ -38,6 +38,7 @@ export function container(overrides: Partial<ContainerInfo> = {}): ContainerInfo
     state: "running",
     health: "healthy",
     build: { state: "ok", builds: 3, failures: 0, finishedAt: "2026-11-11T10:00:00Z" },
+    project: { name: null, description: null, configSource: null, configError: null, warnings: [] },
     registered: false,
     schedule: { state: "none", until: null, daysLeft: null },
     operation: null,

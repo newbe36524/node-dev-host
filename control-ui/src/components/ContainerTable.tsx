@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import type { PendingAction } from "@/hooks/useCommands"
 import { useNow } from "@/hooks/useNow"
-import type { ContainerInfo } from "@/lib/api"
+import type { ContainerInfo, ProjectInfo } from "@/lib/api"
 import { badgeState, relativeAge } from "@/lib/fleet"
 import { cn } from "@/lib/utils"
 import { ContainerActions } from "./ContainerActions"
@@ -21,6 +21,8 @@ export function openUrl(port: number, loc: LocationLike = window.location): stri
 
 /** A change is "recent" for this long: the dashed ring around its badge is shown, then removed. */
 const RECENT_MS = 4000
+// A row whose status carries no project metadata (an older node) renders as it did before the metadata existed.
+const NO_PROJECT: ProjectInfo = { name: null, description: null, configSource: null, configError: null, warnings: [] }
 
 const PENDING_WORD: Record<PendingAction, string> = {
   start: "starting…",
@@ -190,6 +192,9 @@ export function ContainerTable({
                 const operationWord = c.operation ? OPERATION_WORD[c.operation.phase] : undefined
                 const selected = c.id === selectedId
                 const ticked = checked?.has(c.id) ?? false
+                const project = c.project ?? NO_PROJECT
+                const configured = project.configSource !== null
+                const projectText = [project.name, project.description].filter(Boolean).join(" · ")
                 return (
                 // Below md each row stacks as a card; from md it is a table row.
                 <TableRow
@@ -220,7 +225,24 @@ export function ContainerTable({
                       />
                     </TableCell>
                   )}
-                  <TableCell className="min-w-0 flex-1 basis-[calc(100%-3.5rem)] font-medium md:basis-auto md:flex-none">{c.name}</TableCell>
+                  <TableCell className="min-w-0 flex-1 basis-[calc(100%-3.5rem)] font-medium md:basis-auto md:flex-none">
+                    {c.name}
+                    {/* Project metadata is shown only for a node whose workspace has a configuration file. */}
+                    {configured && project.name && (
+                      <span className="font-normal text-muted-foreground md:hidden" data-testid="project-name"> · {project.name}</span>
+                    )}
+                    {configured && projectText && (
+                      <span className="mt-0.5 hidden truncate text-xs font-normal text-muted-foreground md:block" title={projectText} data-testid="project-line">
+                        {projectText}
+                      </span>
+                    )}
+                    {configured && c.build.state === "failed" && project.configError && (
+                      <span className="block w-72 max-w-full break-words text-xs text-destructive" data-testid="config-error">Config: {project.configError}</span>
+                    )}
+                    {configured && project.warnings.map((warning, index) => (
+                      <span key={index} className="block w-72 max-w-full break-words text-xs text-muted-foreground" data-testid="project-warning">{warning}</span>
+                    ))}
+                  </TableCell>
                   <TableCell className="tabular-nums">{c.port}</TableCell>
                   <TableCell className="hidden max-w-48 truncate lg:table-cell" title={c.image}>
                     {c.image}

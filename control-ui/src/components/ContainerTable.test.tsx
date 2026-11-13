@@ -150,4 +150,146 @@ describe("ContainerTable", () => {
     expect(within(row).queryByRole("link", { name: "Open" })).toBeNull()
     restoreViewport()
   })
+
+  const configuredProject = {
+    name: "jjb",
+    description: "Personal JJB site",
+    configSource: ".node-dev-host.yaml",
+    configError: null,
+    warnings: [],
+  }
+
+  it("shows the project name and description under a configured container name, with the full text on hover", () => {
+    render(
+      <ContainerTable
+        containers={[container({ project: configuredProject })]}
+        readOnly={false}
+        onChanged={() => {}}
+      />,
+    )
+
+    const row = screen.getByRole("row", { name: /nd-site-a/ })
+    const line = within(row).getByTestId("project-line")
+    expect(line).toHaveTextContent("jjb · Personal JJB site")
+    expect(line).toHaveAttribute("title", "jjb · Personal JJB site")
+    expect(line).toHaveClass("hidden", "md:block")
+    expect(within(row).queryByTestId("config-error")).toBeNull()
+    expect(within(row).queryByTestId("project-warning")).toBeNull()
+  })
+
+  it("leaves a row without a configuration exactly as before: no project, error or warning lines", () => {
+    render(
+      <ContainerTable
+        containers={[container({ project: { name: "stale", description: "stale", configSource: null, configError: null, warnings: ["copy retried once"] } })]}
+        readOnly={false}
+        onChanged={() => {}}
+      />,
+    )
+
+    const row = screen.getByRole("row", { name: /nd-site-a/ })
+    expect(within(row).queryByTestId("project-line")).toBeNull()
+    expect(within(row).queryByTestId("project-name")).toBeNull()
+    expect(within(row).queryByTestId("project-warning")).toBeNull()
+    expect(within(row).queryByText(/stale/)).toBeNull()
+  })
+
+  it("shows a configuration error as a Config: line beside a failed build badge", () => {
+    render(
+      <ContainerTable
+        containers={[
+          container({
+            name: "nd-broken",
+            build: { state: "failed", builds: 2, failures: 2, finishedAt: null },
+            project: { ...configuredProject, name: null, description: null, configError: 'unknown field "ignor"' },
+          }),
+        ]}
+        readOnly={false}
+        onChanged={() => {}}
+      />,
+    )
+
+    const row = screen.getByRole("row", { name: /nd-broken/ })
+    expect(within(row).getByText("failed", { selector: "[data-state]" })).toBeInTheDocument()
+    const error = within(row).getByTestId("config-error")
+    expect(error).toHaveTextContent('Config: unknown field "ignor"')
+    expect(error).toHaveClass("text-destructive")
+  })
+
+  it("does not show a configuration error on a container whose build is not failed", () => {
+    render(
+      <ContainerTable
+        containers={[container({ project: { ...configuredProject, configError: "stale reason" } })]}
+        readOnly={false}
+        onChanged={() => {}}
+      />,
+    )
+
+    expect(within(screen.getByRole("row", { name: /nd-site-a/ })).queryByTestId("config-error")).toBeNull()
+  })
+
+  it("shows the warnings as quiet lines, not in the fault colour", () => {
+    render(
+      <ContainerTable
+        containers={[
+          container({
+            project: { ...configuredProject, warnings: ["copy retried once: files changed while copying", "serve settings changed: restart the container to apply"] },
+          }),
+        ]}
+        readOnly={false}
+        onChanged={() => {}}
+      />,
+    )
+
+    const row = screen.getByRole("row", { name: /nd-site-a/ })
+    const warnings = within(row).getAllByTestId("project-warning")
+    expect(warnings).toHaveLength(2)
+    expect(warnings[0]).toHaveTextContent("copy retried once: files changed while copying")
+    expect(warnings[0]).toHaveClass("text-muted-foreground")
+    expect(warnings[0]).not.toHaveClass("text-destructive")
+  })
+
+  it("renders markup in the description as characters and runs nothing", () => {
+    const { container: root } = render(
+      <ContainerTable
+        containers={[
+          container({
+            project: { ...configuredProject, description: "<script>window.__pwned = true</script><b>bold</b>" },
+          }),
+        ]}
+        readOnly={false}
+        onChanged={() => {}}
+      />,
+    )
+
+    const row = screen.getByRole("row", { name: /nd-site-a/ })
+    expect(within(row).getByTestId("project-line")).toHaveTextContent("<script>window.__pwned = true</script><b>bold</b>")
+    expect(root.querySelector("script")).toBeNull()
+    expect(root.querySelector("b")).toBeNull()
+    expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined()
+  })
+
+  it("on a narrow screen hides the description but keeps the name, the error and the warnings", () => {
+    const restoreViewport = setViewport(false)
+    render(
+      <ContainerTable
+        containers={[
+          container({
+            name: "nd-broken",
+            build: { state: "failed", builds: 2, failures: 2, finishedAt: null },
+            project: { ...configuredProject, configError: "build.distDir must not contain \"..\" segments", warnings: ["copy retried once: files changed while copying"] },
+          }),
+        ]}
+        readOnly={false}
+        onChanged={() => {}}
+      />,
+    )
+
+    const row = screen.getByRole("row", { name: /nd-broken/ })
+    expect(within(row).getByTestId("project-line")).toHaveClass("hidden", "md:block")
+    expect(within(row).getByTestId("project-name")).toHaveTextContent("jjb")
+    expect(within(row).getByTestId("project-name")).toHaveClass("md:hidden")
+    expect(within(row).getByTestId("config-error")).not.toHaveClass("hidden")
+    expect(within(row).getByTestId("project-warning")).not.toHaveClass("hidden")
+    restoreViewport()
+  })
 })

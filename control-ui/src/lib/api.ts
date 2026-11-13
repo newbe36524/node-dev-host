@@ -39,6 +39,16 @@ export interface NodeOperation {
   since: string
 }
 
+// Read-only project metadata from the node's status.json (its .node-dev-host.yaml). Every value is text from
+// the container, already cut to the server's limits; all are null (warnings empty) when the node has none.
+export interface ProjectInfo {
+  name: string | null
+  description: string | null
+  configSource: string | null
+  configError: string | null
+  warnings: string[]
+}
+
 export interface ContainerInfo {
   name: string
   id: string
@@ -47,6 +57,7 @@ export interface ContainerInfo {
   state: ContainerState
   health: ContainerHealth | null
   build: ContainerBuild
+  project: ProjectInfo
   registered: boolean
   schedule: NodeSchedule
   operation: NodeOperation | null
