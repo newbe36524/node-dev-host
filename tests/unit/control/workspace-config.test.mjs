@@ -143,6 +143,43 @@ test('name is 1 to 80 characters and description at most 500, without control ch
   assert.equal(validateConfig(parseConfig(`version: 1\nname: "${'x'.repeat(80)}"`)).name.length, 80);
 });
 
+test('service declares a command and a loopback port, both required, and the port must be 1024 to 65535', () => {
+  const ok = validateConfig(parseConfig('version: 1\nservice:\n  command: pnpm --filter @jjb/api start\n  port: 3001'));
+  assert.deepEqual(ok.service, { command: 'pnpm --filter @jjb/api start', port: 3001 });
+  reject('version: 1\nservice:\n  command: node api.js', /service needs both command and port/);
+  reject('version: 1\nservice:\n  port: 3001', /service needs both command and port/);
+  reject('version: 1\nservice:\n  command: node api.js\n  port: 80', /service.port must be an integer from 1024 to 65535/);
+  reject('version: 1\nservice:\n  command: node api.js\n  port: 70000', /service.port must be an integer from 1024 to 65535/);
+  reject('version: 1\nservice:\n  command: node api.js\n  port: "3001"', /service.port must be an integer/);
+  reject('version: 1\nservice:\n  command: "  "\n  port: 3001', /service.command must not be empty/);
+  reject('version: 1\nservice:\n  command: node api.js\n  port: 3001\n  env: x', /unknown field "service.env"/);
+  reject('version: 1\nservice: node api.js', /service must be a mapping of fields/);
+  reject('version: 1\nservice:\n  command: node api.js\n  port: 3001\nserve:\n  apiUpstream: 10.0.0.1:3001',
+    /cannot both be set/);
+});
+
+test('the service upstream is its loopback port, and an environment API_UPSTREAM still wins', () => {
+  const config = validateConfig(parseConfig('version: 1\nservice:\n  command: node api.js\n  port: 3001'));
+  assert.equal(resolveSettings(config, {}).apiUpstream, '127.0.0.1:3001');
+  assert.equal(resolveSettings(config, {}).serviceCommand, 'node api.js');
+  assert.equal(resolveSettings(config, {}).servicePort, '3001');
+  assert.equal(resolveSettings(config, { API_UPSTREAM: '10.0.0.9:9000' }).apiUpstream, '10.0.0.9:9000');
+  const none = resolveSettings(null, {});
+  assert.equal(none.serviceCommand, '');
+  assert.equal(none.servicePort, '');
+});
+
+test('the env file carries the service command and port through bash unchanged', () => {
+  const dirs = tempDirs();
+  const cmd = "pnpm --filter @jjb/api start && echo 'it$(x)'";
+  const config = validateConfig(parseConfig(`version: 1\nservice:\n  command: "${cmd.replace(/"/g, '\\"')}"\n  port: 3001`));
+  const file = path.join(dirs.root, 'settings.env');
+  fs.writeFileSync(file, envFile(resolveSettings(config, {})));
+  assert.equal(bashSource(file, 'printf %s "$WS_SERVICE_CMD"'), cmd);
+  assert.equal(bashSource(file, 'printf %s "$WS_SERVICE_PORT"'), '3001');
+  assert.equal(bashSource(file, 'printf %s "$WS_API_UPSTREAM"'), '127.0.0.1:3001');
+});
+
 test('serve.apiUpstream must be host:port and nothing that Caddyfile syntax could read', () => {
   reject('version: 1\nserve:\n  apiUpstream: "172.25.0.1:3001 {"', /serve.apiUpstream must be host:port/);
   reject('version: 1\nserve:\n  apiUpstream: http://api:3001', /serve.apiUpstream must be host:port/);
@@ -186,12 +223,14 @@ test('environment wins over the file, the file wins over the default, and an emp
   const fromFile = resolveSettings(config, {});
   assert.deepEqual(fromFile, {
     install: 'pnpm i', build: 'pnpm build:site', distDir: 'apps/web/dist', spa: 'false', apiUpstream: '10.0.0.1:3001',
+    serviceCommand: '', servicePort: '',
   });
   const fromEnv = resolveSettings(config, {
     INSTALL_CMD: 'npm ci', BUILD_CMD: 'pnpm build:env', DIST_DIR: 'out', SPA: 'true', API_UPSTREAM: '10.0.0.2:3002',
   });
   assert.deepEqual(fromEnv, {
     install: 'npm ci', build: 'pnpm build:env', distDir: 'out', spa: 'true', apiUpstream: '10.0.0.2:3002',
+    serviceCommand: '', servicePort: '',
   });
   const emptyEnv = resolveSettings(config, { BUILD_CMD: '', DIST_DIR: '', API_UPSTREAM: '' });
   assert.equal(emptyEnv.build, 'pnpm build:site');
@@ -201,7 +240,7 @@ test('environment wins over the file, the file wins over the default, and an emp
 
 test('with no file and no environment, every setting falls back to the old default', () => {
   assert.deepEqual(resolveSettings(null, {}), {
-    install: '', build: 'pnpm build', distDir: 'dist', spa: 'true', apiUpstream: '',
+    install: '', build: 'pnpm build', distDir: 'dist', spa: 'true', apiUpstream: '', serviceCommand: '', servicePort: '',
   });
 });
 

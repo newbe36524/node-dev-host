@@ -122,6 +122,8 @@ url()     { echo "http://127.0.0.1:$(port "$1")$2"; }
 status()  { docker exec "$(cn "$1")" dev-host status 2>/dev/null; }
 state()   { status "$1" | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p'; }
 builds()  { status "$1" | sed -n 's/.*"builds":\([0-9]*\).*/\1/p'; }
+# service_field SHORT FIELD: one field of the status "service" object (empty when there is none).
+service_field() { status "$1" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const v=JSON.parse(s).service?.[process.argv[1]];console.log(v ?? "")})' "$2"; }
 
 # poll SECONDS COMMAND...: runs COMMAND once a second until it succeeds or the time is up.
 poll() {
@@ -223,6 +225,39 @@ test_api_proxy() {
   check "reaches state ok" poll 300 state_is api ok
   check "/api/hello reaches the upstream" poll 60 body_has api /api/hello '"from":"upstream"'
   check "other paths are still served from the build" body_has api / marker-v1
+}
+
+test_service() {
+  log "service: a process started from the workspace config serves /api/*, and a build or a crash restarts it"
+  fresh_project service
+  printf 'version: 1\nservice:\n  command: node server.mjs\n  port: 3311\n' > "$WORK/service/.node-dev-host.yaml"
+  cat > "$WORK/service/server.mjs" <<'SERVER'
+import http from 'node:http';
+http.createServer((q, s) => {
+  s.setHeader('content-type', 'application/json');
+  s.end(JSON.stringify({ from: 'service', mark: process.env.SERVICE_MARK, host: process.env.HOST, port: process.env.PORT, path: q.url }));
+}).listen(Number(process.env.PORT), process.env.HOST);
+SERVER
+  start service -v "$WORK/service:/workspace:ro" -e SERVICE_MARK=from-env
+  check "reaches state ok" poll 300 state_is service ok
+  check "/api/hello reaches the service" poll 60 body_has service /api/hello '"from":"service"'
+  check "the service gets PORT and HOST=127.0.0.1" body_has service /api/hello '"host":"127.0.0.1","port":"3311"'
+  check "the container environment reaches the service" body_has service /api/hello '"mark":"from-env"'
+  check "other paths are still served from the build" body_has service / marker-v1
+  check "status shows the running service" [ "$(service_field service state)" = running ]
+
+  local pid before
+  pid="$(service_field service pid)"
+  before="$(builds service)"
+  docker exec "$(cn service)" dev-host rebuild >/dev/null
+  check "the rebuild finishes" poll 120 builds_above service "$before"
+  check "a successful build starts the service again with a new pid" poll 60 [ "$(service_field service pid)" != "$pid" ]
+  check "the restarted service answers" poll 60 body_has service /api/again '"from":"service"'
+
+  pid="$(service_field service pid)"
+  docker exec "$(cn service)" bash -c "kill -9 $pid"
+  check "a service that exits is restarted and the restart is counted" poll 60 [ "$(service_field service restarts)" -ge 1 ]
+  check "the service answers after the restart" poll 60 body_has service /api/after-crash '"from":"service"'
 }
 
 test_custom_caddyfile() {
@@ -834,6 +869,7 @@ else
   test_host
   test_waiting
   test_api_proxy
+  test_service
   test_custom_caddyfile
   test_shared_cache
   test_workspace_config

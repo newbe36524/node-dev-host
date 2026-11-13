@@ -31,9 +31,10 @@ export const BUILT_IN_EXCLUDES = Object.freeze([
 ]);
 // The only files whose changes can require a reinstall; the dependency hash looks at these.
 const DEPENDENCY_FILES = ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', '.pnpmfile.cjs'];
-const TOP_FIELDS = ['version', 'name', 'description', 'ignore', 'external', 'build', 'serve'];
+const TOP_FIELDS = ['version', 'name', 'description', 'ignore', 'external', 'build', 'serve', 'service'];
 const BUILD_FIELDS = ['install', 'command', 'distDir', 'spa'];
 const SERVE_FIELDS = ['apiUpstream'];
+const SERVICE_FIELDS = ['command', 'port'];
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/;
 const KEY_LINE = /^([A-Za-z_][A-Za-z0-9_-]*)[ ]*:(?:[ ]+(.*))?$/;
 // YAML constructs the subset does not support. A plain value that starts with one is refused.
@@ -366,6 +367,26 @@ function checkServe(value) {
   return out;
 }
 
+// A long-running process started after each successful build (for example an API), on a loopback port.
+// The serving layer proxies API_PATH to it, so the node serves the frontend and the backend together.
+function checkService(value) {
+  rejectUnknown(value, SERVICE_FIELDS, 'service.');
+  const out = { command: null, port: null };
+  if (value.command !== undefined) {
+    checkCommand('service.command', value.command);
+    if ([...value.command.trim()].length > 500) fail('service.command must be at most 500 characters');
+    out.command = value.command;
+  }
+  if (value.port !== undefined) {
+    if (!Number.isInteger(value.port) || value.port < 1024 || value.port > 65535) {
+      fail('service.port must be an integer from 1024 to 65535');
+    }
+    out.port = value.port;
+  }
+  if ((out.command === null) !== (out.port === null)) fail('service needs both command and port');
+  return out;
+}
+
 // Returns the normalized configuration, or throws a ConfigError that names the field at fault.
 export function validateConfig(obj) {
   if (!isMapping(obj)) fail('the file must hold a mapping of fields');
@@ -375,6 +396,7 @@ export function validateConfig(obj) {
     version: 1, name: null, description: null, ignore: [], external: [],
     build: { install: null, command: null, distDir: null, spa: null },
     serve: { apiUpstream: null },
+    service: { command: null, port: null },
   };
   if (obj.name !== undefined) out.name = checkText('name', obj.name, 1, 80);
   if (obj.description !== undefined) out.description = checkText('description', obj.description, 0, 500);
@@ -388,6 +410,14 @@ export function validateConfig(obj) {
     if (!isMapping(obj.serve)) fail('serve must be a mapping of fields');
     out.serve = checkServe(obj.serve);
   }
+  if (obj.service !== undefined) {
+    if (!isMapping(obj.service)) fail('service must be a mapping of fields');
+    out.service = checkService(obj.service);
+  }
+  // Both would proxy the same path: the service's port is the only upstream then.
+  if (out.service.port !== null && out.serve.apiUpstream !== null) {
+    fail('service and serve.apiUpstream cannot both be set: the service is proxied on its own port');
+  }
   return out;
 }
 
@@ -400,12 +430,17 @@ const nonEmpty = (value) => typeof value === 'string' && value !== '';
 export function resolveSettings(config, env = {}) {
   const file = config?.build ?? {};
   const serve = config?.serve ?? {};
+  const service = config?.service ?? {};
+  // A service listens on loopback inside the container, so its upstream is fixed by its port.
+  const serviceUpstream = service.port !== null && service.port !== undefined ? `127.0.0.1:${service.port}` : '';
   return {
     install: nonEmpty(env.INSTALL_CMD) ? env.INSTALL_CMD : (file.install || ''),
     build: nonEmpty(env.BUILD_CMD) ? env.BUILD_CMD : (file.command || 'pnpm build'),
     distDir: nonEmpty(env.DIST_DIR) ? env.DIST_DIR : (file.distDir || 'dist'),
     spa: nonEmpty(env.SPA) ? env.SPA : (typeof file.spa === 'boolean' ? String(file.spa) : 'true'),
-    apiUpstream: nonEmpty(env.API_UPSTREAM) ? env.API_UPSTREAM : (serve.apiUpstream || ''),
+    apiUpstream: nonEmpty(env.API_UPSTREAM) ? env.API_UPSTREAM : (serviceUpstream || serve.apiUpstream || ''),
+    serviceCommand: service.command || '',
+    servicePort: service.port ? String(service.port) : '',
   };
 }
 
@@ -472,6 +507,8 @@ export function envFile(settings) {
     `WS_DIST_DIR=${shellQuote(settings.distDir)}`,
     `WS_SPA=${shellQuote(settings.spa)}`,
     `WS_API_UPSTREAM=${shellQuote(settings.apiUpstream)}`,
+    `WS_SERVICE_CMD=${shellQuote(settings.serviceCommand ?? '')}`,
+    `WS_SERVICE_PORT=${shellQuote(settings.servicePort ?? '')}`,
   ].join('\n') + '\n';
 }
 

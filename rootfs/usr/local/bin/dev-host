@@ -62,6 +62,13 @@ COPY_ARGS=(); PROTECT_ARGS=(); HASH_ARGS=(); DEPS_ARGS=()
 RESOLVED_SPA=""; RESOLVED_API_UPSTREAM=""
 # Set when the operator supplies CADDYFILE: then the serving settings from the file and environment are ignored.
 CUSTOM_CADDYFILE=""
+# The service (see service_start): a process next to Caddy, started after each successful build. The workspace
+# file sets SERVICE_CMD and SERVICE_PORT (load_config). SERVICE_PID and the rest live in the build loop's process.
+SERVICE_CMD=""; SERVICE_PORT=""
+SERVICE_PID=""; SERVICE_STATE=""; SERVICE_RESTARTS=0; SERVICE_LAST_EXIT=null
+SERVICE_STARTED_AT=0; SERVICE_NEXT_TRY=0; SERVICE_BACKOFF=5
+# The state last written to status.json, so a service event can rewrite the file without changing the build state.
+STATE_NOW="starting"
 
 log() { printf '[dev-host %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
@@ -74,8 +81,9 @@ warnings_json() {
 
 write_status() { # state, extra json fields (optional)
   local tmp="$STATUS_FILE.tmp"
-  printf '{"state":"%s","builds":%d,"failures":%d,"lastExitCode":%s,"finishedAt":"%s"%s%s,"warnings":%s}\n' \
-    "$1" "$BUILDS" "$FAILURES" "${LAST_EXIT:-null}" "$(date -u +%FT%TZ)" "${2:-}" "$META_JSON" "$(warnings_json)" > "$tmp" \
+  STATE_NOW="$1"
+  printf '{"state":"%s","builds":%d,"failures":%d,"lastExitCode":%s,"finishedAt":"%s"%s%s,"service":%s,"warnings":%s}\n' \
+    "$1" "$BUILDS" "$FAILURES" "${LAST_EXIT:-null}" "$(date -u +%FT%TZ)" "${2:-}" "$META_JSON" "$(service_json)" "$(warnings_json)" > "$tmp" \
     && mv "$tmp" "$STATUS_FILE"
 }
 
@@ -149,6 +157,11 @@ load_config() {
   . "$STATE_DIR/workspace-config.env" || return 1
   INSTALL_CMD="$WS_INSTALL_CMD"; BUILD_CMD="$WS_BUILD_CMD"; DIST_DIR="$WS_DIST_DIR"
   RESOLVED_SPA="$WS_SPA"; RESOLVED_API_UPSTREAM="$WS_API_UPSTREAM"
+  # A rejected file (exit 2) keeps the running service as it was, like the ignore and external lists.
+  if [ "$rc" -eq 0 ]; then
+    SERVICE_CMD="$WS_SERVICE_CMD"; SERVICE_PORT="$WS_SERVICE_PORT"
+    if [ -z "$SERVICE_CMD" ]; then SERVICE_STATE=""; elif [ -z "$SERVICE_STATE" ]; then SERVICE_STATE=waiting; fi
+  fi
   META_JSON="$(cat "$STATE_DIR/workspace-config.status.json")"
   # The rules come from the same module as the status fields, so the copy, the hashes and the status never disagree.
   rules="$(node "$WS_CLI" rules "$DIST_DIR" "$STATE_DIR/workspace-config.ignore" "$STATE_DIR/workspace-config.external")" || return 1
@@ -200,6 +213,69 @@ attach_external() {
   return 0
 }
 
+# ---- service: a long-running process next to Caddy (for example an API) ----
+# It runs from the build copy, after the first successful build, with PORT and HOST=127.0.0.1 set. Caddy proxies
+# API_PATH to it (serve.apiUpstream is 127.0.0.1:<port>). A successful build restarts it, so it runs the new code.
+# If it exits, it is restarted with a pause that doubles up to 60 seconds.
+
+service_json() {
+  if [ -z "$SERVICE_CMD" ]; then printf 'null'; return; fi
+  printf '{"state":"%s","port":%s,"pid":%s,"restarts":%d,"lastExit":%s}' \
+    "$SERVICE_STATE" "$SERVICE_PORT" "${SERVICE_PID:-null}" "$SERVICE_RESTARTS" "${SERVICE_LAST_EXIT:-null}"
+}
+
+# True while the process runs. A zombie (exited, not yet reaped) counts as not running.
+service_alive() {
+  local stat
+  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  stat="${stat##*) }"
+  [ "${stat%% *}" != Z ]
+}
+
+# Stops the service group: TERM, five seconds to exit, then KILL.
+service_stop() {
+  local i
+  [ -n "$SERVICE_PID" ] || return 0
+  kill -TERM -- "-$SERVICE_PID" 2>/dev/null || kill -TERM "$SERVICE_PID" 2>/dev/null
+  for i in 1 2 3 4 5; do service_alive "$SERVICE_PID" || break; sleep 1; done
+  if service_alive "$SERVICE_PID"; then kill -KILL -- "-$SERVICE_PID" 2>/dev/null || kill -KILL "$SERVICE_PID" 2>/dev/null; fi
+  wait "$SERVICE_PID" 2>/dev/null
+  SERVICE_PID=""
+}
+
+service_start() {
+  [ -n "$SERVICE_CMD" ] || return 0
+  service_stop
+  # setsid gives the service a process group of its own, so service_stop reaches the processes it starts.
+  ( cd "$BUILD_DIR" && exec env PORT="$SERVICE_PORT" HOST=127.0.0.1 setsid bash -c "$SERVICE_CMD" ) &
+  SERVICE_PID=$!
+  SERVICE_STARTED_AT=$(date +%s)
+  SERVICE_STATE=running
+  log "service started on 127.0.0.1:$SERVICE_PORT: $SERVICE_CMD"
+}
+
+# Called on every poll of the build loop: notices an exit and restarts the service once its pause has passed.
+service_check() {
+  local now
+  [ -n "$SERVICE_CMD" ] || return 0
+  now=$(date +%s)
+  if [ -n "$SERVICE_PID" ] && ! service_alive "$SERVICE_PID"; then
+    wait "$SERVICE_PID" 2>/dev/null; SERVICE_LAST_EXIT=$?
+    SERVICE_PID=""; SERVICE_STATE=exited
+    SERVICE_NEXT_TRY=$(( now + SERVICE_BACKOFF ))
+    log "service exited (code $SERVICE_LAST_EXIT), restarting in ${SERVICE_BACKOFF}s"
+    write_status "$STATE_NOW"
+  elif [ -n "$SERVICE_PID" ] && [ $(( now - SERVICE_STARTED_AT )) -ge 60 ]; then
+    SERVICE_BACKOFF=5
+  fi
+  if [ "$SERVICE_STATE" = exited ] && [ -z "$SERVICE_PID" ] && [ "$now" -ge "$SERVICE_NEXT_TRY" ]; then
+    SERVICE_RESTARTS=$((SERVICE_RESTARTS + 1))
+    service_start
+    SERVICE_BACKOFF=$(( SERVICE_BACKOFF * 2 > 60 ? 60 : SERVICE_BACKOFF * 2 ))
+    write_status "$STATE_NOW"
+  fi
+}
+
 run_build() {
   local reason="$1" start rc=0 secs lrc=0
   WARNINGS=(); ATTACH_WARNINGS=()
@@ -210,6 +286,8 @@ run_build() {
     log "build FAILED (configuration exit $lrc), serving the previous dist"
     write_status failed; return 1
   fi
+  # The file no longer declares a service: stop the one that runs.
+  [ -n "$SERVICE_CMD" ] || service_stop
   # A change of the exclusion rules moves the change signature. Re-baseline it before the copy, so the edit that
   # changed the rules starts one build and not a second one.
   if [ "$RULES_KEY" != "$RULES_IN_SIG" ]; then
@@ -255,7 +333,9 @@ run_build() {
     # Only a successful build changes the headers: the served dist is then the one they describe.
     printf '%s' "$(date -u +%FT%TZ)" > "$BUILD_TIME_FILE.tmp" && mv "$BUILD_TIME_FILE.tmp" "$BUILD_TIME_FILE"
     printf '%s' "$secs" > "$BUILD_DURATION_FILE.tmp" && mv "$BUILD_DURATION_FILE.tmp" "$BUILD_DURATION_FILE"
-    log "build ok in ${secs}s"; write_status ok
+    log "build ok in ${secs}s"
+    service_start
+    write_status ok
   else
     FAILURES=$((FAILURES + 1)); log "build FAILED (exit $rc), serving the previous dist"; write_status failed
   fi
@@ -264,12 +344,15 @@ run_build() {
 build_loop() {
   local sig now changed_at=0 pending=0 pending_since=0 last_build
   BUILDS=0; FAILURES=0; LAST_EXIT=null; DEPS_SIG=""
+  # The service is a child of this process, so it is stopped here when the container stops.
+  trap 'service_stop; exit 0' TERM INT
   # Baseline before the first build: an edit saved during a build then shows up at the next poll.
   PREV_SIG="$(source_sig)"; RULES_IN_SIG="$RULES_KEY"
   run_build initial
   last_build=$(date +%s)
   while sleep "$POLL_INTERVAL"; do
     now=$(date +%s)
+    service_check
     if [ -f "$TRIGGER_FILE" ]; then
       rm -f "$TRIGGER_FILE"; run_build manual
       last_build=$(date +%s); pending=0; continue
