@@ -28,7 +28,7 @@ A git tag `v1.2.3` also publishes `1.2.3`, `1.2.3-demo`, `1.2.3-alpine` and `1.2
 - Can run a long-running service beside the output, for example an API, started after every successful build and restarted when it exits. See [Workspace configuration](#workspace-configuration), the Service paragraph.
 - Reports build state as JSON at `/__dev-host/status.json` and `dev-host status`, and lets you trigger a rebuild with `dev-host rebuild`.
 - Adds `X-Build-Time` (UTC, when the served build finished) and `X-Build-Duration` (seconds) response headers, so a client can tell how fresh `dist` is.
-- Prunes unused pnpm packages after each dependency install, so the store does not grow without bound.
+- Prunes unused pnpm packages after each dependency install, so the store does not grow without bound. The prune waits for installs of other containers that share the store volume (see Share the package cache).
 - Configured with environment variables, and optionally by a `.node-dev-host.yaml` at the project root: a name and description for the dashboard, directories that never reach the build copy, and build and serve settings. See [Workspace configuration](#workspace-configuration).
 - Optional control node: `dev-host control` runs a dashboard and JSON API for the node-dev-host containers on the Docker host. It lists them with their build state and starts, stops, restarts, rebuilds, removes and shows the logs of them. See [Control node](#control-node).
 
@@ -56,7 +56,7 @@ The `-v` line above keeps the pnpm store in a named volume, so a new container r
 
 - **Host directory instead of a volume:** add `--user "$(id -u):$(id -g)" -e HOME=/tmp` and mount `"$HOME/.cache/node-dev-host/pnpm"` at `/var/lib/dev-host/pnpm`. A named volume is root-owned and does not work with `--user`.
 - **npm projects:** mount a volume at `/var/lib/dev-host/npm-cache` and set `-e npm_config_cache=/var/lib/dev-host/npm-cache`.
-- **Several containers at once** can share one volume. Removing containers does not remove the volume; `docker volume rm node-dev-host-pnpm` resets it.
+- **Several containers at once** can share one volume. Installs and the store prune of those containers are serialised by a lock file next to the store (`store.lock`): installs share it, the prune takes it alone, so a prune never deletes a package another container is installing. Removing containers does not remove the volume; `docker volume rm node-dev-host-pnpm` resets it.
 
 The skill has the details and the trade-offs: [`skills/node-dev-host/SKILL.md`](skills/node-dev-host/SKILL.md#share-the-package-cache).
 

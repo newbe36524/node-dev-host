@@ -48,6 +48,8 @@ BUILD_TIME_FILE="$STATE_DIR/build-time"
 BUILD_DURATION_FILE="$STATE_DIR/build-duration"
 # The configuration loader and the state files it writes into STATE_DIR (never into the workspace).
 WS_CLI="$(dirname "${BASH_SOURCE[0]}")/../lib/dev-host/workspace-config.mjs"
+# with_store_lock: the pnpm store lock shared by the containers that mount one store volume (see store-lock.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/dev-host/store-lock.sh"
 
 # status.json fields that describe the workspace configuration, as a JSON fragment (values JSON-encoded).
 NULL_META=',"name":null,"description":null,"configSource":null,"configHash":null,"configError":null,"ignore":[],"external":[]'
@@ -312,11 +314,19 @@ run_build() {
       if [ -f pnpm-lock.yaml ]; then icmd="pnpm install --frozen-lockfile"; else icmd="pnpm install"; fi
     fi
     log "install: $icmd"
-    bash -c "$icmd" || rc=$?
+    # Installs share the store lock with other containers; a prune needs it exclusively (see store-lock.sh).
+    with_store_lock shared bash -c "$icmd" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      # A transient failure (a registry timeout, a file that another container just wrote) often passes on a
+      # second try. One retry, then the build fails as before.
+      log "install failed (exit $rc), retrying once in 5 seconds"
+      sleep 5
+      rc=0; with_store_lock shared bash -c "$icmd" || rc=$?
+    fi
     DEPS_SIG="$(deps_sig)"
     # Each dependency change adds packages to the pnpm store; drop the ones no project uses any more.
     if [ "$rc" -eq 0 ] && command -v pnpm >/dev/null 2>&1; then
-      pnpm store prune >/dev/null 2>&1 || log "pnpm store prune failed (ignored)"
+      with_store_lock exclusive pnpm store prune >/dev/null 2>&1 || log "pnpm store prune failed (ignored)"
     fi
   fi
   if [ "$rc" -eq 0 ]; then
