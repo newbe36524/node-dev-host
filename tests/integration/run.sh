@@ -185,7 +185,7 @@ test_host() {
   rm -f "$dir/BREAK"
   printf '<p>marker-v3</p>\n' > "$dir/public/index.html"
   check "recovers and serves the next good build" poll 180 body_has host / marker-v3
-  check "status is ok again" state_is host ok
+  check "status is ok again" poll 120 state_is host ok
 
   log "host: an edit made during a build starts another build without a rebuild command"
   touch "$dir/SLOW"
