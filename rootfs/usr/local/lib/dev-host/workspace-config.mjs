@@ -31,7 +31,7 @@ export const BUILT_IN_EXCLUDES = Object.freeze([
 ]);
 // The only files whose changes can require a reinstall; the dependency hash looks at these.
 const DEPENDENCY_FILES = ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', '.pnpmfile.cjs'];
-const TOP_FIELDS = ['version', 'name', 'description', 'image', 'ignore', 'external', 'build', 'serve', 'service'];
+const TOP_FIELDS = ['version', 'name', 'description', 'image', 'writable', 'ignore', 'external', 'build', 'serve', 'service'];
 const BUILD_FIELDS = ['install', 'command', 'distDir', 'spa'];
 const SERVE_FIELDS = ['apiUpstream'];
 const SERVICE_FIELDS = ['command', 'port'];
@@ -258,6 +258,34 @@ function checkImage(value) {
   return value;
 }
 
+export const MAX_WRITABLE = 8;
+
+// One path under the workspace that a node may write to read-write (see control/nodes.mjs). Relative, with
+// forward slashes, no `..` segment and not the workspace root itself. Returns the normalized path.
+export function validateWritablePath(entry) {
+  if (typeof entry !== 'string' || entry.trim() === '') fail('writable entries must be non-empty strings');
+  if (CONTROL_CHARS.test(entry)) fail('writable entries must not contain control characters');
+  const text = entry.trim();
+  if (text.startsWith('/') || text.startsWith('\\') || /^[A-Za-z]:/.test(text)) fail(`writable path must be relative to the workspace: ${text}`);
+  const segments = text.replace(/\\/g, '/').split('/').filter((part) => part !== '' && part !== '.');
+  if (segments.includes('..')) fail(`writable path must not contain ..: ${text}`);
+  if (segments.length === 0) fail('writable path must not be the workspace root');
+  return segments.join('/');
+}
+
+// Paths a node may write to read-write. The build and serving never use them; the control node binds them.
+function checkWritable(value) {
+  if (!Array.isArray(value)) fail('writable must be a list of relative paths');
+  if (value.length > MAX_WRITABLE) fail(`writable may list at most ${MAX_WRITABLE} paths`);
+  const seen = new Set();
+  for (const entry of value) {
+    const normalized = validateWritablePath(entry);
+    if (seen.has(normalized)) fail(`writable lists ${normalized} more than once`);
+    seen.add(normalized);
+  }
+  return value;
+}
+
 function checkDistDir(value) {
   const field = 'build.distDir';
   if (typeof value !== 'string') fail(`${field} must be a string`);
@@ -408,6 +436,7 @@ export function validateConfig(obj) {
   if (obj.name !== undefined) out.name = checkText('name', obj.name, 1, 80);
   if (obj.description !== undefined) out.description = checkText('description', obj.description, 0, 500);
   if (obj.image !== undefined) checkImage(obj.image); // validated, then left out of the resolved settings
+  if (obj.writable !== undefined) checkWritable(obj.writable); // validated, then left out of the resolved settings
   if (obj.ignore !== undefined) out.ignore = checkIgnore(obj.ignore);
   if (obj.external !== undefined) out.external = checkExternal(obj.external);
   if (obj.build !== undefined) {

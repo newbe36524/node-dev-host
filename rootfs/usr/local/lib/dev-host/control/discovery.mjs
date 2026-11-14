@@ -15,9 +15,16 @@ function workspaceMount(info) {
   return (info.Mounts || []).find((mount) => mount.Destination === '/workspace');
 }
 
+// A read-write bind under /workspace whose source is inside the workspace: the writable paths of a node record.
+function isWritableWorkspaceBind(mount, workspace) {
+  return Boolean(workspace && mount.RW && mount.Destination.startsWith('/workspace/')
+    && mount.Source.startsWith(`${workspace.Source}/`));
+}
+
 function unsupportedReason(info, httpPort) {
   const allowedMounts = new Set(['/workspace', PNPM_VOLUME]);
-  const extra = (info.Mounts || []).find((mount) => !allowedMounts.has(mount.Destination));
+  const workspace = workspaceMount(info);
+  const extra = (info.Mounts || []).find((mount) => !allowedMounts.has(mount.Destination) && !isWritableWorkspaceBind(mount, workspace));
   if (extra) return `unsupported mount: ${extra.Destination}`;
   const port = info.HostConfig?.PortBindings?.[`${httpPort}/tcp`]
     || info.NetworkSettings?.Ports?.[`${httpPort}/tcp`]

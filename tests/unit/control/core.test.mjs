@@ -396,3 +396,56 @@ test('console settings persist beside the nodes and survive node updates', async
   assert.deepEqual(await store.getSettings(), { npmRegistry: 'http://mirror.test/' });
   assert.equal((await store.getNodes()).length, 1);
 });
+
+test('writable paths become read-write binds under the read-only workspace, and only inside it', () => {
+  const options = { allowedImages: ['jjb-ndh'], workspaceRoots: ['/home/me/repos'] };
+  const record = validateNode({
+    name: 'nd-jjb', workspace: '/home/me/repos/jjb', port: 43103, image: 'jjb-ndh:local', writable: ['data', '.browser-profile/'],
+  }, options);
+  assert.deepEqual(record.writable, ['data', '.browser-profile']);
+  assert.deepEqual(createBody(record).HostConfig.Binds, [
+    '/home/me/repos/jjb:/workspace:ro',
+    'node-dev-host-pnpm:/var/lib/dev-host/pnpm',
+    '/home/me/repos/jjb/data:/workspace/data:rw',
+    '/home/me/repos/jjb/.browser-profile:/workspace/.browser-profile:rw',
+  ]);
+  assert.deepEqual(createBody(validateNode({ name: 'nd-plain', workspace: '/home/me/repos/jjb', port: 43104, image: 'jjb-ndh:local' }, options)).HostConfig.Binds, [
+    '/home/me/repos/jjb:/workspace:ro', 'node-dev-host-pnpm:/var/lib/dev-host/pnpm',
+  ]);
+  const base = { name: 'nd-jjb', workspace: '/home/me/repos/jjb', port: 43103, image: 'jjb-ndh:local' };
+  assert.throws(() => validateNode({ ...base, writable: ['/etc'] }, options), /relative to the workspace/);
+  assert.throws(() => validateNode({ ...base, writable: ['../x'] }, options), /must not contain \.\./);
+  assert.throws(() => validateNode({ ...base, writable: ['data', 'data'] }, options), /more than once/);
+  assert.throws(() => validateNode({ ...base, workspace: null, writable: ['data'] }, { ...options, allowWorkspaceNull: false }), /absolute path|needs a workspace/);
+});
+
+test('discovery imports a node with a read-write writable bind, and still skips a read-write bind outside the workspace', async () => {
+  const dir = await tempDir();
+  const store = createStore({ dir });
+  const info = (name, extra) => ({
+    Name: `/${name}`,
+    Config: { Image: 'jjb-ndh:local', Labels: { 'node-dev-host.port': '43103' }, Env: ['NODE_VERSION=24'] },
+    State: { Running: false },
+    HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: false },
+    Mounts: [
+      { Type: 'bind', Source: '/home/me/repos/jjb', Destination: '/workspace', RW: false },
+      { Type: 'bind', Source: '/home/me/repos/jjb/data', Destination: '/workspace/data', RW: true },
+      ...extra,
+    ],
+    NetworkSettings: { Networks: { bridge: { IPAddress: '' } } },
+  });
+  const containers = [info('nd-jjb', []), info('nd-rw-outside', [{ Type: 'bind', Source: '/home/me/other', Destination: '/workspace/x', RW: true }])];
+  const docker = {
+    dockerRaw: async (method, apiPath) => {
+      if (apiPath.startsWith('/containers/json')) return { status: 200, body: Buffer.from(JSON.stringify(containers.map((c) => ({ Names: [c.Name] })))) };
+      const name = decodeURIComponent(apiPath.split('/')[2]);
+      return { status: 200, body: Buffer.from(JSON.stringify(containers.find((c) => c.Name === `/${name}`))) };
+    },
+    imageInfo: async () => ({ Config: { Env: ['NODE_VERSION=24'] } }),
+  };
+  const discovery = createDiscovery({ docker, store, allowedImages: ['jjb-ndh'], log: () => {} });
+  assert.deepEqual(await discovery.scan(), {
+    imported: ['nd-jjb'],
+    skipped: [{ name: 'nd-rw-outside', reason: 'unsupported mount: /workspace/x' }],
+  });
+});

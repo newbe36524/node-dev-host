@@ -754,3 +754,22 @@ test('an unexpected filesystem error makes attach exit 1 after reporting the war
     fs.chmodSync(build, 0o700);
   }
 });
+
+test('writable is accepted and ignored: the build and serving settings are the same as without it', () => {
+  const body = 'build:\n  command: pnpm build\nserve:\n  apiUpstream: 172.25.0.1:3001';
+  const withWritable = validateConfig(parseConfig(`version: 1\nwritable: [data, .browser-profile]\n${body}`));
+  const without = validateConfig(parseConfig(`version: 1\n${body}`));
+  assert.equal('writable' in withWritable, false);
+  assert.deepEqual(withWritable, without);
+  assert.deepEqual(validateConfig(parseConfig(`version: 1\nwritable:\n  - data/\n${body}`)), without);
+});
+
+test('writable must be a list of relative paths under the workspace, and the reason names the problem', () => {
+  reject('version: 1\nwritable: data', /writable must be a list of relative paths/);
+  reject('version: 1\nwritable: [/etc]', /writable path must be relative to the workspace: \/etc/);
+  reject('version: 1\nwritable: ["../other"]', /writable path must not contain \.\./);
+  reject('version: 1\nwritable: ["."]', /writable path must not be the workspace root/);
+  reject('version: 1\nwritable: ["", data]', /writable entries must be non-empty strings/);
+  reject('version: 1\nwritable: [data, data/]', /writable lists data more than once/);
+  reject('version: 1\nwritable: [a, b, c, d, e, f, g, h, i]', /writable may list at most 8 paths/);
+});

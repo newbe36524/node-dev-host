@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { HttpError } from './docker.mjs';
+import { MAX_WRITABLE, validateWritablePath } from '../workspace-config.mjs';
 
 export const PORT_LABEL = 'node-dev-host.port';
 export const NAME_LABEL = 'node-dev-host.name';
@@ -9,7 +10,7 @@ export const MIN_PORT = 43100;
 export const MAX_PORT = 43299;
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const ENV_RE = /^[A-Z0-9_]+$/;
-const USER_KEYS = new Set(['name', 'workspace', 'port', 'image', 'env', 'networks']);
+const USER_KEYS = new Set(['name', 'workspace', 'port', 'image', 'env', 'networks', 'writable']);
 const NETWORK_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const RESERVED_NETWORKS = new Set(['bridge', 'host', 'none']);
 const MAX_NETWORKS = 4;
@@ -83,6 +84,20 @@ export function validateNode(input, {
       invalid(`workspace must be under CONTROL_WORKSPACE_ROOTS: ${workspaceRoots.join(', ')}`);
     }
   }
+  // Paths under the workspace bound read-write on top of the read-only /workspace (see createBody).
+  const writable = input.writable ?? [];
+  if (!Array.isArray(writable)) invalid('writable must be a list of relative paths');
+  if (writable.length > MAX_WRITABLE) invalid(`writable may list at most ${MAX_WRITABLE} paths`);
+  if (writable.length && !workspace) invalid('writable needs a workspace');
+  const writablePaths = [];
+  for (const entry of writable) {
+    try {
+      writablePaths.push(validateWritablePath(entry));
+    } catch (error) {
+      invalid(error.message);
+    }
+  }
+  if (new Set(writablePaths).size !== writablePaths.length) invalid('writable lists a path more than once');
   const networks = input.networks ?? [];
   if (!Array.isArray(networks)) invalid('networks must be an array of network names');
   if (networks.length > MAX_NETWORKS) invalid(`networks may list at most ${MAX_NETWORKS} names`);
@@ -104,6 +119,7 @@ export function validateNode(input, {
     env: { ...env },
     restartPolicy: input.restartPolicy || 'no',
     networks: [...new Set(networks)],
+    writable: writablePaths,
     source: input.source || 'added',
     createdAt: input.createdAt || new Date().toISOString(),
     autoStartUntil: input.autoStartUntil ?? null,
@@ -115,6 +131,8 @@ export function createBody(record, { httpPort = DEFAULT_HTTP_PORT, npmRegistry =
   const portKey = `${httpPort}/tcp`;
   const binds = ['node-dev-host-pnpm:/var/lib/dev-host/pnpm'];
   if (record.workspace) binds.unshift(`${record.workspace}:/workspace:ro`);
+  // A writable path is bound on top of the read-only /workspace, so only that subtree can be written.
+  for (const relative of record.writable || []) binds.push(`${record.workspace}/${relative}:/workspace/${relative}:rw`);
   const env = { ...(npmRegistry ? { [NPM_REGISTRY_ENV]: npmRegistry } : {}), ...(record.env || {}) };
   const body = {
     Image: record.image,
