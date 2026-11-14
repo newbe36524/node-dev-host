@@ -94,6 +94,7 @@ serve:
 | `service.command` | Not empty, at most 500 characters. The command that starts the service, run in the build copy. Required with `service.port`. |
 | `service.port` | An integer from 1024 to 65535. The loopback port the service listens on; see the Service paragraph below. Required with `service.command`. |
 | `image` | A non-empty string without whitespace or control characters, for example `jjb-ndh:local`. It names the image the node runs. The nd-console registration helper reads it, and the build ignores it. An image older than this field rejects it and fails the build, so add the field only after the node runs an image that has it. See [Derived images](#derived-images). |
+| `writable` | A list of up to 8 relative paths under the workspace, for example `[data, .browser-profile]`. Each is bound read-write over the read-only `/workspace`, so only those subtrees can be written. The nd-console registration helper reads it and sends it on the node record, and it must exist as a directory on the host. The build ignores it. An image older than this field rejects it, as for `image`. |
 
 The file is at most 64 KiB. A field not listed above is refused at any level, and so is any field that would choose a network: networks stay in the control node's node record. The top level must be a mapping of fields, and a file with more than one document is refused.
 
