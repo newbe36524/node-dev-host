@@ -1,2 +1,5 @@
 node_modules/
 dist/
+
+# Local deja session-rule export (auto-extracted from agent sessions; not committed)
+.deja/
