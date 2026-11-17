@@ -59,6 +59,8 @@ export interface ContainerInfo {
   build: ContainerBuild
   project: ProjectInfo
   registered: boolean
+  /** True when the container runs in Docker privileged mode, or the saved node is allowed to (see the control README). */
+  privileged: boolean
   schedule: NodeSchedule
   operation: NodeOperation | null
   error: string | null

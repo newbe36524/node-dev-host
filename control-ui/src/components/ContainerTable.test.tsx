@@ -1,7 +1,7 @@
 import { render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { ContainerTable, openUrl } from "@/components/ContainerTable"
-import { container, setViewport } from "@/test/fakeApi"
+import { container, privilegedContainer, setViewport } from "@/test/fakeApi"
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -291,5 +291,62 @@ describe("ContainerTable", () => {
     expect(within(row).getByTestId("config-error")).not.toHaveClass("hidden")
     expect(within(row).getByTestId("project-warning")).not.toHaveClass("hidden")
     restoreViewport()
+  })
+})
+
+describe("ContainerTable privileged marker", () => {
+  it("marks a privileged row with the word Privileged and its host-level access name at wide width", () => {
+    const restoreViewport = setViewport(true)
+    render(<ContainerTable containers={[privilegedContainer(), container({ name: "nd-site-a" })]} readOnly={false} onChanged={() => {}} />)
+    try {
+      const row = screen.getByRole("row", { name: /nd-my-ansible/ })
+      const marker = within(row).getByRole("group", { name: "Privileged: this node has host-level access" })
+      expect(marker).toHaveAttribute("data-privileged", "true")
+      expect(within(marker).getByText("Privileged")).toBeInTheDocument()
+      // The marker sits in the Name cell, next to the name.
+      expect(within(row).getAllByRole("cell")[0]).toContainElement(marker)
+      expect(screen.getAllByText("Privileged")).toHaveLength(1)
+    } finally {
+      restoreViewport()
+    }
+  })
+
+  it("keeps the marker on the card below md, on the name line", () => {
+    const restoreViewport = setViewport(false)
+    render(<ContainerTable containers={[privilegedContainer()]} readOnly={false} onChanged={() => {}} />)
+    try {
+      const card = screen.getByRole("row", { name: /nd-my-ansible/ })
+      const marker = within(card).getByRole("group", { name: /host-level access/ })
+      expect(within(card).getAllByRole("cell")[0]).toContainElement(marker)
+    } finally {
+      restoreViewport()
+    }
+  })
+
+  it("shows no marker on an ordinary row, and the marker is text, not colour alone", () => {
+    render(<ContainerTable containers={[container({ name: "nd-site-a" })]} readOnly={false} onChanged={() => {}} />)
+
+    expect(screen.queryByText("Privileged")).toBeNull()
+    expect(document.querySelector("[data-privileged]")).toBeNull()
+  })
+
+  it("uses no status hue for the marker: no green, blue or red class", () => {
+    render(<ContainerTable containers={[privilegedContainer()]} readOnly={false} onChanged={() => {}} />)
+
+    const marker = document.querySelector('[data-privileged="true"]') as HTMLElement
+    // Only classes that apply to the marker itself: variant-prefixed ones (aria-invalid:, focus-visible:) are inert here.
+    const applied = marker.className.split(/\s+/).filter((token) => !token.includes(":"))
+    expect(applied.filter((token) => /emerald|green|sky|blue|red|destructive|amber|yellow/.test(token))).toEqual([])
+    expect(applied).toContain("bg-foreground")
+    expect(applied).toContain("text-background")
+    expect(applied).not.toContain("bg-primary")
+  })
+
+  it("keeps the marker in place when the same row refreshes", () => {
+    const { rerender } = render(<ContainerTable containers={[privilegedContainer()]} readOnly={false} onChanged={() => {}} />)
+    rerender(<ContainerTable containers={[privilegedContainer({ state: "running", health: "healthy" })]} readOnly={false} onChanged={() => {}} />)
+
+    expect(document.querySelectorAll('[data-privileged="true"]')).toHaveLength(1)
+    expect(within(screen.getByRole("row", { name: /nd-my-ansible/ })).getByText("Privileged")).toBeInTheDocument()
   })
 })

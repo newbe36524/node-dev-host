@@ -121,6 +121,7 @@ describe("working a large fleet", () => {
     build: { state: build, builds: 1, failures: 0, finishedAt: null },
     project: { name: null, description: null, configSource: null, configError: null, warnings: [] },
     registered: false,
+    privileged: false,
     schedule: { state: "none", until: null, daysLeft: null },
     operation: null,
     error: null,

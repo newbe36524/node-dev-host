@@ -40,12 +40,18 @@ export function container(overrides: Partial<ContainerInfo> = {}): ContainerInfo
     build: { state: "ok", builds: 3, failures: 0, finishedAt: "2026-11-11T10:00:00Z" },
     project: { name: null, description: null, configSource: null, configError: null, warnings: [] },
     registered: false,
+    privileged: false,
     schedule: { state: "none", until: null, daysLeft: null },
     operation: null,
     error: null,
     warning: null,
     ...overrides,
   }
+}
+
+/** A registered node that runs privileged, as the control node reports it: the row a reviewer must not miss. */
+export function privilegedContainer(overrides: Partial<ContainerInfo> = {}): ContainerInfo {
+  return container({ name: "nd-my-ansible", id: "priv01", port: 43160, registered: true, privileged: true, ...overrides })
 }
 
 /** Makes window.matchMedia report the given viewport for the md breakpoint. Returns a restore function. */

@@ -38,6 +38,15 @@ describe("AddNodeDialog", () => {
     })
   })
 
+  it("offers no privileged field: privilege is granted by the control node's allowlist, not by the dialog", () => {
+    renderDialog(43123)
+
+    expect(screen.queryByLabelText(/privileged/i)).toBeNull()
+    expect(screen.queryByRole("checkbox", { name: /privileged/i })).toBeNull()
+    expect(screen.queryByRole("switch", { name: /privileged/i })).toBeNull()
+    expect(screen.queryByText(/privileged/i)).toBeNull()
+  })
+
   it("seeds the port when the dialog opens after the list loads", () => {
     const onOpenChange = vi.fn()
     const props = { onOpenChange, onAdded: vi.fn(), disabled: false }
