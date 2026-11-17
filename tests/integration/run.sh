@@ -29,6 +29,7 @@ API_PID=""
 REG_PID=""
 SLOW_VOLUME=""
 FAILS=0
+FAILED_PORTS=()   # ports where docker run failed this run; pick_port never offers them again
 
 case "$TARGET" in
   demo|demo-alpine) VARIANT=demo ;;
@@ -67,16 +68,20 @@ trap cleanup EXIT
 # ---- port registry (the same procedure as skills/node-dev-host/SKILL.md, "Choose the host port") ----
 
 # pick_port NAME: prints the host port for the container NAME, from 43100-43299.
+# A port is taken when any local TCP socket uses it, in any state (not only LISTEN: a bind can fail
+# on a TIME_WAIT or other non-listening socket in the ephemeral range, which overlaps 43100-43299),
+# when a running or labelled container uses it, or when this run already failed to bind it.
 pick_port() {
   local name="$1" port listening taken start c i
   port=$(docker inspect -f '{{index .Config.Labels "node-dev-host.port"}}' "$name" 2>/dev/null)
   if [ -n "$port" ] && [ "$port" != "<no value>" ]; then echo "$port"; return 0; fi
   if command -v ss >/dev/null 2>&1; then
-    listening=$(ss -Htln | awk '{print $4}' | sed 's/.*://')
+    listening=$(ss -Htan | awk '{print $4}' | sed 's/.*://')
   else
     listening=$(lsof -nP -iTCP -sTCP:LISTEN | awk 'NR>1 {print $9}' | sed 's/.*://')
   fi
   taken=$( { echo "$listening"
+             printf '%s\n' "${FAILED_PORTS[@]}"
              docker ps --format '{{.Ports}}' | grep -oE '[0-9]+->' | tr -d '>-'
              docker ps -a --filter label=node-dev-host.port --format '{{.Label "node-dev-host.port"}}'
            } | grep -E '^[0-9]+$' | sort -un)
@@ -112,6 +117,7 @@ start() {
       return 0
     fi
     printf '        docker run on port %s failed: %s\n' "$port" "$err"
+    FAILED_PORTS+=("$port")
     docker rm -f "$name" >/dev/null 2>&1
   done
   fail "could not start $name after 5 tries"
@@ -325,6 +331,7 @@ start_control() {
       return 0
     fi
     printf '        docker run on port %s failed: %s\n' "$port" "$err"
+    FAILED_PORTS+=("$port")
     docker rm -f "$name" >/dev/null 2>&1
   done
   fail "could not start $name after 5 tries"
