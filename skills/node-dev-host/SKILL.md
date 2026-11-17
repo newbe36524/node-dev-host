@@ -207,6 +207,7 @@ Rules:
 | `CONTROL_DATA_DIR` | `/var/lib/dev-host/control` | Directory containing `nodes.json`. Mount a persistent volume there to keep node records across control-container recreation. |
 | `CONTROL_ALLOWED_IMAGES` | `ghcr.io/newbe36524/node-dev-host,node-dev-host` | Comma-separated allowed image repositories for node creation. Tags may vary. |
 | `CONTROL_WORKSPACE_ROOTS` | empty | Comma-separated absolute host path roots allowed for workspaces. Empty allows any absolute path without `..` segments. |
+| `CONTROL_PRIVILEGED_NODES` | empty | Comma-separated node names allowed to run in privileged mode. Empty allows none. Read once at startup, so recreate `nd-control` after a change. Entries that are not valid node names are ignored and logged. See Privileged nodes below. |
 
 ### Guards and API
 
@@ -216,18 +217,27 @@ Every request is checked in order. The `Host` header must be `127.0.0.1`, `local
 | --- | --- |
 | `GET /api/containers` | `{"readOnly":…,"containers":[…],"persistence":…,"nextPort":…}`. Each row also has `registered`, `schedule`, `operation`, `error` and `warning`; a saved node without a container is `not created`. |
 | `GET /api/containers/<name>/logs?tail=N` | Plain text. `N` defaults to 200 and is capped at 1000. |
-| `POST /api/containers/<name>/start`, `stop`, `restart` | 200 |
+| `POST /api/containers/<name>/start`, `stop`, `restart` | 200. Start and restart of a privileged node not on `CONTROL_PRIVILEGED_NODES` return 403. |
 | `POST /api/containers/<name>/start` with `{"autoStart":true}` | Saves a seven-day auto-start expiry, then starts; a missing container is created from its record. |
 | `POST /api/containers/<name>/rebuild` | 202. Runs `dev-host rebuild` in the container. 409 when the container is stopped. |
 | `POST /api/containers/<name>/recreate` | 202. Pulls the latest image and recreates a registered node from its record. |
 | `DELETE /api/containers/<name>` | 200. Removes the container and frees its port; a registered node record stays. |
-| `POST /api/nodes` | 201. Saves a node record without creating a container. The body may list `networks`. |
+| `POST /api/nodes` | 201. Saves a node record without creating a container. The body may list `networks`, and `privileged: true` only for a name on `CONTROL_PRIVILEGED_NODES` (otherwise 400). |
 | `DELETE /api/nodes/<name>` | 200. Removes the container if present, then deletes the record. |
 | `POST /api/nodes/<name>/auto-start` | 200. Extends auto-start to seven days from now. |
 | `DELETE /api/nodes/<name>/auto-start` | 200. Clears the auto-start expiry without stopping a running node. |
 | `POST /api/scan` | 200 with `{imported, skipped}` for labelled containers not yet registered. |
 
 Labelled containers and saved nodes are listed and actionable. Unlabelled containers without a node record are refused with 403, and an unknown name returns 404. A registered node without a container accepts Start, Recreate and Delete node only. The control node has no port label or node record, so it is refused too.
+
+### Privileged nodes
+
+A privileged container has host-root-level reach, even without the Docker socket. A node runs in privileged mode only when both hold: its record has `privileged: true`, and its exact name is in `CONTROL_PRIVILEGED_NODES`. The list is read once at startup, so a change takes effect after `nd-control` is recreated or restarted.
+
+- `POST /api/nodes` with `privileged: true` for a name that is not on the list returns 400 naming `CONTROL_PRIVILEGED_NODES`, and saves nothing. A request without the field saves a node that is not privileged.
+- Start, restart and recreate of a privileged node whose name has left the list return 403 naming `CONTROL_PRIVILEGED_NODES`, and create or start nothing, including in the auto-start pass. Stop, delete and logs still work, and the row keeps its `privileged` flag.
+- A scan imports a labelled privileged container only when its name is on the list. Any other privileged container is skipped with `container is privileged`.
+- Every row of `GET /api/containers` carries `privileged`: Docker's value for a container that exists, the record's value for a node that is `not created`. The dashboard marks privileged rows with a `Privileged` label.
 
 ### Add a node through the API
 
@@ -261,7 +271,7 @@ The list provides `nextPort` and `persistence`; adding saves a node and leaves i
 | `413` / `415` | Body exceeds 16 KB / content type is not JSON. |
 | `503` | Node store is not writable or Docker is unreachable. |
 
-Every error response is JSON with an `error` message. Scan imports reproducible labelled containers and reports skipped containers with extra mounts, a non-loopback published port, privileged mode, or no `/workspace` bind on a non-demo image. Imported nodes have no auto-start window. After import the console owns the record; Recreate uses that record and the new container will not retain Compose labels.
+Every error response is JSON with an `error` message. Scan imports reproducible labelled containers and reports skipped containers with extra mounts, a non-loopback published port, privileged mode (unless the name is in `CONTROL_PRIVILEGED_NODES`), or no `/workspace` bind on a non-demo image. Imported nodes have no auto-start window. After import the console owns the record; Recreate uses that record and the new container will not retain Compose labels.
 
 ### Node records and scheduled startup
 

@@ -199,6 +199,12 @@ A neutral outline pill showing the Docker state (`running`, `exited`, ...). It i
 
 The registered-node state `not created` uses a dashed quiet-text outline, like `stopped`; its build badge is also `stopped`. It is a useful state, not an error.
 
+### Privileged marker
+A solid inverted neutral pill with a shield icon and the word `Privileged`, placed in the Name cell next to the container name, so it shows in the wide table and on the narrow card. It marks host-level reach, not a fault. It is ink on paper and flips in dark mode through the theme tokens (`bg-foreground`, `text-background`).
+- **Colour rule:** the marker never uses the green, blue or red status hues, and it is never an outline, so it cannot be read as a build state. The Three Signals Rule still holds.
+- **Word rule:** the text is `Privileged`; the accessible name says the node has host-level access. Greyscale keeps the marker identifiable.
+- It carries `data-privileged="true"`. Rows that are not privileged show nothing, and the Add node dialog has no privileged control.
+
 ### Refresh indicator
 Right side of the header: a small icon plus "Updated hh:mm:ss" in quiet text. While a request is in flight the icon becomes a spinner with the label "Refreshing". Before the first response it reads "Waiting for first update". This is the answer to "can I trust what I see right now".
 

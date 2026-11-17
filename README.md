@@ -94,6 +94,7 @@ serve:
 | `service.command` | Not empty, at most 500 characters. The command that starts the service, run in the build copy. Required with `service.port`. |
 | `service.port` | An integer from 1024 to 65535. The loopback port the service listens on; see the Service paragraph below. Required with `service.command`. |
 | `image` | A non-empty string without whitespace or control characters, for example `jjb-ndh:local`. It names the image the node runs. The nd-console registration helper reads it, and the build ignores it. An image older than this field rejects it and fails the build, so add the field only after the node runs an image that has it. See [Derived images](#derived-images). |
+| `privileged` | `true` or `false`, default `false`. `true` only for a name on `CONTROL_PRIVILEGED_NODES`; the API refuses it otherwise. The build ignores it. See Privileged nodes. |
 | `writable` | A list of up to 8 relative paths under the workspace, for example `[data, .browser-profile]`. Each is bound read-write over the read-only `/workspace`, so only those subtrees can be written. The nd-console registration helper reads it and sends it on the node record, and it must exist as a directory on the host. The build ignores it. An image older than this field rejects it, as for `image`. |
 
 The file is at most 64 KiB. A field not listed above is refused at any level, and so is any field that would choose a network: networks stay in the control node's node record. The top level must be a mapping of fields, and a file with more than one document is refused.
@@ -322,13 +323,23 @@ The control node reads these variables. The variables in the skill's Configurati
 | `CONTROL_DATA_DIR` | `/var/lib/dev-host/control` | Directory containing `nodes.json`. Mount a persistent volume here to keep node records across control-container recreation. |
 | `CONTROL_ALLOWED_IMAGES` | `ghcr.io/newbe36524/node-dev-host,node-dev-host` | Comma-separated allowed image repositories for node creation. Tags may vary. |
 | `CONTROL_WORKSPACE_ROOTS` | empty | Comma-separated absolute host path roots allowed for workspaces. Empty allows any absolute path without `..` segments. |
+| `CONTROL_PRIVILEGED_NODES` | empty | Comma-separated node names allowed to run in privileged mode. Empty allows none. Read once at startup, so recreate `nd-control` after a change. Entries that are not valid node names are ignored and logged. See Privileged nodes below. |
 | `CONTROL_SELF_UPDATE` | `true` | Upgrade to a newer `latest` image on a timer. `false` (also `0`, `no`, `off`) turns the timer off; `POST /api/upgrade` still works. |
 | `CONTROL_SELF_UPDATE_INTERVAL_HOURS` | `6` | Hours between image checks for self-upgrade. |
 | `CONTROL_STANDBY` | empty | Set only by a self-upgrade on the candidate. A standby node answers its health check and returns `503` for the API until it takes over. Do not set it by hand. |
 
+### Privileged nodes
+
+A privileged container has host-root-level reach, even without the Docker socket. A node runs in privileged mode only when both hold: its record has `privileged: true`, and its exact name is in `CONTROL_PRIVILEGED_NODES`. The list is read once at startup, so a change takes effect after `nd-control` is recreated or restarted.
+
+- `POST /api/nodes` with `privileged: true` for a name that is not on the list returns 400 naming `CONTROL_PRIVILEGED_NODES`, and saves nothing. A request without the field saves a node that is not privileged.
+- Start, restart and recreate of a privileged node whose name has left the list return 403 naming `CONTROL_PRIVILEGED_NODES`, and create or start nothing, including in the auto-start pass. Stop, delete and logs still work, and the row keeps its `privileged` flag.
+- A scan imports a labelled privileged container only when its name is on the list. Any other privileged container is skipped with `container is privileged`.
+- Every row of `GET /api/containers` carries `privileged`: Docker's value for a container that exists, the record's value for a node that is `not created`. The dashboard marks privileged rows with a `Privileged` label.
+
 ### Add a node through the API
 
-Scripts and agents use the same `POST /api/nodes` route as the dashboard; do not add managed nodes by editing a Compose file. `curl` supplies `Host` from the URL. Mutating calls also need a matching `Origin`, `X-Dev-Host-Control: 1`, and `Content-Type: application/json`. These guards are not authentication; keep the control port on loopback.
+Scripts and agents use the same `POST /api/nodes` route as the dashboard; do not add managed nodes by editing a Compose file. A node is privileged only when its name is in `CONTROL_PRIVILEGED_NODES`; see Privileged nodes. `curl` supplies `Host` from the URL. Mutating calls also need a matching `Origin`, `X-Dev-Host-Control: 1`, and `Content-Type: application/json`. These guards are not authentication; keep the control port on loopback.
 
 ```sh
 CONTROL=http://127.0.0.1:43190
@@ -358,7 +369,7 @@ The initial list returns `nextPort` and `persistence`; adding saves the node and
 | `413` / `415` | Body exceeds 16 KB / content type is not JSON. |
 | `503` | Node store is not writable or Docker is unreachable. |
 
-Every error response is JSON with an `error` message. A scan imports labelled containers that the control node can reproduce. It skips containers with extra mounts, a non-loopback published port, privileged mode, or (for non-demo images) no `/workspace` bind, and reports each reason. Imported nodes have no auto-start window. Once imported, the console owns that record; Recreate builds from it and the resulting container will not retain Compose labels.
+Every error response is JSON with an `error` message. A scan imports labelled containers that the control node can reproduce. It skips containers with extra mounts, a non-loopback published port, privileged mode unless the name is in `CONTROL_PRIVILEGED_NODES` (see Privileged nodes), or (for non-demo images) no `/workspace` bind, and reports each reason. Imported nodes have no auto-start window. Once imported, the console owns that record; Recreate builds from it and the resulting container will not retain Compose labels.
 
 ### Docker Desktop (macOS and Windows)
 
