@@ -142,6 +142,22 @@ test('candidate body keeps the config, has no host port, and starts in standby',
   assert.equal(body.Labels['com.docker.compose.service'], 'nd-control');
 });
 
+test('a control node with a privileged-node allowlist is not privileged itself, and its candidate keeps the list unchanged', () => {
+  const self = selfContainer();
+  self.Config.Env.push('CONTROL_PRIVILEGED_NODES=nd-my-ansible,nd-lab');
+  const before = structuredClone(self);
+  const body = candidateBody(self, { image: IMAGE });
+  // The list travels with the environment, exactly as written, and nothing else about the container changes.
+  assert.ok(body.Env.includes('CONTROL_PRIVILEGED_NODES=nd-my-ansible,nd-lab'));
+  assert.deepEqual(body.Env, [...before.Config.Env.filter((entry) => !entry.startsWith('CONTROL_STANDBY=')), 'CONTROL_STANDBY=true']);
+  assert.equal(body.HostConfig.Privileged, undefined);
+  assert.deepEqual(body.HostConfig.Binds, ['node-dev-host-control:/var/lib/dev-host/control', '/var/run/docker.sock:/var/run/docker.sock']);
+  assert.equal(body.HostConfig.PortBindings, undefined);
+  assert.equal(body.HostConfig.NetworkMode, undefined);
+  assert.deepEqual(Object.keys(body.NetworkingConfig.EndpointsConfig).sort(), ['hpc-console_default', 'nd-console_default']);
+  assert.deepEqual(self, before);
+});
+
 test('upgrade starts the candidate, freezes, hands over, swaps names and removes the old node', async () => {
   const { dir, fake, calls, upgrade } = await setup();
   const promoted = [];

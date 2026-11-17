@@ -6,7 +6,7 @@ import path from 'node:path';
 import { afterEach, test } from 'node:test';
 import { createDockerClient, isLocalImage } from '../../../rootfs/usr/local/lib/dev-host/control/docker.mjs';
 import { createOperationTracker } from '../../../rootfs/usr/local/lib/dev-host/control/operations.mjs';
-import { createBody, DEFAULT_ALLOWED_IMAGES, nextPort, parseAllowedImages, parseWorkspaceRoots, validateNode, validateNpmRegistry } from '../../../rootfs/usr/local/lib/dev-host/control/nodes.mjs';
+import { assertPrivilegeAllowed, createBody, DEFAULT_ALLOWED_IMAGES, nextPort, parseAllowedImages, parsePrivilegedNodes, parseWorkspaceRoots, validateNode, validateNpmRegistry } from '../../../rootfs/usr/local/lib/dev-host/control/nodes.mjs';
 import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from '../../../rootfs/usr/local/lib/dev-host/control/schedule.mjs';
 import { createStore } from '../../../rootfs/usr/local/lib/dev-host/control/store.mjs';
 import { createDiscovery } from '../../../rootfs/usr/local/lib/dev-host/control/discovery.mjs';
@@ -448,4 +448,140 @@ test('discovery imports a node with a read-write writable bind, and still skips 
     imported: ['nd-jjb'],
     skipped: [{ name: 'nd-rw-outside', reason: 'unsupported mount: /workspace/x' }],
   });
+});
+
+test('CONTROL_PRIVILEGED_NODES parses to trimmed, exact, de-duplicated names and reports invalid entries', () => {
+  assert.deepEqual(parsePrivilegedNodes(''), { names: [], ignored: [] });
+  assert.deepEqual(parsePrivilegedNodes(undefined), { names: [], ignored: [] });
+  assert.deepEqual(parsePrivilegedNodes('nd-my-ansible'), { names: ['nd-my-ansible'], ignored: [] });
+  assert.deepEqual(parsePrivilegedNodes(' nd-my-ansible ,nd-lab,, '), { names: ['nd-my-ansible', 'nd-lab'], ignored: [] });
+  assert.deepEqual(parsePrivilegedNodes('nd-lab,nd-lab,nd-lab'), { names: ['nd-lab'], ignored: [] });
+  // Case is kept as typed, so ND-LAB is a different name from nd-lab and never matches it.
+  assert.deepEqual(parsePrivilegedNodes('ND-LAB'), { names: ['ND-LAB'], ignored: [] });
+  assert.deepEqual(parsePrivilegedNodes('nd-my-ansible,bad name!,-leading,nd-lab'), {
+    names: ['nd-my-ansible', 'nd-lab'],
+    ignored: ['bad name!', '-leading'],
+  });
+});
+
+test('a node record may be privileged only when its name is allowlisted, and defaults to not privileged', () => {
+  const options = { allowedImages: ['node-dev-host'], workspaceRoots: ['/home'], privilegedNodes: new Set(['nd-my-ansible']) };
+  const input = { name: 'nd-my-ansible', workspace: '/home/me/repos/site', port: 43120, image: 'node-dev-host:latest' };
+  assert.equal(validateNode(input, options).privileged, false);
+  assert.equal(validateNode({ ...input, privileged: false }, options).privileged, false);
+  assert.equal(validateNode({ ...input, privileged: true }, options).privileged, true);
+  assert.throws(() => validateNode({ ...input, name: 'nd-other', privileged: true }, options), (err) => {
+    assert.equal(err.status, 400);
+    assert.match(err.message, /CONTROL_PRIVILEGED_NODES/);
+    return true;
+  });
+  // Without an allowlist, nothing is privileged.
+  assert.throws(() => validateNode({ ...input, privileged: true }, { allowedImages: ['node-dev-host'], workspaceRoots: ['/home'] }), /CONTROL_PRIVILEGED_NODES/);
+  assert.throws(() => validateNode({ ...input, privileged: 'yes' }, options), (err) => err.status === 400 && /must be a boolean/.test(err.message));
+  assert.throws(() => validateNode({ ...input, privileged: 1 }, options), /must be a boolean/);
+});
+
+test('a privileged record gets Privileged in its create body; an ordinary record has no Privileged key; loopback, binds and socket are unchanged', () => {
+  const options = { allowedImages: ['node-dev-host'], workspaceRoots: ['/home'], privilegedNodes: new Set(['nd-my-ansible']) };
+  const base = { name: 'nd-my-ansible', workspace: '/home/me/repos/site', port: 43120, image: 'node-dev-host:latest' };
+  const ordinary = createBody(validateNode({ ...base, name: 'nd-plain' }, { ...options, privilegedNodes: new Set() }));
+  assert.equal('Privileged' in ordinary.HostConfig, false);
+  const privileged = createBody(validateNode({ ...base, privileged: true }, options), { privilegedNodes: options.privilegedNodes });
+  assert.equal(privileged.HostConfig.Privileged, true);
+  // Everything else about the container is the same as an ordinary node of the same shape.
+  const { Privileged, ...rest } = privileged.HostConfig;
+  assert.deepEqual(rest, ordinary.HostConfig);
+  assert.deepEqual(privileged.HostConfig.PortBindings, { '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '43120' }] });
+  assert.deepEqual(privileged.HostConfig.Binds, ['/home/me/repos/site:/workspace:ro', 'node-dev-host-pnpm:/var/lib/dev-host/pnpm']);
+  assert.equal(privileged.HostConfig.Binds.some((bind) => bind.includes('docker.sock')), false);
+  assert.equal(privileged.HostConfig.NetworkMode, undefined);
+  // A privileged record whose name is not on the list cannot produce a create body at all.
+  const notListed = validateNode({ ...base, privileged: true }, options);
+  assert.throws(() => createBody({ ...notListed, name: 'nd-other' }, { privilegedNodes: options.privilegedNodes }), (err) => {
+    assert.equal(err.status, 403);
+    assert.match(err.message, /CONTROL_PRIVILEGED_NODES/);
+    return true;
+  });
+  assert.throws(() => createBody(notListed), (err) => err.status === 403 && /CONTROL_PRIVILEGED_NODES/.test(err.message));
+});
+
+test('assertPrivilegeAllowed refuses a privileged record or container whose name left the allowlist, and nothing else', () => {
+  const allowed = new Set(['nd-my-ansible']);
+  const privilegedContainer = { HostConfig: { Privileged: true } };
+  const plainContainer = { HostConfig: { Privileged: false } };
+  assert.doesNotThrow(() => assertPrivilegeAllowed('nd-my-ansible', { record: { privileged: true }, container: privilegedContainer }, allowed));
+  assert.doesNotThrow(() => assertPrivilegeAllowed('nd-plain', { record: { privileged: false }, container: plainContainer }, allowed));
+  assert.doesNotThrow(() => assertPrivilegeAllowed('nd-plain', { record: { }, container: null }, new Set()));
+  for (const args of [
+    { record: { privileged: true }, container: null },
+    { record: { privileged: true }, container: plainContainer },
+    { record: null, container: privilegedContainer },
+  ]) {
+    assert.throws(() => assertPrivilegeAllowed('nd-gone', args, allowed), (err) => {
+      assert.equal(err.status, 403);
+      assert.match(err.message, /CONTROL_PRIVILEGED_NODES/);
+      return true;
+    });
+  }
+});
+
+test('the node store loads a nodes.json from before the privileged field and leaves the file byte-identical', async () => {
+  const dir = await tempDir();
+  const file = path.join(dir, 'nodes.json');
+  const old = `${JSON.stringify({ version: 1, nodes: [{ name: 'nd-old', workspace: '/home/me/repos/old', port: 43100, image: 'node-dev-host:latest', env: {}, restartPolicy: 'no', networks: [], writable: [], source: 'added', createdAt: '2026-01-01T00:00:00.000Z', autoStartUntil: null }] }, null, 2)}\n`;
+  await fs.writeFile(file, old, 'utf8');
+  const before = await fs.readFile(file);
+  const store = createStore({ dir });
+  const [node] = await store.getNodes();
+  assert.equal(node.name, 'nd-old');
+  assert.equal(node.privileged, undefined);
+  assert.equal(createBody(node).HostConfig.Privileged, undefined);
+  assert.deepEqual(await fs.readFile(file), before);
+});
+
+test('discovery imports an allowlisted privileged container as privileged, keeps the other checks, and still skips the rest', async () => {
+  const store = createStore({ dir: await tempDir() });
+  const base = (name, overrides = {}) => ({
+    Name: `/${name}`,
+    Config: { Image: 'node-dev-host:latest', Labels: { 'node-dev-host.port': name === 'nd-my-ansible' ? '43121' : '43122' }, Env: [] },
+    State: { Running: false },
+    HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: true },
+    Mounts: [{ Type: 'bind', Source: '/workspace/site', Destination: '/workspace', RW: false }],
+    NetworkSettings: { Networks: {} },
+    ...overrides,
+  });
+  const containers = [
+    base('nd-my-ansible'),
+    base('nd-my-ansible-extra', { Mounts: [{ Type: 'bind', Source: '/workspace/site', Destination: '/workspace', RW: false }, { Type: 'bind', Source: '/etc', Destination: '/etc' }] }),
+    base('nd-priv'),
+  ];
+  const docker = {
+    dockerRaw: async (method, apiPath) => {
+      if (apiPath.startsWith('/containers/json')) {
+        return { status: 200, body: Buffer.from(JSON.stringify(containers.map((info) => ({ Names: [info.Name] })))) };
+      }
+      const name = decodeURIComponent(apiPath.split('/')[2]);
+      return { status: 200, body: Buffer.from(JSON.stringify(containers.find((info) => info.Name === `/${name}`))) };
+    },
+    imageInfo: async () => ({ Config: { Env: [] } }),
+  };
+  const discovery = createDiscovery({
+    docker,
+    store,
+    allowedImages: ['node-dev-host'],
+    workspaceRoots: ['/workspace'],
+    privilegedNodes: new Set(['nd-my-ansible', 'nd-my-ansible-extra']),
+    log: () => {},
+  });
+  assert.deepEqual(await discovery.scan(), {
+    imported: ['nd-my-ansible'],
+    skipped: [
+      { name: 'nd-my-ansible-extra', reason: 'unsupported mount: /etc' },
+      { name: 'nd-priv', reason: 'container is privileged' },
+    ],
+  });
+  const [record] = await store.getNodes();
+  assert.equal(record.name, 'nd-my-ansible');
+  assert.equal(record.privileged, true);
+  assert.equal(createBody(record, { privilegedNodes: new Set(['nd-my-ansible']) }).HostConfig.Privileged, true);
 });

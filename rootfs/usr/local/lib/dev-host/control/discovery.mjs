@@ -21,7 +21,7 @@ function isWritableWorkspaceBind(mount, workspace) {
     && mount.Source.startsWith(`${workspace.Source}/`));
 }
 
-function unsupportedReason(info, httpPort) {
+function unsupportedReason(info, httpPort, privilegedNodes, name) {
   const allowedMounts = new Set(['/workspace', PNPM_VOLUME]);
   const workspace = workspaceMount(info);
   const extra = (info.Mounts || []).find((mount) => !allowedMounts.has(mount.Destination) && !isWritableWorkspaceBind(mount, workspace));
@@ -32,13 +32,14 @@ function unsupportedReason(info, httpPort) {
   if (port.some((binding) => binding.HostIp !== '127.0.0.1')) {
     return 'published port is not bound to loopback';
   }
-  if (info.HostConfig?.Privileged) return 'container is privileged';
+  // A privileged container is imported only when its name is on the allowlist; the other checks still apply to it.
+  if (info.HostConfig?.Privileged && !privilegedNodes.has(name)) return 'container is privileged';
   const demo = /(^|[/@:])[^/]*demo(?:-alpine)?(?:[:@]|$)/i.test(info.Config?.Image || '');
   if (!workspaceMount(info) && !demo) return 'no /workspace bind';
   return null;
 }
 
-export function createDiscovery({ docker, store, allowedImages, workspaceRoots, httpPort = 8080, log = console.warn }) {
+export function createDiscovery({ docker, store, allowedImages, workspaceRoots, httpPort = 8080, privilegedNodes = new Set(), log = console.warn }) {
   async function scan() {
     const [existingRecords, list] = await Promise.all([
       store.getNodes(),
@@ -55,7 +56,7 @@ export function createDiscovery({ docker, store, allowedImages, workspaceRoots, 
       const detail = await docker.dockerRaw('GET', `/containers/${encodeURIComponent(name)}/json`);
       if (detail.status !== 200) continue;
       const info = JSON.parse(detail.body.toString('utf8'));
-      const reason = unsupportedReason(info, httpPort);
+      const reason = unsupportedReason(info, httpPort, privilegedNodes, name);
       if (reason) {
         skipped.push({ name, reason });
         continue;
@@ -85,8 +86,9 @@ export function createDiscovery({ docker, store, allowedImages, workspaceRoots, 
           env,
           restartPolicy: info.HostConfig?.RestartPolicy?.Name || 'no',
           networks,
+          privileged: info.HostConfig?.Privileged === true,
           source: 'imported',
-        }, { allowedImages, workspaceRoots, allowWorkspaceNull: true });
+        }, { allowedImages, workspaceRoots, allowWorkspaceNull: true, privilegedNodes });
         await store.update((document) => {
           if (!document.nodes.some((node) => node.name === name)) document.nodes.push(record);
           return document;

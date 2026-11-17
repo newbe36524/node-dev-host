@@ -16,7 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createDiscovery } from './discovery.mjs';
 import { createDockerClient, DockerUnavailable, dockerMessage, HttpError } from './docker.mjs';
-import { addNodeRecord, createBody, deleteNodeRecord, nextPort, parseAllowedImages, parseWorkspaceRoots, validateNode, validateNpmRegistry } from './nodes.mjs';
+import { addNodeRecord, assertPrivilegeAllowed, createBody, deleteNodeRecord, nextPort, parseAllowedImages, parsePrivilegedNodes, parseWorkspaceRoots, validateNode, validateNpmRegistry } from './nodes.mjs';
 import { createOperationTracker } from './operations.mjs';
 import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from './schedule.mjs';
 import { createStore } from './store.mjs';
@@ -55,9 +55,13 @@ const MAX_TAIL = 1000;
 const DEFAULT_TAIL = 200;
 
 const log = (...parts) => console.log(`[control ${new Date().toISOString().slice(11, 19)}]`, ...parts);
+// Read once at startup: a change to CONTROL_PRIVILEGED_NODES takes effect when nd-control is recreated.
+const privilegedParsed = parsePrivilegedNodes(env.CONTROL_PRIVILEGED_NODES || '');
+for (const entry of privilegedParsed.ignored) log(`CONTROL_PRIVILEGED_NODES ignores ${JSON.stringify(entry)}: not a valid node name`);
+const PRIVILEGED_NODES = new Set(privilegedParsed.names);
 const store = createStore({ dir: DATA_DIR, readOnly: READONLY, log: (...parts) => log(...parts) });
 const operations = createOperationTracker();
-const discovery = createDiscovery({ docker, store, allowedImages: ALLOWED_IMAGES, workspaceRoots: WORKSPACE_ROOTS, log });
+const discovery = createDiscovery({ docker, store, allowedImages: ALLOWED_IMAGES, workspaceRoots: WORKSPACE_ROOTS, privilegedNodes: PRIVILEGED_NODES, log });
 const upgrade = createSelfUpgrade({ docker, store, operations, dataDir: DATA_DIR, selfId: os.hostname(), log });
 // A standby flag survives in the container's environment after a takeover, so ask the handover record first.
 if (STANDBY && (await upgrade.wasPromoted())) STANDBY = false;
@@ -182,6 +186,7 @@ async function listContainers() {
       build: probe.build,
       project: probe.project,
       registered: Boolean(record),
+      privileged: info.HostConfig?.Privileged === true,
       schedule: scheduleState(record?.autoStartUntil),
       operation: operation?.phase ? { phase: operation.phase, since: operation.since } : null,
       error: operation?.error ?? null,
@@ -203,6 +208,7 @@ async function listContainers() {
       build: { ...UNKNOWN_BUILD },
       project: unknownProject(),
       registered: true,
+      privileged: record.privileged === true,
       schedule: scheduleState(record.autoStartUntil),
       operation: operation?.phase ? { phase: operation.phase, since: operation.since } : null,
       error: operation?.error ?? null,
@@ -280,7 +286,10 @@ function nodeHttpPort(record) {
   return value > 0 ? value : 8080;
 }
 
+// Every start goes through here, so the startup pass for auto-start windows is covered as well as manual starts.
 async function startContainer(name) {
+  const [container, records] = await Promise.all([inspectContainer(name), store.getNodes()]);
+  assertPrivilegeAllowed(name, { record: records.find((node) => node.name === name), container }, PRIVILEGED_NODES);
   const r = await dockerRaw('POST', `/containers/${enc(name)}/start`);
   if (r.status === 204 || r.status === 304) return null;
   throw new HttpError(r.status === 409 ? 409 : 500, dockerMessage(r));
@@ -293,7 +302,7 @@ async function createFromRecord(record, context, pullCache) {
   if (pulled.warning) context.setWarning(pulled.warning);
   context.setPhase('creating');
   const npmRegistry = await npmRegistrySetting();
-  await docker.createContainer(record.name, createBody(record, { httpPort: nodeHttpPort(record), npmRegistry }));
+  await docker.createContainer(record.name, createBody(record, { httpPort: nodeHttpPort(record), npmRegistry, privilegedNodes: PRIVILEGED_NODES }));
   context.setPhase('starting');
   await startContainer(record.name);
   return { warning: pulled.warning };
@@ -315,6 +324,8 @@ async function setAutoStart(name, until) {
 
 async function lifecycle(name, action, body = {}) {
   const { container, record } = await resolveTarget(name, action);
+  // Refused before anything is queued, so the caller gets the reason in the response.
+  if (['start', 'restart', 'recreate'].includes(action)) assertPrivilegeAllowed(name, { record, container }, PRIVILEGED_NODES);
   if (action === 'recreate') {
     if (!record) throw new HttpError(409, `container ${name} is not registered; scan first`);
     queueOperation(name, 'pulling', async (context) => {
@@ -328,7 +339,7 @@ async function lifecycle(name, action, body = {}) {
       }
       context.setPhase('creating');
       const npmRegistry = await npmRegistrySetting();
-      await docker.createContainer(name, createBody(record, { httpPort: nodeHttpPort(record), npmRegistry }));
+      await docker.createContainer(name, createBody(record, { httpPort: nodeHttpPort(record), npmRegistry, privilegedNodes: PRIVILEGED_NODES }));
       context.setPhase('starting');
       await startContainer(name);
       return { warning: pulled.warning };
@@ -538,13 +549,14 @@ async function serveApi(req, res, url) {
     if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'POST' });
     const body = await readJsonBody(req);
     await ensureStoreWritable();
-    validateNode(body, { allowedImages: ALLOWED_IMAGES, workspaceRoots: WORKSPACE_ROOTS });
+    validateNode(body, { allowedImages: ALLOWED_IMAGES, workspaceRoots: WORKSPACE_ROOTS, privilegedNodes: PRIVILEGED_NODES });
     for (const network of body.networks ?? []) await ensureNetworkExists(network);
     const summaries = await labelledSummaries();
     const result = await addNodeRecord(store, body, {
       allowedImages: ALLOWED_IMAGES,
       workspaceRoots: WORKSPACE_ROOTS,
       containers: summaries,
+      privilegedNodes: PRIVILEGED_NODES,
     });
     return sendJson(res, 201, { ok: true, node: result.nodes.find((node) => node.name === body.name) });
   }
@@ -685,7 +697,7 @@ async function activate() {
     resolveContainer: inspectContainer,
     pullImage: docker.pullImage,
     createContainer: docker.createContainer,
-    createBody: async (record) => createBody(record, { httpPort: nodeHttpPort(record), npmRegistry: await npmRegistrySetting() }),
+    createBody: async (record) => createBody(record, { httpPort: nodeHttpPort(record), npmRegistry: await npmRegistrySetting(), privilegedNodes: PRIVILEGED_NODES }),
     startContainer,
     log,
   }).catch((err) => log('startup pass failed:', err.message || err));

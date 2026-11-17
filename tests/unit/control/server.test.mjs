@@ -832,3 +832,237 @@ test('a node on a local image is created on start and on recreate with no pull a
   assert.equal(calls.filter((call) => call.startsWith('POST /images/create')).length, 0);
   assert.equal(calls.filter((call) => call.startsWith('POST /containers/create')).length, 2);
 });
+
+// A Docker stand-in for the privileged-node tests: containers live in a Map and every request is recorded.
+function privilegedDocker(socket, containers, calls) {
+  const sum = (item) => ({ Id: item.Id, Names: [`/${item.name}`], Image: item.Config.Image, State: item.State.Running ? 'running' : 'exited', Labels: item.Config.Labels, Ports: [] });
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://docker');
+    calls.push(`${req.method} ${url.pathname}`);
+    const { pathname } = url;
+    if (pathname === '/_ping') return json(res, 200, {});
+    if (pathname === '/containers/json') return json(res, 200, [...containers.values()].filter((item) => item.Config.Labels?.['node-dev-host.port']).map(sum));
+    if (pathname.startsWith('/images/')) return json(res, 200, { Config: { Env: [] } });
+    if (pathname.endsWith('/logs')) { res.writeHead(200); return res.end(); }
+    if (pathname === '/containers/create') {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      const body = JSON.parse(raw);
+      const name = url.searchParams.get('name');
+      if (containers.has(name)) return json(res, 409, { message: 'name is already in use' });
+      const item = {
+        Id: `id-${name}-${calls.length}`, name,
+        Config: { Image: body.Image, Labels: body.Labels, Env: body.Env, Tty: false },
+        HostConfig: body.HostConfig, Mounts: [], NetworkSettings: { Networks: {} }, State: { Running: false },
+      };
+      containers.set(name, item);
+      return json(res, 201, { Id: item.Id });
+    }
+    const match = pathname.match(/^\/containers\/([^/]+)(?:\/(json|start|stop|restart))?$/);
+    if (match) {
+      const name = decodeURIComponent(match[1]);
+      const item = containers.get(name);
+      if (req.method === 'DELETE') {
+        containers.delete(name);
+        res.writeHead(204); return res.end();
+      }
+      if (!item) return json(res, 404, { message: 'not found' });
+      if (!match[2] || match[2] === 'json') return json(res, 200, item);
+      item.State.Running = match[2] !== 'stop';
+      res.writeHead(204); return res.end();
+    }
+    return json(res, 404, { message: 'not found' });
+  });
+  return new Promise((resolve) => server.listen(socket, () => resolve(server)));
+}
+
+async function spawnControl(dir, socket, allowlist, cleanup) {
+  const portServer = net.createServer();
+  await new Promise((resolve) => portServer.listen(0, '127.0.0.1', resolve));
+  const port = portServer.address().port;
+  await new Promise((resolve) => portServer.close(resolve));
+  const base = `http://127.0.0.1:${port}`;
+  let output = '';
+  const child = spawn(process.execPath, [path.resolve('rootfs/usr/local/lib/dev-host/control/server.mjs')], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HTTP_PORT: String(port),
+      DOCKER_SOCKET: socket,
+      CONTROL_DATA_DIR: path.join(dir, 'data'),
+      CONTROL_ALLOWED_IMAGES: 'node-dev-host',
+      CONTROL_WORKSPACE_ROOTS: '/home',
+      CONTROL_SELF_UPDATE: 'false',
+      CONTROL_PRIVILEGED_NODES: allowlist,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      if ((await fetch(`${base}/__dev-host/status.json`)).status === 200) break;
+    } catch {}
+    if (attempt > 100) throw new Error('control server did not start');
+    await sleep(20);
+  }
+  const guarded = (pathName, method = 'GET', body) => fetch(`${base}${pathName}`, {
+    method,
+    headers: { ...(method !== 'GET' ? { Origin: base, 'X-Dev-Host-Control': '1' } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const rows = async () => (await (await guarded('/api/containers')).json()).containers;
+  const rowOf = async (name) => (await rows()).find((row) => row.name === name);
+  const settled = async (name) => {
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      const row = await rowOf(name);
+      if (row && row.operation === null && row.state !== 'not created') return row;
+      await sleep(10);
+    }
+    throw new Error(`${name} did not settle`);
+  };
+  // A child stopped by a signal has exitCode null, so both fields say whether it has already exited.
+  const stop = async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+      await new Promise((resolve) => child.once('exit', resolve));
+    }
+  };
+  cleanup.push(stop);
+  return { base, guarded, rowOf, settled, stop, log: () => output, sleep };
+}
+
+test('privileged nodes: only allowlisted names register and start as privileged, rows show it, and a name that left the list is refused', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'node-control-privileged-'));
+  const socket = path.join(dir, 'docker.sock');
+  const containers = new Map();
+  const calls = [];
+  // A privileged container nobody registered: the scan must skip it, and the row must still say so.
+  containers.set('nd-priv', {
+    Id: 'id-nd-priv', name: 'nd-priv',
+    Config: { Image: 'node-dev-host:local', Labels: { 'node-dev-host.port': '43170', 'node-dev-host.name': 'nd-priv' }, Env: [], Tty: false },
+    HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: true, RestartPolicy: { Name: 'no' } },
+    Mounts: [{ Type: 'bind', Source: '/home/priv', Destination: '/workspace', RW: false }],
+    NetworkSettings: { Networks: {} }, State: { Running: false },
+  });
+  const dockerServer = await privilegedDocker(socket, containers, calls);
+  // Control nodes stop first: the fake Docker server cannot close while one of them still holds a connection.
+  const cleanup = [];
+  t.after(async () => {
+    for (const stop of cleanup.reverse()) await stop();
+    await new Promise((resolve) => dockerServer.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const control = await spawnControl(dir, socket, 'nd-my-ansible, bad name!, nd-lab', cleanup);
+  assert.match(control.log(), /CONTROL_PRIVILEGED_NODES ignores "bad name!"/);
+  const { guarded, rowOf, settled } = control;
+  const node = { workspace: '/home/me/repos/site', image: 'node-dev-host:local' };
+
+  let row = await rowOf('nd-priv');
+  assert.equal(row.privileged, true);
+  assert.equal(row.registered, false);
+
+  // Registration: a name off the list is refused by the API itself, with nothing saved.
+  let response = await guarded('/api/nodes', 'POST', { ...node, name: 'nd-other', port: 43163, privileged: true });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /CONTROL_PRIVILEGED_NODES/);
+  assert.equal(await rowOf('nd-other'), undefined);
+  response = await guarded('/api/nodes', 'POST', { ...node, name: 'nd-my-ansible', port: 43160, privileged: 'yes' });
+  assert.equal(response.status, 400);
+  assert.equal(await rowOf('nd-my-ansible'), undefined);
+
+  assert.equal((await guarded('/api/nodes', 'POST', { ...node, name: 'nd-my-ansible', port: 43160, privileged: true })).status, 201);
+  assert.equal((await guarded('/api/nodes', 'POST', { ...node, name: 'nd-plain', port: 43161 })).status, 201);
+  assert.equal((await guarded('/api/nodes', 'POST', { ...node, name: 'nd-lab', port: 43162, privileged: true })).status, 201);
+
+  // Start: the allowlisted privileged node gets Docker's Privileged flag, and only loopback is published.
+  assert.equal((await guarded('/api/containers/nd-my-ansible/start', 'POST')).status, 202);
+  await settled('nd-my-ansible');
+  const made = containers.get('nd-my-ansible');
+  assert.equal(made.HostConfig.Privileged, true);
+  assert.deepEqual(made.HostConfig.PortBindings, { '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '43160' }] });
+  assert.equal(made.HostConfig.Binds.some((bind) => bind.includes('docker.sock')), false);
+  assert.equal((await guarded('/api/containers/nd-plain/start', 'POST')).status, 202);
+  await settled('nd-plain');
+  assert.equal('Privileged' in containers.get('nd-plain').HostConfig, false);
+
+  // Rows: every kind carries privileged, and the marker is not tied to registration.
+  assert.equal((await rowOf('nd-my-ansible')).privileged, true);
+  assert.equal((await rowOf('nd-plain')).privileged, false);
+  assert.equal((await rowOf('nd-lab')).privileged, true);
+  assert.equal((await rowOf('nd-lab')).state, 'not created');
+  row = await rowOf('nd-priv');
+  assert.equal(row.privileged, true);
+  assert.equal(row.registered, false);
+  assert.equal((await (await guarded('/api/containers')).json()).containers.every((item) => typeof item.privileged === 'boolean'), true);
+
+  // The first control node is replaced by a second one whose list has dropped nd-my-ansible.
+  await control.stop();
+
+  // The list changes: nd-lab and nd-my-ansible are both off it now, so both must be refused.
+  const second = await spawnControl(dir, socket, 'nd-plain', cleanup);
+  const refused = await second.guarded('/api/containers/nd-my-ansible/start', 'POST');
+  assert.equal(refused.status, 403);
+  assert.match((await refused.json()).error, /CONTROL_PRIVILEGED_NODES/);
+  for (const action of ['restart', 'recreate']) {
+    const r = await second.guarded(`/api/containers/nd-my-ansible/${action}`, 'POST');
+    assert.equal(r.status, 403, action);
+    assert.match((await r.json()).error, /CONTROL_PRIVILEGED_NODES/);
+  }
+  assert.equal(containers.get('nd-my-ansible').State.Running, true);
+  assert.equal((await second.rowOf('nd-my-ansible')).privileged, true);
+  assert.equal((await second.guarded('/api/containers/nd-lab/start', 'POST')).status, 403);
+  assert.equal((await second.guarded('/api/containers/nd-my-ansible/logs')).status, 200);
+  assert.equal((await second.guarded('/api/containers/nd-my-ansible/stop', 'POST')).status, 200);
+  assert.equal(containers.get('nd-my-ansible').State.Running, false);
+  assert.equal((await second.guarded('/api/containers/nd-my-ansible/start', 'POST')).status, 403);
+  assert.equal((await second.guarded('/api/containers/nd-my-ansible', 'DELETE')).status, 200);
+  assert.equal((await second.guarded('/api/nodes/nd-my-ansible', 'DELETE')).status, 200);
+});
+
+test('the startup pass never starts or creates a privileged node that left the allowlist, and still starts the ordinary one', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'node-control-startup-'));
+  const socket = path.join(dir, 'docker.sock');
+  const containers = new Map();
+  const calls = [];
+  const window = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const record = (name, port, privileged) => ({
+    name, workspace: '/home/me/repos/site', port, image: 'node-dev-host:local', env: {}, restartPolicy: 'no', networks: [], writable: [],
+    privileged, source: 'added', createdAt: '2026-01-01T00:00:00.000Z', autoStartUntil: window,
+  });
+  await fs.mkdir(path.join(dir, 'data'), { recursive: true });
+  await fs.writeFile(path.join(dir, 'data', 'nodes.json'), `${JSON.stringify({ version: 1, nodes: [
+    record('nd-auto-priv', 43180, true),
+    record('nd-auto-stopped', 43181, true),
+    record('nd-auto-plain', 43182, false),
+  ] }, null, 2)}\n`, 'utf8');
+  // A stopped privileged container for a name that is no longer allowlisted.
+  containers.set('nd-auto-stopped', {
+    Id: 'id-nd-auto-stopped', name: 'nd-auto-stopped',
+    Config: { Image: 'node-dev-host:local', Labels: { 'node-dev-host.port': '43181', 'node-dev-host.name': 'nd-auto-stopped' }, Env: [], Tty: false },
+    HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: true, RestartPolicy: { Name: 'no' } },
+    Mounts: [{ Type: 'bind', Source: '/home/me/repos/site', Destination: '/workspace', RW: false }],
+    NetworkSettings: { Networks: {} }, State: { Running: false },
+  });
+  const dockerServer = await privilegedDocker(socket, containers, calls);
+  const cleanup = [];
+  t.after(async () => {
+    for (const stop of cleanup.reverse()) await stop();
+    await new Promise((resolve) => dockerServer.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const control = await spawnControl(dir, socket, 'nd-lab', cleanup);
+  // The ordinary node is started by the pass; once it is, the pass has reached the other two.
+  for (let attempt = 0; attempt < 300 && containers.get('nd-auto-plain')?.State.Running !== true; attempt += 1) await control.sleep(10);
+  await control.sleep(200);
+  assert.equal(containers.get('nd-auto-plain').State.Running, true);
+  assert.equal(containers.has('nd-auto-priv'), false);
+  assert.equal(containers.get('nd-auto-stopped').State.Running, false);
+  assert.equal(calls.filter((call) => call === 'POST /containers/nd-auto-stopped/start').length, 0);
+  assert.equal(calls.filter((call) => call === 'POST /containers/nd-auto-priv/start').length, 0);
+  assert.match(control.log(), /startup failed for nd-auto-priv: .*CONTROL_PRIVILEGED_NODES/);
+  assert.match(control.log(), /startup failed for nd-auto-stopped: .*CONTROL_PRIVILEGED_NODES/);
+});

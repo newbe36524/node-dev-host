@@ -10,7 +10,7 @@ export const MIN_PORT = 43100;
 export const MAX_PORT = 43299;
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const ENV_RE = /^[A-Z0-9_]+$/;
-const USER_KEYS = new Set(['name', 'workspace', 'port', 'image', 'env', 'networks', 'writable']);
+const USER_KEYS = new Set(['name', 'workspace', 'port', 'image', 'env', 'networks', 'writable', 'privileged']);
 const NETWORK_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const RESERVED_NETWORKS = new Set(['bridge', 'host', 'none']);
 const MAX_NETWORKS = 4;
@@ -51,10 +51,29 @@ function isWithinRoot(workspace, root) {
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
+// The privileged-node allowlist (CONTROL_PRIVILEGED_NODES) is a set of node names. Privileged mode gives a container
+// host-root-level reach, so it is granted by name and never by a request alone.
+const privilegeMessage = (name) => `node ${name} is not on the privileged-node allowlist; add it to CONTROL_PRIVILEGED_NODES and recreate nd-control`;
+
+// Returns { names, ignored }: names are trimmed, exact, de-duplicated; an entry that is not a valid node name is
+// ignored (and reported), so a typo narrows the list rather than widening it.
+export function parsePrivilegedNodes(value = '') {
+  const names = [];
+  const ignored = [];
+  for (const raw of value.split(',')) {
+    const entry = raw.trim();
+    if (!entry) continue;
+    if (!NAME_RE.test(entry)) ignored.push(entry);
+    else if (!names.includes(entry)) names.push(entry);
+  }
+  return { names, ignored };
+}
+
 export function validateNode(input, {
   allowedImages = DEFAULT_ALLOWED_IMAGES,
   workspaceRoots = [],
   allowWorkspaceNull = false,
+  privilegedNodes = new Set(),
 } = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) invalid('node must be a JSON object');
   for (const key of Object.keys(input)) {
@@ -65,6 +84,9 @@ export function validateNode(input, {
   if (typeof input.name !== 'string' || !NAME_RE.test(input.name)) {
     invalid('name must match [A-Za-z0-9][A-Za-z0-9_.-]*');
   }
+  const privileged = input.privileged ?? false;
+  if (typeof privileged !== 'boolean') invalid('privileged must be a boolean');
+  if (privileged && !privilegedNodes.has(input.name)) invalid(privilegeMessage(input.name));
   if (!Number.isInteger(input.port) || input.port < MIN_PORT || input.port > MAX_PORT) {
     invalid(`port must be in ${MIN_PORT}-${MAX_PORT}`);
   }
@@ -120,6 +142,7 @@ export function validateNode(input, {
     restartPolicy: input.restartPolicy || 'no',
     networks: [...new Set(networks)],
     writable: writablePaths,
+    privileged,
     source: input.source || 'added',
     createdAt: input.createdAt || new Date().toISOString(),
     autoStartUntil: input.autoStartUntil ?? null,
@@ -127,8 +150,16 @@ export function validateNode(input, {
 }
 
 // npmRegistry is the console-wide default. The node's own env wins, so one node can still use another registry.
-export function createBody(record, { httpPort = DEFAULT_HTTP_PORT, npmRegistry = null } = {}) {
+// The one place a container is built from a record, so every creation path passes the allowlist check here.
+export function assertPrivilegeAllowed(name, { record, container } = {}, privilegedNodes = new Set()) {
+  // Fail closed: a privileged record or an existing privileged container is refused unless its name is listed.
+  const privileged = container?.HostConfig?.Privileged === true || record?.privileged === true;
+  if (privileged && !privilegedNodes.has(name)) throw new HttpError(403, privilegeMessage(name));
+}
+
+export function createBody(record, { httpPort = DEFAULT_HTTP_PORT, npmRegistry = null, privilegedNodes = new Set() } = {}) {
   const portKey = `${httpPort}/tcp`;
+  assertPrivilegeAllowed(record.name, { record }, privilegedNodes);
   const binds = ['node-dev-host-pnpm:/var/lib/dev-host/pnpm'];
   if (record.workspace) binds.unshift(`${record.workspace}:/workspace:ro`);
   // A writable path is bound on top of the read-only /workspace, so only that subtree can be written.
@@ -144,6 +175,8 @@ export function createBody(record, { httpPort = DEFAULT_HTTP_PORT, npmRegistry =
       PortBindings: { [portKey]: [{ HostIp: '127.0.0.1', HostPort: String(record.port) }] },
       RestartPolicy: { Name: record.restartPolicy || 'no' },
       LogConfig: { Type: 'json-file', Config: { 'max-size': '10m', 'max-file': '3' } },
+      // Only a privileged record that passed the allowlist check above gets the flag; otherwise the key is absent.
+      ...(record.privileged === true ? { Privileged: true } : {}),
     },
   };
   if (record.networks?.length) {
@@ -176,8 +209,8 @@ export function parseWorkspaceRoots(value = '') {
   return value.split(',').map((item) => item.trim()).filter(Boolean);
 }
 
-export async function addNodeRecord(store, input, { allowedImages, workspaceRoots, containers = [] } = {}) {
-  const record = validateNode(input, { allowedImages, workspaceRoots });
+export async function addNodeRecord(store, input, { allowedImages, workspaceRoots, containers = [], privilegedNodes } = {}) {
+  const record = validateNode(input, { allowedImages, workspaceRoots, privilegedNodes });
   const labels = containers.map((container) => ({
     name: container.name ?? (container.Names?.[0] || '').replace(/^\//, ''),
     port: Number(container.port ?? container.Labels?.[PORT_LABEL]),
