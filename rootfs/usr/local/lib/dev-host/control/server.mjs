@@ -16,7 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createDiscovery } from './discovery.mjs';
 import { createDockerClient, DockerUnavailable, dockerMessage, HttpError } from './docker.mjs';
-import { addNodeRecord, assertPrivilegeAllowed, createBody, deleteNodeRecord, HOST_MOUNT_PREFIX, nextPort, parseAllowedImages, parseHostMountRoots, parsePrivilegedNodes, parseWorkspaceRoots, validateNode, validateNpmRegistry } from './nodes.mjs';
+import { addNodeRecord, assertPrivilegeAllowed, createBody, deleteNodeRecord, HOST_MOUNT_PREFIX, MAX_PORT, MIN_PORT, nextPort, parseAllowedImages, parseHostMountRoots, parsePrivilegedNodes, parseWorkspaceRoots, validateNode, validateNpmRegistry } from './nodes.mjs';
 import { createOperationTracker } from './operations.mjs';
 import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from './schedule.mjs';
 import { createStore } from './store.mjs';
@@ -295,13 +295,49 @@ function nodeHttpPort(record) {
   return value > 0 ? value : 8080;
 }
 
+const PORT_IN_USE = /address already in use/i;
+const MAX_PORT_TRIES = 5;
+
 // Every start goes through here, so the startup pass for auto-start windows is covered as well as manual starts.
-async function startContainer(name) {
+// Docker binds the host port on start, not on create. A port can be busy for a reason the saved state cannot see
+// (a socket still in TIME_WAIT, another process), and then the start fails with "address already in use". The
+// failed container is removed, the node moves to the next free port and the start is tried again, as `start` in
+// tests/integration/run.sh does. failed: ports earlier attempts of this start found busy.
+async function startContainer(name, { context, failed = [] } = {}) {
   const [container, records] = await Promise.all([inspectContainer(name), store.getNodes()]);
-  assertPrivilegeAllowed(name, { record: records.find((node) => node.name === name), container }, PRIVILEGED_NODES);
+  const record = records.find((node) => node.name === name);
+  assertPrivilegeAllowed(name, { record, container }, PRIVILEGED_NODES);
   const r = await dockerRaw('POST', `/containers/${enc(name)}/start`);
   if (r.status === 204 || r.status === 304) return null;
-  throw new HttpError(r.status === 409 ? 409 : 500, dockerMessage(r));
+  const message = dockerMessage(r);
+  if (r.status !== 409 && PORT_IN_USE.test(message) && record && failed.length + 1 < MAX_PORT_TRIES) {
+    return moveToFreePort(name, record, [...failed, record.port], { context });
+  }
+  throw new HttpError(r.status === 409 ? 409 : 500, message);
+}
+
+// Recreates the node's container on the next free port that is not in failed, saves that port on the record, and starts it.
+async function moveToFreePort(name, record, failed, { context } = {}) {
+  const [summaries, published, records] = await Promise.all([labelledSummaries(), publishedHostPorts(), store.getNodes()]);
+  const port = nextPort(records, summaries, published, failed);
+  if (port === null) throw new HttpError(500, `no free port in ${MIN_PORT}-${MAX_PORT} to move ${name} to`);
+  context?.setPhase('removing');
+  const removed = await dockerRaw('DELETE', `/containers/${enc(name)}?force=1`);
+  if (removed.status !== 204 && removed.status !== 404) throw new HttpError(500, dockerMessage(removed));
+  await ensureStoreWritable();
+  await store.update((document) => {
+    const node = document.nodes.find((item) => item.name === name);
+    if (!node) throw new HttpError(404, `node not found: ${name}`);
+    node.port = port;
+    return document;
+  });
+  context?.setPhase('creating');
+  const npmRegistry = await npmRegistrySetting();
+  await docker.createContainer(name, createBody({ ...record, port }, { httpPort: nodeHttpPort(record), npmRegistry, privilegedNodes: PRIVILEGED_NODES, hostMountRoots: HOST_MOUNT_ROOTS }));
+  context?.setPhase('starting');
+  const next = await startContainer(name, { context, failed });
+  const warning = `port ${record.port} was in use; ${name} moved to ${port}`;
+  return { warning: next?.warning ? `${warning}; ${next.warning}` : warning };
 }
 
 async function createFromRecord(record, context, pullCache) {
@@ -313,8 +349,8 @@ async function createFromRecord(record, context, pullCache) {
   const npmRegistry = await npmRegistrySetting();
   await docker.createContainer(record.name, createBody(record, { httpPort: nodeHttpPort(record), npmRegistry, privilegedNodes: PRIVILEGED_NODES, hostMountRoots: HOST_MOUNT_ROOTS }));
   context.setPhase('starting');
-  await startContainer(record.name);
-  return { warning: pulled.warning };
+  const moved = await startContainer(record.name, { context });
+  return { warning: [pulled.warning, moved?.warning].filter(Boolean).join('; ') || null };
 }
 
 function queueOperation(name, initialPhase, work) {
@@ -350,8 +386,8 @@ async function lifecycle(name, action, body = {}) {
       const npmRegistry = await npmRegistrySetting();
       await docker.createContainer(name, createBody(record, { httpPort: nodeHttpPort(record), npmRegistry, privilegedNodes: PRIVILEGED_NODES, hostMountRoots: HOST_MOUNT_ROOTS }));
       context.setPhase('starting');
-      await startContainer(name);
-      return { warning: pulled.warning };
+      const moved = await startContainer(name, { context });
+      return { warning: [pulled.warning, moved?.warning].filter(Boolean).join('; ') || null };
     });
     return { queued: true };
   }
@@ -369,7 +405,7 @@ async function lifecycle(name, action, body = {}) {
     }
     return operations.run(name, null, () => rebuild(name));
   }
-  if (action === 'start') return operations.run(name, 'starting', () => startContainer(name));
+  if (action === 'start') return operations.run(name, 'starting', (context) => startContainer(name, { context }));
   return operations.run(name, null, async () => {
     const r = await dockerRaw('POST', `/containers/${enc(name)}/${action}`);
     if (r.status === 204 || r.status === 304) return null; // 304: already in that state

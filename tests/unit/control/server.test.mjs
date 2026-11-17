@@ -833,6 +833,62 @@ test('a node on a local image is created on start and on recreate with no pull a
   assert.equal(calls.filter((call) => call.startsWith('POST /containers/create')).length, 2);
 });
 
+test('a start whose host port is busy moves the node to the next free port, saves that port, and says so', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'node-control-busy-port-'));
+  const socket = path.join(dir, 'docker.sock');
+  const containers = new Map();
+  const calls = [];
+  // 43100 is held on the host by a socket that neither the saved records nor any container shows.
+  const dockerServer = await privilegedDocker(socket, containers, calls, new Set([43100]));
+  const cleanup = [];
+  t.after(async () => {
+    for (const stop of cleanup.reverse()) await stop();
+    await new Promise((resolve) => dockerServer.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const { guarded, settled } = await spawnControl(dir, socket, '', cleanup);
+  const node = { workspace: '/home/me/repos/site', image: 'node-dev-host:local' };
+
+  assert.equal((await guarded('/api/nodes', 'POST', { ...node, name: 'nd-busy', port: 43100 })).status, 201);
+  assert.equal((await guarded('/api/containers/nd-busy/start', 'POST')).status, 202);
+  const row = await settled('nd-busy');
+  assert.equal(row.state, 'running');
+  assert.equal(row.error, null);
+  assert.equal(row.port, 43101);
+  assert.equal(row.warning, 'port 43100 was in use; nd-busy moved to 43101');
+  assert.equal(containers.get('nd-busy').HostConfig.PortBindings['8080/tcp'][0].HostPort, '43101');
+  assert.equal(containers.get('nd-busy').State.Running, true);
+  assert.equal(calls.filter((call) => call === 'DELETE /containers/nd-busy').length, 1);
+  assert.equal(calls.filter((call) => call.startsWith('POST /containers/create')).length, 2);
+});
+
+test('a start that finds five ports busy stops there and leaves the node created, with the bind error on its row', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'node-control-busy-ports-'));
+  const socket = path.join(dir, 'docker.sock');
+  const containers = new Map();
+  const calls = [];
+  const dockerServer = await privilegedDocker(socket, containers, calls, new Set([43100, 43101, 43102, 43103, 43104]));
+  const cleanup = [];
+  t.after(async () => {
+    for (const stop of cleanup.reverse()) await stop();
+    await new Promise((resolve) => dockerServer.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const { guarded, settled } = await spawnControl(dir, socket, '', cleanup);
+  const node = { workspace: '/home/me/repos/site', image: 'node-dev-host:local' };
+
+  assert.equal((await guarded('/api/nodes', 'POST', { ...node, name: 'nd-exhausted', port: 43100 })).status, 201);
+  assert.equal((await guarded('/api/containers/nd-exhausted/start', 'POST')).status, 202);
+  const row = await settled('nd-exhausted');
+  // The fake Docker reports a container that never started as "exited"; the real daemon says "created". Either way it is not running.
+  assert.notEqual(row.state, 'running');
+  assert.equal(containers.get('nd-exhausted').State.Running, false);
+  assert.match(row.error, /address already in use/);
+  assert.equal(row.port, 43104);
+  assert.equal(calls.filter((call) => call.startsWith('POST /containers/create')).length, 5);
+  assert.equal(calls.filter((call) => call === 'DELETE /containers/nd-exhausted').length, 4);
+});
+
 // The mounts Docker would report for a create body's binds ("source:destination[:ro]").
 function mountsOfBinds(binds = []) {
   return binds.map((bind) => {
@@ -842,7 +898,7 @@ function mountsOfBinds(binds = []) {
 }
 
 // A Docker stand-in for the privileged-node tests: containers live in a Map and every request is recorded.
-function privilegedDocker(socket, containers, calls) {
+function privilegedDocker(socket, containers, calls, busy = new Set()) {
   const sum = (item) => ({ Id: item.Id, Names: [`/${item.name}`], Image: item.Config.Image, State: item.State.Running ? 'running' : 'exited', Labels: item.Config.Labels, Ports: [] });
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://docker');
@@ -876,6 +932,11 @@ function privilegedDocker(socket, containers, calls) {
       }
       if (!item) return json(res, 404, { message: 'not found' });
       if (!match[2] || match[2] === 'json') return json(res, 200, item);
+      // Docker binds the host port on start: a port held by a socket the control cannot see fails here, as it does for real.
+      const hostPort = Number(item.HostConfig.PortBindings?.['8080/tcp']?.[0]?.HostPort);
+      if (match[2] === 'start' && busy.has(hostPort)) {
+        return json(res, 500, { message: `failed to set up container networking: failed to bind host port for 127.0.0.1:${hostPort}:172.17.0.2:8080/tcp: address already in use` });
+      }
       item.State.Running = match[2] !== 'stop';
       res.writeHead(204); return res.end();
     }

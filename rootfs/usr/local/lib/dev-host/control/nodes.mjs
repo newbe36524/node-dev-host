@@ -280,14 +280,16 @@ export function createBody(record, {
 }
 
 // published: host ports that running containers publish, labelled or not. A port in use by any of them is skipped,
-// so the port handed out is one Docker can bind.
-export function nextPort(records = [], containers = [], published = []) {
+// so the port handed out is one Docker can bind. avoid: ports a start already found busy, skipped even though
+// nothing saved or running holds them (a socket the control cannot see).
+export function nextPort(records = [], containers = [], published = [], avoid = []) {
   const used = new Set(records.map((record) => Number(record.port)));
   for (const container of containers) {
     const port = container.port ?? container.Config?.Labels?.[PORT_LABEL] ?? container.Labels?.[PORT_LABEL];
     if (Number.isInteger(Number(port))) used.add(Number(port));
   }
   for (const port of published) if (Number.isInteger(Number(port))) used.add(Number(port));
+  for (const port of avoid) if (Number.isInteger(Number(port))) used.add(Number(port));
   for (let port = MIN_PORT; port <= MAX_PORT; port += 1) {
     if (!used.has(port)) return port;
   }

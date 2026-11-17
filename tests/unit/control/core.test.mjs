@@ -176,6 +176,8 @@ test('node validation, fixed creation body, and nextPort respect the record cont
   assert.equal(nextPort([{ port: 43100 }], [{ Labels: { 'node-dev-host.port': '43101' } }]), 43102);
   // A port that an unlabelled container publishes (for example a control node started by hand) is taken too.
   assert.equal(nextPort([], [], [43100, 43101]), 43102);
+  // Ports a start already found busy are skipped too, even when nothing saved or running holds them.
+  assert.equal(nextPort([{ port: 43100 }], [], [], [43101]), 43102);
   assert.deepEqual(parseAllowedImages('registry.example/nd'), ['registry.example/nd']);
   assert.deepEqual(parseWorkspaceRoots('/work,/repo'), ['/work', '/repo']);
   assert.deepEqual(parseAllowedImages(''), DEFAULT_ALLOWED_IMAGES);
