@@ -205,6 +205,12 @@ A solid inverted neutral pill with a shield icon and the word `Privileged`, plac
 - **Word rule:** the text is `Privileged`; the accessible name says the node has host-level access. Greyscale keeps the marker identifiable.
 - It carries `data-privileged="true"`. Rows that are not privileged show nothing, and the Add node dialog has no privileged control.
 
+### Host-access markers
+`Host PID` (an eye icon) and `Host mounts <n>` (a drive icon) are outline neutral pills in the Name cell, beside the Privileged marker, with the mounted paths printed under the name in quiet monospace. They are the weaker signal: the Privileged marker stays the solid, strongest one.
+- **Colour rule:** outline neutrals only, with no fill and no green, blue or red hue. The word is the text, so greyscale keeps them readable.
+- **Path rule:** the paths are visible text and the accessible name, not only a tooltip.
+- They carry `data-host-access="pid"` or `"mounts"`. A row with no host access shows nothing, and the Add node dialog has no host-access control.
+
 ### Refresh indicator
 Right side of the header: a small icon plus "Updated hh:mm:ss" in quiet text. While a request is in flight the icon becomes a spinner with the label "Refreshing". Before the first response it reads "Waiting for first update". This is the answer to "can I trust what I see right now".
 

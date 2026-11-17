@@ -95,6 +95,8 @@ serve:
 | `service.port` | An integer from 1024 to 65535. The loopback port the service listens on; see the Service paragraph below. Required with `service.command`. |
 | `image` | A non-empty string without whitespace or control characters, for example `jjb-ndh:local`. It names the image the node runs. The nd-console registration helper reads it, and the build ignores it. An image older than this field rejects it and fails the build, so add the field only after the node runs an image that has it. See [Derived images](#derived-images). |
 | `privileged` | `true` or `false`, default `false`. `true` only for a name on `CONTROL_PRIVILEGED_NODES`; the API refuses it otherwise. The build ignores it. See Privileged nodes. |
+| `pidHost` | `true` or `false`, default `false`. `true` runs the container in the host PID namespace. Only for a name on `CONTROL_PRIVILEGED_NODES`; it does not need `privileged`. See Host PID and host mounts. |
+| `hostMounts` | A list of up to 4 absolute host paths, default empty. Each is bound read-only at `/host` plus the same path. Only for a name on `CONTROL_PRIVILEGED_NODES`, and each path must pass the rules in Host PID and host mounts. |
 | `writable` | A list of up to 8 relative paths under the workspace, for example `[data, .browser-profile]`. Each is bound read-write over the read-only `/workspace`, so only those subtrees can be written. The nd-console registration helper reads it and sends it on the node record, and it must exist as a directory on the host. The build ignores it. An image older than this field rejects it, as for `image`. |
 
 The file is at most 64 KiB. A field not listed above is refused at any level, and so is any field that would choose a network: networks stay in the control node's node record. The top level must be a mapping of fields, and a file with more than one document is refused.
@@ -324,6 +326,7 @@ The control node reads these variables. The variables in the skill's Configurati
 | `CONTROL_ALLOWED_IMAGES` | `ghcr.io/newbe36524/node-dev-host,node-dev-host` | Comma-separated allowed image repositories for node creation. Tags may vary. |
 | `CONTROL_WORKSPACE_ROOTS` | empty | Comma-separated absolute host path roots allowed for workspaces. Empty allows any absolute path without `..` segments. |
 | `CONTROL_PRIVILEGED_NODES` | empty | Comma-separated node names allowed to run in privileged mode. Empty allows none. Read once at startup, so recreate `nd-control` after a change. Entries that are not valid node names are ignored and logged. See Privileged nodes below. |
+| `CONTROL_HOST_MOUNT_ROOTS` | empty | Comma-separated absolute host paths that a node's `hostMounts` must equal or lie under, by path segment. Empty adds no root restriction (the path rules still apply). A non-empty setting with no valid entry refuses every host mount. Read once at startup, so recreate `nd-control` after a change. Entries that are not valid absolute paths are ignored and logged. See Host PID and host mounts below. |
 | `CONTROL_SELF_UPDATE` | `true` | Upgrade to a newer `latest` image on a timer. `false` (also `0`, `no`, `off`) turns the timer off; `POST /api/upgrade` still works. |
 | `CONTROL_SELF_UPDATE_INTERVAL_HOURS` | `6` | Hours between image checks for self-upgrade. |
 | `CONTROL_STANDBY` | empty | Set only by a self-upgrade on the candidate. A standby node answers its health check and returns `503` for the API until it takes over. Do not set it by hand. |
@@ -336,6 +339,31 @@ A privileged container has host-root-level reach, even without the Docker socket
 - Start, restart and recreate of a privileged node whose name has left the list return 403 naming `CONTROL_PRIVILEGED_NODES`, and create or start nothing, including in the auto-start pass. Stop, delete and logs still work, and the row keeps its `privileged` flag.
 - A scan imports a labelled privileged container only when its name is on the list. Any other privileged container is skipped with `container is privileged`.
 - Every row of `GET /api/containers` carries `privileged`: Docker's value for a container that exists, the record's value for a node that is `not created`. The dashboard marks privileged rows with a `Privileged` label.
+
+### Host PID and host mounts
+
+A node can read host state through two record fields: `pidHost` shares the host PID namespace, and `hostMounts` binds host paths read-only. Both are granted only by the name in `CONTROL_PRIVILEGED_NODES`, and neither needs `privileged: true`. Sharing the host PID namespace lets the node read the environment of every host process, so review it as privileged access.
+
+- `pidHost: true` sets `HostConfig.PidMode` to `host`. The node sees host `/proc`.
+- Each `hostMounts` path is bound read-only at `/host` plus the same path, so `/var/lib/steam` appears at `/host/var/lib/steam`. No mount is writable, and no Docker or Podman socket is ever mounted. A node may list up to 4 paths.
+- A path must be absolute and normalized: no `..`, `.`, repeated or trailing slash. It must not be a socket (a name ending in `.sock`) or sit under `/run`, `/var/run`, `/var/lib/docker` or `/var/lib/containerd`. It must not be a whole system directory such as `/`, `/home`, `/var`, `/var/lib`, `/opt` or `/tmp`, nor sit under `/proc`, `/sys`, `/dev`, `/etc`, `/root` or `/boot`. A rejection names the path and the rule. `/proc` is refused as a mount because `pidHost` is how a node reads it.
+- `CONTROL_HOST_MOUNT_ROOTS` is the operator's allow list. When it is set, every host mount must equal one root or lie below it. The control node cannot see the host filesystem, so these checks are lexical: a symlink on the host is not followed. Check each approved path on the host for symlinks, sockets and nested mounts before adding it.
+- Start, restart and recreate of a node with host access whose name has left the list return 403 naming `CONTROL_PRIVILEGED_NODES`, and the auto-start pass does not start it. Stop, delete and logs still work.
+- A scan skips a host-PID container that is not on the list with `container uses the host PID namespace`. An allowlisted container with a mount that fails these rules is skipped with `unsupported mount: <destination>` and the rule. A PID mode other than the default or `host` is skipped with `unsupported PID mode: <mode>`.
+- Every row of `GET /api/containers` carries `pidHost` and `hostMounts`: from Docker for a container that exists, and from the record for a node that is `not created`. The dashboard shows `Host PID` and `Host mounts <n>` beside the `Privileged` marker, and the Add node dialog has no control for host access.
+
+An example record for a name on the list, with both paths under `CONTROL_HOST_MOUNT_ROOTS=/var/lib/steam,/home/me/.local/share/containers`:
+
+```json
+{
+  "name": "nd-my-ansible",
+  "workspace": "/home/me/repos/site",
+  "port": 43102,
+  "image": "node-dev-host:local",
+  "pidHost": true,
+  "hostMounts": ["/var/lib/steam", "/home/me/.local/share/containers"]
+}
+```
 
 ### Add a node through the API
 
@@ -369,7 +397,7 @@ The initial list returns `nextPort` and `persistence`; adding saves the node and
 | `413` / `415` | Body exceeds 16 KB / content type is not JSON. |
 | `503` | Node store is not writable or Docker is unreachable. |
 
-Every error response is JSON with an `error` message. A scan imports labelled containers that the control node can reproduce. It skips containers with extra mounts, a non-loopback published port, privileged mode unless the name is in `CONTROL_PRIVILEGED_NODES` (see Privileged nodes), or (for non-demo images) no `/workspace` bind, and reports each reason. Imported nodes have no auto-start window. Once imported, the console owns that record; Recreate builds from it and the resulting container will not retain Compose labels.
+Every error response is JSON with an `error` message. A scan imports labelled containers that the control node can reproduce. It skips containers with extra mounts, a non-loopback published port, privileged mode, host PID mode or host mounts unless the name is in `CONTROL_PRIVILEGED_NODES` (see Privileged nodes and Host PID and host mounts), or (for non-demo images) no `/workspace` bind, and reports each reason. Imported nodes have no auto-start window. Once imported, the console owns that record; Recreate builds from it and the resulting container will not retain Compose labels.
 
 ### Docker Desktop (macOS and Windows)
 

@@ -208,6 +208,7 @@ Rules:
 | `CONTROL_ALLOWED_IMAGES` | `ghcr.io/newbe36524/node-dev-host,node-dev-host` | Comma-separated allowed image repositories for node creation. Tags may vary. |
 | `CONTROL_WORKSPACE_ROOTS` | empty | Comma-separated absolute host path roots allowed for workspaces. Empty allows any absolute path without `..` segments. |
 | `CONTROL_PRIVILEGED_NODES` | empty | Comma-separated node names allowed to run in privileged mode. Empty allows none. Read once at startup, so recreate `nd-control` after a change. Entries that are not valid node names are ignored and logged. See Privileged nodes below. |
+| `CONTROL_HOST_MOUNT_ROOTS` | empty | Comma-separated absolute host paths that a node's `hostMounts` must equal or lie under. Empty adds no root restriction; a non-empty setting with no valid entry refuses every host mount. Read once at startup. See Host PID and host mounts below. |
 
 ### Guards and API
 
@@ -238,6 +239,31 @@ A privileged container has host-root-level reach, even without the Docker socket
 - Start, restart and recreate of a privileged node whose name has left the list return 403 naming `CONTROL_PRIVILEGED_NODES`, and create or start nothing, including in the auto-start pass. Stop, delete and logs still work, and the row keeps its `privileged` flag.
 - A scan imports a labelled privileged container only when its name is on the list. Any other privileged container is skipped with `container is privileged`.
 - Every row of `GET /api/containers` carries `privileged`: Docker's value for a container that exists, the record's value for a node that is `not created`. The dashboard marks privileged rows with a `Privileged` label.
+
+### Host PID and host mounts
+
+A node can read host state through two record fields: `pidHost` shares the host PID namespace, and `hostMounts` binds host paths read-only. Both are granted only by the name in `CONTROL_PRIVILEGED_NODES`, and neither needs `privileged: true`. Sharing the host PID namespace lets the node read the environment of every host process, so review it as privileged access.
+
+- `pidHost: true` sets `HostConfig.PidMode` to `host`.
+- Each `hostMounts` path is bound read-only at `/host` plus the same path, so `/var/lib/steam` appears at `/host/var/lib/steam`. No mount is writable and no socket is mounted. At most 4 paths.
+- A path must be absolute and normalized (no `..`, `.`, repeated or trailing slash), must not be a socket or sit under `/run`, `/var/run`, `/var/lib/docker` or `/var/lib/containerd`, must not be a whole system directory (`/`, `/home`, `/var`, `/var/lib`, `/opt`, `/tmp` and similar), and must not sit under `/proc`, `/sys`, `/dev`, `/etc`, `/root` or `/boot`. A rejection names the path and the rule.
+- `CONTROL_HOST_MOUNT_ROOTS` (empty by default) is the operator's allow list: each host mount must equal one root or lie below it, by path segment. A non-empty setting with no valid entry refuses every host mount. Read once at startup, so recreate `nd-control` after a change.
+- The control node checks paths lexically and cannot follow a symlink on the host. Check each approved path on the host for symlinks, sockets and nested mounts first.
+- A scan skips an unlisted host-PID container with `container uses the host PID namespace`, and skips an allowlisted container whose mount fails these rules with `unsupported mount: <destination>` and the rule. Start and recreate of a node with host access whose name has left the list return 403 naming `CONTROL_PRIVILEGED_NODES`.
+- Every row of `GET /api/containers` carries `pidHost` and `hostMounts`, from Docker for a container and from the record for a node that is `not created`. The dashboard shows `Host PID` and `Host mounts <n>` beside the `Privileged` marker. The Add node dialog has no control for host access.
+
+An example record for a name on the list, with both paths under `CONTROL_HOST_MOUNT_ROOTS=/var/lib/steam,/home/me/.local/share/containers`:
+
+```json
+{
+  "name": "nd-my-ansible",
+  "workspace": "/home/me/repos/site",
+  "port": 43102,
+  "image": "node-dev-host:local",
+  "pidHost": true,
+  "hostMounts": ["/var/lib/steam", "/home/me/.local/share/containers"]
+}
+```
 
 ### Add a node through the API
 
