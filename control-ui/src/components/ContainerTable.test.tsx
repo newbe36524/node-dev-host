@@ -1,7 +1,7 @@
 import { render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { ContainerTable, openUrl } from "@/components/ContainerTable"
-import { container, privilegedContainer, setViewport } from "@/test/fakeApi"
+import { container, hostMountsContainer, hostPidContainer, privilegedContainer, setViewport } from "@/test/fakeApi"
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -348,5 +348,71 @@ describe("ContainerTable privileged marker", () => {
 
     expect(document.querySelectorAll('[data-privileged="true"]')).toHaveLength(1)
     expect(within(screen.getByRole("row", { name: /nd-my-ansible/ })).getByText("Privileged")).toBeInTheDocument()
+  })
+})
+
+describe("ContainerTable host-access markers", () => {
+  const hostPlusMounts = () =>
+    container({ name: "nd-my-ansible", id: "host01", port: 43102, registered: true, pidHost: true, hostMounts: ["/var/lib/steam", "/home/me/.local/share/containers"] })
+
+  it("marks only the rows with host access, each with its own word marker", () => {
+    const restoreViewport = setViewport(true)
+    render(<ContainerTable containers={[container({ name: "nd-site-a" }), hostPidContainer(), hostMountsContainer()]} readOnly={false} onChanged={() => {}} />)
+    try {
+      expect(within(screen.getByRole("row", { name: /nd-site-a/ })).queryByText(/Host PID|Host mounts/)).toBeNull()
+      const pidRow = screen.getByRole("row", { name: /nd-pid/ })
+      expect(within(pidRow).getByText("Host PID")).toBeInTheDocument()
+      expect(within(pidRow).queryByText(/Host mounts/)).toBeNull()
+      const mountRow = screen.getByRole("row", { name: /nd-mounts/ })
+      expect(within(mountRow).getByText("Host mounts 1")).toBeInTheDocument()
+      expect(within(mountRow).queryByText("Host PID")).toBeNull()
+      expect(document.querySelectorAll("[data-host-access]")).toHaveLength(2)
+    } finally {
+      restoreViewport()
+    }
+  })
+
+  it("shows the markers and the paths as text on the narrow card, on the name line", () => {
+    const restoreViewport = setViewport(false)
+    render(<ContainerTable containers={[hostPlusMounts()]} readOnly={false} onChanged={() => {}} />)
+    try {
+      const card = screen.getByRole("row", { name: /nd-my-ansible/ })
+      const cell = within(card).getAllByRole("cell")[0]
+      const pid = within(card).getByRole("group", { name: /Host PID/ })
+      const mounts = within(card).getByRole("group", { name: /Host mounts 2/ })
+      expect(cell).toContainElement(pid)
+      expect(cell).toContainElement(mounts)
+      expect(pid).toHaveTextContent("Host PID")
+      expect(mounts).toHaveTextContent("Host mounts 2")
+      expect(mounts).toHaveAccessibleName(/\/var\/lib\/steam, \/home\/me\/\.local\/share\/containers/)
+      expect(within(card).getByText("/var/lib/steam, /home/me/.local/share/containers")).toBeInTheDocument()
+    } finally {
+      restoreViewport()
+    }
+  })
+
+  it("uses no status hue for the markers, and they are outline neutrals weaker than the Privileged marker", () => {
+    render(<ContainerTable containers={[container({ name: "nd-my-ansible", registered: true, privileged: true, pidHost: true, hostMounts: ["/var/lib/steam"] })]} readOnly={false} onChanged={() => {}} />)
+
+    const markers = Array.from(document.querySelectorAll("[data-host-access]")) as HTMLElement[]
+    expect(markers).toHaveLength(2)
+    for (const marker of markers) {
+      const applied = marker.className.split(/\s+/).filter((token) => !token.includes(":"))
+      expect(applied.filter((token) => /emerald|green|sky|blue|red|destructive|amber|yellow/.test(token))).toEqual([])
+      expect(applied.filter((token) => /^bg-/.test(token))).toEqual([])
+    }
+    const privileged = document.querySelector('[data-privileged="true"]') as HTMLElement
+    expect(privileged).toHaveClass("bg-foreground")
+  })
+
+  it("keeps the name cell markup the same when the same row refreshes", () => {
+    const { rerender } = render(<ContainerTable containers={[hostPlusMounts()]} readOnly={false} onChanged={() => {}} />)
+    const before = within(screen.getByRole("row", { name: /nd-my-ansible/ })).getAllByRole("cell")[0].innerHTML
+
+    rerender(<ContainerTable containers={[{ ...hostPlusMounts(), state: "running", health: "healthy" }]} readOnly={false} onChanged={() => {}} />)
+
+    const after = within(screen.getByRole("row", { name: /nd-my-ansible/ })).getAllByRole("cell")[0].innerHTML
+    expect(after).toBe(before)
+    expect(document.querySelectorAll('[data-host-access]')).toHaveLength(2)
   })
 })

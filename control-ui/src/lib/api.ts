@@ -61,6 +61,10 @@ export interface ContainerInfo {
   registered: boolean
   /** True when the container runs in Docker privileged mode, or the saved node is allowed to (see the control README). */
   privileged: boolean
+  /** True when the container shares the host PID namespace, or the saved node is allowed to (see the control README). */
+  pidHost: boolean
+  /** The host paths bound read-only under /host in the container, or the saved node's paths when it is not created. */
+  hostMounts: string[]
   schedule: NodeSchedule
   operation: NodeOperation | null
   error: string | null

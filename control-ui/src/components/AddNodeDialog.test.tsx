@@ -47,6 +47,15 @@ describe("AddNodeDialog", () => {
     expect(screen.queryByText(/privileged/i)).toBeNull()
   })
 
+  it("offers no host-access field or toggle: host PID and host mounts are granted by the control node's allowlist only", () => {
+    renderDialog(43124)
+
+    expect(screen.queryByLabelText(/host/i)).toBeNull()
+    expect(screen.queryByRole("checkbox", { name: /host/i })).toBeNull()
+    expect(screen.queryByRole("switch", { name: /host/i })).toBeNull()
+    expect(screen.queryByText(/host pid|host mount|pidhost|hostmounts/i)).toBeNull()
+  })
+
   it("seeds the port when the dialog opens after the list loads", () => {
     const onOpenChange = vi.fn()
     const props = { onOpenChange, onAdded: vi.fn(), disabled: false }

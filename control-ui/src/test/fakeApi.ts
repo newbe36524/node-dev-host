@@ -41,6 +41,8 @@ export function container(overrides: Partial<ContainerInfo> = {}): ContainerInfo
     project: { name: null, description: null, configSource: null, configError: null, warnings: [] },
     registered: false,
     privileged: false,
+    pidHost: false,
+    hostMounts: [],
     schedule: { state: "none", until: null, daysLeft: null },
     operation: null,
     error: null,
@@ -52,6 +54,16 @@ export function container(overrides: Partial<ContainerInfo> = {}): ContainerInfo
 /** A registered node that runs privileged, as the control node reports it: the row a reviewer must not miss. */
 export function privilegedContainer(overrides: Partial<ContainerInfo> = {}): ContainerInfo {
   return container({ name: "nd-my-ansible", id: "priv01", port: 43160, registered: true, privileged: true, ...overrides })
+}
+
+/** A registered node that shares the host PID namespace and has no host mount. */
+export function hostPidContainer(overrides: Partial<ContainerInfo> = {}): ContainerInfo {
+  return container({ name: "nd-pid", id: "pid01", port: 43161, registered: true, pidHost: true, ...overrides })
+}
+
+/** A registered node with read-only host mounts and no host PID namespace. */
+export function hostMountsContainer(overrides: Partial<ContainerInfo> = {}): ContainerInfo {
+  return container({ name: "nd-mounts", id: "mnt01", port: 43162, registered: true, hostMounts: ["/var/lib/steam"], ...overrides })
 }
 
 /** Makes window.matchMedia report the given viewport for the md breakpoint. Returns a restore function. */

@@ -158,6 +158,16 @@ test('a control node with a privileged-node allowlist is not privileged itself, 
   assert.deepEqual(self, before);
 });
 
+test('the control node keeps its own shape with host-access settings: no host PID mode and no /host mount, whatever the allowlist and roots', () => {
+  const self = selfContainer();
+  self.Config.Env.push('CONTROL_PRIVILEGED_NODES=nd-my-ansible', 'CONTROL_HOST_MOUNT_ROOTS=/var/lib/steam');
+  const body = candidateBody(self, { image: IMAGE });
+  assert.equal(body.HostConfig.PidMode, undefined);
+  assert.equal(body.HostConfig.Privileged, undefined);
+  assert.equal(body.HostConfig.Binds.some((bind) => bind.includes(':/host/')), false);
+  assert.ok(body.Env.includes('CONTROL_HOST_MOUNT_ROOTS=/var/lib/steam'));
+});
+
 test('upgrade starts the candidate, freezes, hands over, swaps names and removes the old node', async () => {
   const { dir, fake, calls, upgrade } = await setup();
   const promoted = [];

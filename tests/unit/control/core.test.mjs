@@ -3,10 +3,11 @@ import fs from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, test } from 'node:test';
 import { createDockerClient, isLocalImage } from '../../../rootfs/usr/local/lib/dev-host/control/docker.mjs';
 import { createOperationTracker } from '../../../rootfs/usr/local/lib/dev-host/control/operations.mjs';
-import { assertPrivilegeAllowed, createBody, DEFAULT_ALLOWED_IMAGES, nextPort, parseAllowedImages, parsePrivilegedNodes, parseWorkspaceRoots, validateNode, validateNpmRegistry } from '../../../rootfs/usr/local/lib/dev-host/control/nodes.mjs';
+import { assertPrivilegeAllowed, createBody, DEFAULT_ALLOWED_IMAGES, nextPort, parseAllowedImages, parseHostMountRoots, parsePrivilegedNodes, parseWorkspaceRoots, validateHostMount, validateNode, validateNpmRegistry } from '../../../rootfs/usr/local/lib/dev-host/control/nodes.mjs';
 import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from '../../../rootfs/usr/local/lib/dev-host/control/schedule.mjs';
 import { createStore } from '../../../rootfs/usr/local/lib/dev-host/control/store.mjs';
 import { createDiscovery } from '../../../rootfs/usr/local/lib/dev-host/control/discovery.mjs';
@@ -584,4 +585,246 @@ test('discovery imports an allowlisted privileged container as privileged, keeps
   assert.equal(record.name, 'nd-my-ansible');
   assert.equal(record.privileged, true);
   assert.equal(createBody(record, { privilegedNodes: new Set(['nd-my-ansible']) }).HostConfig.Privileged, true);
+});
+
+test('a node record from before pidHost and hostMounts normalizes to the defaults, and nodes.json is not rewritten', async () => {
+  const dir = await tempDir();
+  const file = path.join(dir, 'nodes.json');
+  const old = `${JSON.stringify({ version: 1, nodes: [{ name: 'nd-old', workspace: '/home/me/repos/old', port: 43100, image: 'node-dev-host:latest', env: {}, restartPolicy: 'no', networks: [], writable: [], source: 'added', createdAt: '2026-01-01T00:00:00.000Z', autoStartUntil: null }] }, null, 2)}\n`;
+  await fs.writeFile(file, old, 'utf8');
+  const before = await fs.readFile(file);
+  const store = createStore({ dir });
+  const [stored] = await store.getNodes();
+  assert.equal(stored.pidHost, undefined);
+  assert.equal(stored.hostMounts, undefined);
+  const { name, workspace, port, image, env } = stored;
+  const normalized = validateNode({ name, workspace, port, image, env }, { allowedImages: ['node-dev-host'], workspaceRoots: ['/home'] });
+  assert.equal(normalized.pidHost, false);
+  assert.deepEqual(normalized.hostMounts, []);
+  assert.equal('PidMode' in createBody(normalized).HostConfig, false);
+  assert.deepEqual(await fs.readFile(file), before);
+});
+
+test('pidHost and hostMounts are type-checked, bounded and unique, and a rejection saves nothing', () => {
+  const options = { allowedImages: ['node-dev-host'], workspaceRoots: ['/home'], privilegedNodes: new Set(['nd-my-ansible']) };
+  const input = { name: 'nd-my-ansible', workspace: '/home/me/repos/site', port: 43120, image: 'node-dev-host:latest' };
+  const rejects = (extra, pattern) => assert.throws(() => validateNode({ ...input, ...extra }, options), (err) => err.status === 400 && pattern.test(err.message));
+  rejects({ pidHost: 'yes' }, /pidHost must be a boolean/);
+  rejects({ pidHost: 1 }, /pidHost must be a boolean/);
+  rejects({ hostMounts: '/var/lib/steam' }, /hostMounts must be a list of host paths/);
+  rejects({ hostMounts: [1] }, /hostMounts must be a list of host paths/);
+  rejects({ hostMounts: ['/var/lib/steam', '/var/lib/steam'] }, /lists a path more than once/);
+  rejects({ hostMounts: ['/var/lib/a', '/var/lib/b', '/var/lib/c', '/var/lib/d', '/var/lib/e'] }, /at most 4 paths/);
+  const accepted = validateNode({ ...input, pidHost: true, hostMounts: ['/var/lib/steam'] }, options);
+  assert.equal(accepted.pidHost, true);
+  assert.deepEqual(accepted.hostMounts, ['/var/lib/steam']);
+  assert.equal(validateNode(input, options).pidHost, false);
+  assert.deepEqual(validateNode(input, options).hostMounts, []);
+});
+
+test('validateHostMount refuses every deny entry, relative, unnormalized and socket paths, and accepts a narrow path', () => {
+  const refused = [
+    // Socket trees: the whole tree is refused.
+    '/run', '/run/user/1000/podman', '/var/run', '/var/run/docker.sock', '/var/lib/docker', '/var/lib/containerd',
+    // Sockets by name anywhere.
+    '/home/me/podman.sock', '/var/lib/steam/docker.sock',
+    // Whole system directories.
+    '/', '/home', '/var', '/var/lib', '/usr', '/bin', '/sbin', '/lib', '/lib64', '/opt', '/srv', '/mnt', '/media', '/tmp',
+    // Sensitive trees, at any depth.
+    '/proc', '/proc/1/environ', '/sys', '/sys/kernel', '/dev', '/dev/shm', '/etc', '/etc/shadow', '/root', '/root/.ssh', '/boot', '/boot/efi',
+    // Relative, unnormalized, repeated-slash and trailing-slash forms.
+    'var/lib/steam', '', '/var/lib/../steam', '/var/lib/steam/..', '/var/lib/./steam', '/var//lib/steam', '/var/lib/steam/',
+  ];
+  for (const value of refused) {
+    assert.throws(() => validateHostMount(value), (err) => err.status === 400 && err.message.includes(value), value);
+  }
+  assert.throws(() => validateHostMount('/proc'), /host PID namespace/);
+  assert.throws(() => validateHostMount(['/var/lib/steam']), (err) => err.status === 400);
+  assert.equal(validateHostMount('/var/lib/steam/instances'), '/var/lib/steam/instances');
+  assert.equal(validateHostMount('/home/me/.local/share/containers'), '/home/me/.local/share/containers');
+});
+
+test('CONTROL_HOST_MOUNT_ROOTS keeps the valid roots, reports the rest, and a non-empty setting with no valid root refuses every mount', () => {
+  assert.deepEqual(parseHostMountRoots(''), { configured: false, roots: [], ignored: [] });
+  assert.deepEqual(parseHostMountRoots('/var/lib/steam, var/lib, /srv/x/, /var/lib/steam'), {
+    configured: true, roots: ['/var/lib/steam'], ignored: ['var/lib', '/srv/x/'],
+  });
+  assert.deepEqual(parseHostMountRoots('relative'), { configured: true, roots: [], ignored: ['relative'] });
+  // A setting of only separators is not empty: it must narrow to nothing, not to everything.
+  assert.deepEqual(parseHostMountRoots(' , '), { configured: true, roots: [], ignored: [] });
+});
+
+test('host mounts must lie under CONTROL_HOST_MOUNT_ROOTS by path segment, and an empty setting adds no root restriction', () => {
+  const optionsFor = (value) => ({
+    allowedImages: ['node-dev-host'], workspaceRoots: ['/home'], privilegedNodes: new Set(['nd-my-ansible']), hostMountRoots: parseHostMountRoots(value),
+  });
+  const input = { name: 'nd-my-ansible', workspace: '/home/me/repos/site', port: 43120, image: 'node-dev-host:latest', pidHost: true };
+  const accept = (mount, value) => validateNode({ ...input, hostMounts: [mount] }, optionsFor(value)).hostMounts;
+  assert.deepEqual(accept('/var/lib/steam/instances', '/var/lib/steam'), ['/var/lib/steam/instances']);
+  assert.deepEqual(accept('/var/lib/steam', '/var/lib/steam'), ['/var/lib/steam']);
+  assert.throws(() => accept('/srv/data', '/var/lib/steam'), (err) => err.status === 400 && /CONTROL_HOST_MOUNT_ROOTS/.test(err.message));
+  assert.throws(() => accept('/var/lib/steam-old', '/var/lib/steam'), /CONTROL_HOST_MOUNT_ROOTS/);
+  // Every entry invalid: nothing is inside a root, so every mount is refused.
+  assert.throws(() => accept('/srv/data', 'relative'), /CONTROL_HOST_MOUNT_ROOTS/);
+  assert.throws(() => accept('/var/lib/steam', ','), /CONTROL_HOST_MOUNT_ROOTS/);
+  // No setting: only the path rules apply.
+  assert.deepEqual(accept('/srv/data', ''), ['/srv/data']);
+  assert.throws(() => accept('/proc', ''), /host PID namespace/);
+});
+
+test('host access is granted only to an allowlisted name, and does not need privileged: true', () => {
+  const options = { allowedImages: ['node-dev-host'], workspaceRoots: ['/home'], privilegedNodes: new Set(['nd-my-ansible']) };
+  const input = { name: 'nd-my-ansible', workspace: '/home/me/repos/site', port: 43120, image: 'node-dev-host:latest' };
+  const pidOnly = validateNode({ ...input, pidHost: true }, options);
+  assert.equal(pidOnly.pidHost, true);
+  assert.equal(pidOnly.privileged, false);
+  assert.equal(validateNode({ ...input, hostMounts: ['/var/lib/steam'] }, options).privileged, false);
+  for (const extra of [{ pidHost: true }, { hostMounts: ['/var/lib/steam'] }, { pidHost: false, hostMounts: ['/var/lib/steam'] }]) {
+    assert.throws(() => validateNode({ ...input, name: 'nd-other', ...extra }, options), (err) => err.status === 400 && /CONTROL_PRIVILEGED_NODES/.test(err.message), JSON.stringify(extra));
+  }
+  assert.throws(() => validateNode({ ...input, pidHost: true }, { allowedImages: ['node-dev-host'], workspaceRoots: ['/home'] }), /CONTROL_PRIVILEGED_NODES/);
+  // A name off the list that declares nothing is not refused.
+  assert.equal(validateNode({ ...input, name: 'nd-other' }, options).pidHost, false);
+});
+
+test('createBody sets PidMode and read-only /host binds only for an allowlisted host-access record, with loopback publishing and no socket', () => {
+  const hostMountRoots = parseHostMountRoots('/var/lib/steam,/home/me/.local/share/containers');
+  const options = { allowedImages: ['node-dev-host'], workspaceRoots: ['/home'], privilegedNodes: new Set(['nd-my-ansible']), hostMountRoots };
+  const base = { name: 'nd-my-ansible', workspace: '/home/me/repos/site', port: 43102, image: 'node-dev-host:latest' };
+  const ordinary = createBody(validateNode({ ...base, name: 'nd-plain', port: 43103 }, { ...options, privilegedNodes: new Set() }));
+  assert.equal('PidMode' in ordinary.HostConfig, false);
+  assert.deepEqual(ordinary.HostConfig.Binds, ['/home/me/repos/site:/workspace:ro', 'node-dev-host-pnpm:/var/lib/dev-host/pnpm']);
+  const host = validateNode({ ...base, pidHost: true, hostMounts: ['/var/lib/steam', '/home/me/.local/share/containers'] }, options);
+  const body = createBody(host, { privilegedNodes: options.privilegedNodes, hostMountRoots });
+  assert.equal(body.HostConfig.PidMode, 'host');
+  assert.deepEqual(body.HostConfig.Binds, [
+    '/home/me/repos/site:/workspace:ro',
+    'node-dev-host-pnpm:/var/lib/dev-host/pnpm',
+    '/var/lib/steam:/host/var/lib/steam:ro',
+    '/home/me/.local/share/containers:/host/home/me/.local/share/containers:ro',
+  ]);
+  assert.equal(body.HostConfig.Binds.some((bind) => bind.includes('.sock') || bind.endsWith(':rw')), false);
+  assert.equal('Privileged' in body.HostConfig, false);
+  assert.deepEqual(body.HostConfig.PortBindings, { '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '43102' }] });
+  assert.equal(body.HostConfig.NetworkMode, undefined);
+  // A name that left the list cannot produce a body, and a path outside the roots is refused at creation too.
+  assert.throws(() => createBody({ ...host, name: 'nd-other' }, { privilegedNodes: options.privilegedNodes, hostMountRoots }), (err) => err.status === 403 && /CONTROL_PRIVILEGED_NODES/.test(err.message));
+  assert.throws(() => createBody({ ...host, hostMounts: ['/srv/data'] }, { privilegedNodes: options.privilegedNodes, hostMountRoots }), /CONTROL_HOST_MOUNT_ROOTS/);
+});
+
+test('assertPrivilegeAllowed refuses host PID mode and /host mounts whose name left the allowlist, and nothing else', () => {
+  const allowed = new Set(['nd-my-ansible']);
+  const hostPid = { HostConfig: { PidMode: 'host' }, Mounts: [] };
+  const hostMount = { HostConfig: { PidMode: '' }, Mounts: [{ Destination: '/host/var/lib/steam', Source: '/var/lib/steam', RW: false }] };
+  const plain = { HostConfig: { PidMode: '' }, Mounts: [{ Destination: '/workspace', Source: '/home/x', RW: false }] };
+  assert.doesNotThrow(() => assertPrivilegeAllowed('nd-my-ansible', { record: { pidHost: true, hostMounts: ['/var/lib/steam'] }, container: hostMount }, allowed));
+  assert.doesNotThrow(() => assertPrivilegeAllowed('nd-my-ansible', { record: null, container: hostPid }, allowed));
+  assert.doesNotThrow(() => assertPrivilegeAllowed('nd-plain', { record: { pidHost: false, hostMounts: [] }, container: plain }, new Set()));
+  for (const args of [
+    { record: { pidHost: true }, container: null },
+    { record: { hostMounts: ['/var/lib/steam'] }, container: null },
+    { record: null, container: hostPid },
+    { record: null, container: hostMount },
+    { record: {}, container: hostMount },
+  ]) {
+    assert.throws(() => assertPrivilegeAllowed('nd-gone', args, allowed), (err) => {
+      assert.equal(err.status, 403);
+      assert.match(err.message, /CONTROL_PRIVILEGED_NODES/);
+      return true;
+    });
+  }
+});
+
+test('discovery imports allowlisted host access and skips every unapproved form with the documented reason', async () => {
+  const store = createStore({ dir: await tempDir() });
+  const workspaceBind = (overrides = {}) => ({ Type: 'bind', Source: '/workspace/site', Destination: '/workspace', RW: false, ...overrides });
+  const hostBind = (source, overrides = {}) => ({ Type: 'bind', Source: source, Destination: `/host${source}`, RW: false, ...overrides });
+  const base = (name, port, overrides = {}) => ({
+    Name: `/${name}`,
+    Config: { Image: 'node-dev-host:latest', Labels: { 'node-dev-host.port': String(port) }, Env: [] },
+    State: { Running: false },
+    HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: false, PidMode: '' },
+    Mounts: [workspaceBind()],
+    NetworkSettings: { Networks: {} },
+    ...overrides,
+  });
+  const containers = [
+    base('nd-my-ansible', 43121, { HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: false, PidMode: 'host' }, Mounts: [workspaceBind(), hostBind('/var/lib/steam')] }),
+    base('nd-mounts', 43122, { Mounts: [workspaceBind(), hostBind('/var/lib/steam')] }),
+    base('nd-other', 43123, { HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: false, PidMode: 'host' } }),
+    base('nd-pidother', 43124, { HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: false, PidMode: 'container:abc123' } }),
+    base('nd-writable', 43125, { Mounts: [workspaceBind(), hostBind('/var/lib/steam', { RW: true })] }),
+    base('nd-misplaced', 43126, { Mounts: [workspaceBind(), { ...hostBind('/var/lib/steam'), Destination: '/host/var/lib/other' }] }),
+    base('nd-proc', 43127, { Mounts: [workspaceBind(), hostBind('/proc')] }),
+    base('nd-outside', 43128, { Mounts: [workspaceBind(), hostBind('/srv/data')] }),
+    base('nd-nolist', 43129, { Mounts: [workspaceBind(), hostBind('/var/lib/steam')] }),
+    base('nd-etc', 43130, { Mounts: [workspaceBind(), { Type: 'bind', Source: '/etc', Destination: '/etc', RW: false }] }),
+    base('nd-priv', 43131, { HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: true, PidMode: '' } }),
+  ];
+  const docker = {
+    dockerRaw: async (method, apiPath) => {
+      if (apiPath.startsWith('/containers/json')) {
+        return { status: 200, body: Buffer.from(JSON.stringify(containers.map((info) => ({ Names: [info.Name] })))) };
+      }
+      const name = decodeURIComponent(apiPath.split('/')[2]);
+      return { status: 200, body: Buffer.from(JSON.stringify(containers.find((info) => info.Name === `/${name}`))) };
+    },
+    imageInfo: async () => ({ Config: { Env: [] } }),
+  };
+  const allowlisted = ['nd-my-ansible', 'nd-mounts', 'nd-pidother', 'nd-writable', 'nd-misplaced', 'nd-proc', 'nd-outside', 'nd-etc'];
+  const discovery = createDiscovery({
+    docker,
+    store,
+    allowedImages: ['node-dev-host'],
+    workspaceRoots: ['/workspace'],
+    privilegedNodes: new Set(allowlisted),
+    hostMountRoots: parseHostMountRoots('/var/lib/steam'),
+    log: () => {},
+  });
+  assert.deepEqual(await discovery.scan(), {
+    imported: ['nd-my-ansible', 'nd-mounts'],
+    skipped: [
+      { name: 'nd-other', reason: 'container uses the host PID namespace' },
+      { name: 'nd-pidother', reason: 'unsupported PID mode: container:abc123' },
+      { name: 'nd-writable', reason: 'unsupported mount: /host/var/lib/steam (host mounts must be read-only)' },
+      { name: 'nd-misplaced', reason: 'unsupported mount: /host/var/lib/other (host mounts must sit at /host plus the host path)' },
+      { name: 'nd-proc', reason: 'unsupported mount: /host/proc (host mount /proc is refused: /proc is the host PID namespace, not a mount; set pidHost to read host processes)' },
+      { name: 'nd-outside', reason: 'unsupported mount: /host/srv/data (host mount /srv/data is outside CONTROL_HOST_MOUNT_ROOTS (/var/lib/steam))' },
+      { name: 'nd-nolist', reason: 'unsupported mount: /host/var/lib/steam (name is not on the privileged-node allowlist)' },
+      { name: 'nd-etc', reason: 'unsupported mount: /etc' },
+      { name: 'nd-priv', reason: 'container is privileged' },
+    ],
+  });
+  const records = Object.fromEntries((await store.getNodes()).map((node) => [node.name, node]));
+  assert.equal(records['nd-my-ansible'].pidHost, true);
+  assert.deepEqual(records['nd-my-ansible'].hostMounts, ['/var/lib/steam']);
+  assert.equal(records['nd-my-ansible'].privileged, false);
+  assert.equal(records['nd-mounts'].pidHost, false);
+  assert.deepEqual(records['nd-mounts'].hostMounts, ['/var/lib/steam']);
+  const body = createBody(records['nd-my-ansible'], { privilegedNodes: new Set(allowlisted), hostMountRoots: parseHostMountRoots('/var/lib/steam') });
+  assert.equal(body.HostConfig.PidMode, 'host');
+  assert.ok(body.HostConfig.Binds.includes('/var/lib/steam:/host/var/lib/steam:ro'));
+});
+
+test('every host-access example record in the README and the node-dev-host skill passes validateNode', async () => {
+  const repo = fileURLToPath(new URL('../../..', import.meta.url));
+  // The examples name nd-my-ansible and sit under this root list, which the docs state in their prose.
+  const options = {
+    allowedImages: DEFAULT_ALLOWED_IMAGES,
+    workspaceRoots: [],
+    privilegedNodes: new Set(['nd-my-ansible']),
+    hostMountRoots: parseHostMountRoots('/var/lib/steam,/home/me/.local/share/containers'),
+  };
+  let checked = 0;
+  for (const doc of ['README.md', 'skills/node-dev-host/SKILL.md']) {
+    const text = await fs.readFile(path.join(repo, doc), 'utf8');
+    for (const [, json] of text.matchAll(/```json\n([\s\S]*?)```/g)) {
+      if (!json.includes('"pidHost"')) continue;
+      const record = validateNode(JSON.parse(json), options);
+      assert.equal(record.pidHost, true, doc);
+      assert.deepEqual(record.hostMounts, ['/var/lib/steam', '/home/me/.local/share/containers'], doc);
+      checked += 1;
+    }
+  }
+  assert.equal(checked, 2);
 });

@@ -10,6 +10,7 @@ import { badgeState, relativeAge } from "@/lib/fleet"
 import { cn } from "@/lib/utils"
 import { ContainerActions } from "./ContainerActions"
 import { badgeTransitionName } from "./LogsSheet"
+import { HostAccessBadges } from "./HostAccessBadges"
 import { PrivilegedBadge } from "./PrivilegedBadge"
 import { ContainerStateBadge, StateBadge } from "./StateBadge"
 
@@ -229,6 +230,7 @@ export function ContainerTable({
                   <TableCell className="min-w-0 flex-1 basis-[calc(100%-3.5rem)] font-medium md:basis-auto md:flex-none">
                     {c.name}
                     {c.privileged && <PrivilegedBadge />}
+                    <HostAccessBadges pidHost={c.pidHost} hostMounts={c.hostMounts} />
                     {/* Project metadata is shown only for a node whose workspace has a configuration file. */}
                     {configured && project.name && (
                       <span className="font-normal text-muted-foreground md:hidden" data-testid="project-name"> · {project.name}</span>

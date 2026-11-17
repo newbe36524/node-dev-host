@@ -122,6 +122,8 @@ describe("working a large fleet", () => {
     project: { name: null, description: null, configSource: null, configError: null, warnings: [] },
     registered: false,
     privileged: false,
+    pidHost: false,
+    hostMounts: [],
     schedule: { state: "none", until: null, daysLeft: null },
     operation: null,
     error: null,

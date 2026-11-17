@@ -833,6 +833,14 @@ test('a node on a local image is created on start and on recreate with no pull a
   assert.equal(calls.filter((call) => call.startsWith('POST /containers/create')).length, 2);
 });
 
+// The mounts Docker would report for a create body's binds ("source:destination[:ro]").
+function mountsOfBinds(binds = []) {
+  return binds.map((bind) => {
+    const [source, destination, mode] = bind.split(':');
+    return { Type: 'bind', Source: source, Destination: destination, RW: mode !== 'ro' };
+  });
+}
+
 // A Docker stand-in for the privileged-node tests: containers live in a Map and every request is recorded.
 function privilegedDocker(socket, containers, calls) {
   const sum = (item) => ({ Id: item.Id, Names: [`/${item.name}`], Image: item.Config.Image, State: item.State.Running ? 'running' : 'exited', Labels: item.Config.Labels, Ports: [] });
@@ -853,7 +861,7 @@ function privilegedDocker(socket, containers, calls) {
       const item = {
         Id: `id-${name}-${calls.length}`, name,
         Config: { Image: body.Image, Labels: body.Labels, Env: body.Env, Tty: false },
-        HostConfig: body.HostConfig, Mounts: [], NetworkSettings: { Networks: {} }, State: { Running: false },
+        HostConfig: body.HostConfig, Mounts: mountsOfBinds(body.HostConfig.Binds), NetworkSettings: { Networks: {} }, State: { Running: false },
       };
       containers.set(name, item);
       return json(res, 201, { Id: item.Id });
@@ -876,7 +884,7 @@ function privilegedDocker(socket, containers, calls) {
   return new Promise((resolve) => server.listen(socket, () => resolve(server)));
 }
 
-async function spawnControl(dir, socket, allowlist, cleanup) {
+async function spawnControl(dir, socket, allowlist, cleanup, hostMountRoots = '') {
   const portServer = net.createServer();
   await new Promise((resolve) => portServer.listen(0, '127.0.0.1', resolve));
   const port = portServer.address().port;
@@ -894,6 +902,7 @@ async function spawnControl(dir, socket, allowlist, cleanup) {
       CONTROL_WORKSPACE_ROOTS: '/home',
       CONTROL_SELF_UPDATE: 'false',
       CONTROL_PRIVILEGED_NODES: allowlist,
+      CONTROL_HOST_MOUNT_ROOTS: hostMountRoots,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -1064,5 +1073,164 @@ test('the startup pass never starts or creates a privileged node that left the a
   assert.equal(calls.filter((call) => call === 'POST /containers/nd-auto-stopped/start').length, 0);
   assert.equal(calls.filter((call) => call === 'POST /containers/nd-auto-priv/start').length, 0);
   assert.match(control.log(), /startup failed for nd-auto-priv: .*CONTROL_PRIVILEGED_NODES/);
+  assert.match(control.log(), /startup failed for nd-auto-stopped: .*CONTROL_PRIVILEGED_NODES/);
+});
+
+test('host access: only allowlisted names get the host PID namespace and /host mounts, the API, rows and scan say so, and a name that left the list is refused', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'node-control-host-access-'));
+  const socket = path.join(dir, 'docker.sock');
+  const containers = new Map();
+  const calls = [];
+  // A host-PID container nobody registered, for a name off the list: the scan must skip it and the row must show it.
+  containers.set('nd-stray', {
+    Id: 'id-nd-stray', name: 'nd-stray',
+    Config: { Image: 'node-dev-host:local', Labels: { 'node-dev-host.port': '43190', 'node-dev-host.name': 'nd-stray' }, Env: [], Tty: false },
+    HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: false, PidMode: 'host', RestartPolicy: { Name: 'no' } },
+    Mounts: [{ Type: 'bind', Source: '/home/stray', Destination: '/workspace', RW: false }],
+    NetworkSettings: { Networks: {} }, State: { Running: false },
+  });
+  const dockerServer = await privilegedDocker(socket, containers, calls);
+  const cleanup = [];
+  t.after(async () => {
+    for (const stop of cleanup.reverse()) await stop();
+    await new Promise((resolve) => dockerServer.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const control = await spawnControl(dir, socket, 'nd-my-ansible, nd-mounts', cleanup, '/var/lib/steam, relative/path');
+  assert.match(control.log(), /CONTROL_HOST_MOUNT_ROOTS ignores "relative\/path"/);
+  const { guarded, rowOf, settled } = control;
+  const node = { workspace: '/home/me/repos/site', image: 'node-dev-host:local' };
+  const post = (body) => guarded('/api/nodes', 'POST', body);
+
+  // Registration: every refusal saves nothing.
+  let response = await post({ ...node, name: 'nd-other', port: 43150, pidHost: true });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /CONTROL_PRIVILEGED_NODES/);
+  assert.equal(await rowOf('nd-other'), undefined);
+  response = await post({ ...node, name: 'nd-my-ansible', port: 43151, hostMounts: ['/proc'] });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /host PID namespace/);
+  response = await post({ ...node, name: 'nd-my-ansible', port: 43151, hostMounts: ['/srv/data'] });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /CONTROL_HOST_MOUNT_ROOTS/);
+  assert.equal(await rowOf('nd-my-ansible'), undefined);
+
+  // Allowlisted, with a narrow path under the root: saved as declared.
+  response = await post({ ...node, name: 'nd-my-ansible', port: 43151, pidHost: true, hostMounts: ['/var/lib/steam/instances'] });
+  assert.equal(response.status, 201);
+  const saved = (await response.json()).node;
+  assert.equal(saved.pidHost, true);
+  assert.deepEqual(saved.hostMounts, ['/var/lib/steam/instances']);
+  assert.equal((await post({ ...node, name: 'nd-mounts', port: 43152, hostMounts: ['/var/lib/steam'] })).status, 201);
+  assert.equal((await post({ ...node, name: 'nd-plain', port: 43153 })).status, 201);
+  // A direct call for a name off the list is refused exactly as the helper would be.
+  assert.equal((await post({ ...node, name: 'nd-lab', port: 43154, hostMounts: ['/var/lib/steam'] })).status, 400);
+
+  // Start: host PID mode and one read-only /host bind, loopback only, and no privileged flag.
+  assert.equal((await guarded('/api/containers/nd-my-ansible/start', 'POST')).status, 202);
+  await settled('nd-my-ansible');
+  const made = containers.get('nd-my-ansible');
+  assert.equal(made.HostConfig.PidMode, 'host');
+  assert.ok(made.HostConfig.Binds.includes('/var/lib/steam/instances:/host/var/lib/steam/instances:ro'));
+  assert.equal(made.HostConfig.Binds.some((bind) => bind.includes('docker.sock') || bind.endsWith(':rw')), false);
+  assert.deepEqual(made.HostConfig.PortBindings, { '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '43151' }] });
+  assert.equal('Privileged' in made.HostConfig, false);
+  assert.equal((await guarded('/api/containers/nd-plain/start', 'POST')).status, 202);
+  await settled('nd-plain');
+  assert.equal('PidMode' in containers.get('nd-plain').HostConfig, false);
+
+  // Rows: each kind carries both fields.
+  let row = await rowOf('nd-my-ansible');
+  assert.equal(row.pidHost, true);
+  assert.deepEqual(row.hostMounts, ['/var/lib/steam/instances']);
+  row = await rowOf('nd-plain');
+  assert.equal(row.pidHost, false);
+  assert.deepEqual(row.hostMounts, []);
+  row = await rowOf('nd-mounts');
+  assert.equal(row.state, 'not created');
+  assert.equal(row.pidHost, false);
+  assert.deepEqual(row.hostMounts, ['/var/lib/steam']);
+  // A running container with only a /host mount: the row reads the mount from Docker.
+  assert.equal((await guarded('/api/containers/nd-mounts/start', 'POST')).status, 202);
+  await settled('nd-mounts');
+  assert.ok(containers.get('nd-mounts').HostConfig.Binds.includes('/var/lib/steam:/host/var/lib/steam:ro'));
+  row = await rowOf('nd-mounts');
+  assert.equal(row.state, 'running');
+  assert.equal(row.pidHost, false);
+  assert.deepEqual(row.hostMounts, ['/var/lib/steam']);
+  row = await rowOf('nd-stray');
+  assert.equal(row.registered, false);
+  assert.equal(row.pidHost, true);
+  assert.deepEqual(row.hostMounts, []);
+  assert.ok((await (await guarded('/api/containers')).json()).containers.every((item) => typeof item.pidHost === 'boolean' && Array.isArray(item.hostMounts)));
+
+  // Scan: the unregistered host-PID container is skipped with its reason, and nothing is imported.
+  const scan = await (await guarded('/api/scan', 'POST')).json();
+  assert.deepEqual(scan, { imported: [], skipped: [{ name: 'nd-stray', reason: 'container uses the host PID namespace' }] });
+
+  // The first control node is replaced by one whose list has dropped nd-my-ansible and nd-mounts.
+  await control.stop();
+  const second = await spawnControl(dir, socket, 'nd-plain', cleanup, '/var/lib/steam');
+  for (const action of ['start', 'restart', 'recreate']) {
+    const r = await second.guarded(`/api/containers/nd-my-ansible/${action}`, 'POST');
+    assert.equal(r.status, 403, action);
+    assert.match((await r.json()).error, /CONTROL_PRIVILEGED_NODES/);
+  }
+  assert.equal(containers.get('nd-my-ansible').State.Running, true);
+  assert.equal((await second.guarded('/api/containers/nd-stray/start', 'POST')).status, 403);
+  assert.equal((await second.guarded('/api/containers/nd-mounts/start', 'POST')).status, 403);
+  assert.equal((await second.rowOf('nd-my-ansible')).pidHost, true);
+
+  // Stop, logs, remove and delete still work for the node that left the list.
+  assert.equal((await second.guarded('/api/containers/nd-my-ansible/logs')).status, 200);
+  assert.equal((await second.guarded('/api/containers/nd-my-ansible/stop', 'POST')).status, 200);
+  assert.equal(containers.get('nd-my-ansible').State.Running, false);
+  assert.equal((await second.guarded('/api/containers/nd-my-ansible/start', 'POST')).status, 403);
+  assert.equal((await second.guarded('/api/containers/nd-my-ansible', 'DELETE')).status, 200);
+  assert.equal((await second.guarded('/api/nodes/nd-my-ansible', 'DELETE')).status, 200);
+});
+
+test('the startup pass never starts a host-access node that left the allowlist, and still starts the ordinary one', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'node-control-host-startup-'));
+  const socket = path.join(dir, 'docker.sock');
+  const containers = new Map();
+  const calls = [];
+  const window = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const record = (name, port, extra = {}) => ({
+    name, workspace: '/home/me/repos/site', port, image: 'node-dev-host:local', env: {}, restartPolicy: 'no', networks: [], writable: [],
+    privileged: false, source: 'added', createdAt: '2026-01-01T00:00:00.000Z', autoStartUntil: window, ...extra,
+  });
+  await fs.mkdir(path.join(dir, 'data'), { recursive: true });
+  await fs.writeFile(path.join(dir, 'data', 'nodes.json'), `${JSON.stringify({ version: 1, nodes: [
+    record('nd-auto-host', 43180, { pidHost: true, hostMounts: ['/var/lib/steam'] }),
+    record('nd-auto-stopped', 43181, { pidHost: true }),
+    record('nd-auto-plain', 43182),
+  ] }, null, 2)}\n`, 'utf8');
+  // A stopped host-PID container for a name that is no longer allowlisted.
+  containers.set('nd-auto-stopped', {
+    Id: 'id-nd-auto-stopped', name: 'nd-auto-stopped',
+    Config: { Image: 'node-dev-host:local', Labels: { 'node-dev-host.port': '43181', 'node-dev-host.name': 'nd-auto-stopped' }, Env: [], Tty: false },
+    HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1' }] }, Privileged: false, PidMode: 'host', RestartPolicy: { Name: 'no' } },
+    Mounts: [{ Type: 'bind', Source: '/home/me/repos/site', Destination: '/workspace', RW: false }],
+    NetworkSettings: { Networks: {} }, State: { Running: false },
+  });
+  const dockerServer = await privilegedDocker(socket, containers, calls);
+  const cleanup = [];
+  t.after(async () => {
+    for (const stop of cleanup.reverse()) await stop();
+    await new Promise((resolve) => dockerServer.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const control = await spawnControl(dir, socket, 'nd-lab', cleanup, '/var/lib/steam');
+  for (let attempt = 0; attempt < 300 && containers.get('nd-auto-plain')?.State.Running !== true; attempt += 1) await control.sleep(10);
+  await control.sleep(200);
+  assert.equal(containers.get('nd-auto-plain').State.Running, true);
+  assert.equal(containers.has('nd-auto-host'), false);
+  assert.equal(containers.get('nd-auto-stopped').State.Running, false);
+  assert.equal(calls.filter((call) => call === 'POST /containers/nd-auto-stopped/start').length, 0);
+  assert.equal(calls.filter((call) => call === 'POST /containers/nd-auto-host/start').length, 0);
+  assert.match(control.log(), /startup failed for nd-auto-host: .*CONTROL_PRIVILEGED_NODES/);
   assert.match(control.log(), /startup failed for nd-auto-stopped: .*CONTROL_PRIVILEGED_NODES/);
 });

@@ -16,7 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createDiscovery } from './discovery.mjs';
 import { createDockerClient, DockerUnavailable, dockerMessage, HttpError } from './docker.mjs';
-import { addNodeRecord, assertPrivilegeAllowed, createBody, deleteNodeRecord, nextPort, parseAllowedImages, parsePrivilegedNodes, parseWorkspaceRoots, validateNode, validateNpmRegistry } from './nodes.mjs';
+import { addNodeRecord, assertPrivilegeAllowed, createBody, deleteNodeRecord, HOST_MOUNT_PREFIX, nextPort, parseAllowedImages, parseHostMountRoots, parsePrivilegedNodes, parseWorkspaceRoots, validateNode, validateNpmRegistry } from './nodes.mjs';
 import { createOperationTracker } from './operations.mjs';
 import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from './schedule.mjs';
 import { createStore } from './store.mjs';
@@ -59,9 +59,14 @@ const log = (...parts) => console.log(`[control ${new Date().toISOString().slice
 const privilegedParsed = parsePrivilegedNodes(env.CONTROL_PRIVILEGED_NODES || '');
 for (const entry of privilegedParsed.ignored) log(`CONTROL_PRIVILEGED_NODES ignores ${JSON.stringify(entry)}: not a valid node name`);
 const PRIVILEGED_NODES = new Set(privilegedParsed.names);
+// Read once at startup, like the allowlist. Host mounts must lie under one of these roots when any is set.
+const hostMountParsed = parseHostMountRoots(env.CONTROL_HOST_MOUNT_ROOTS || '');
+for (const entry of hostMountParsed.ignored) log(`CONTROL_HOST_MOUNT_ROOTS ignores ${JSON.stringify(entry)}: not an absolute path without .. or a trailing slash`);
+if (hostMountParsed.configured && hostMountParsed.roots.length === 0) log('CONTROL_HOST_MOUNT_ROOTS lists no valid root: every host mount is refused');
+const HOST_MOUNT_ROOTS = hostMountParsed;
 const store = createStore({ dir: DATA_DIR, readOnly: READONLY, log: (...parts) => log(...parts) });
 const operations = createOperationTracker();
-const discovery = createDiscovery({ docker, store, allowedImages: ALLOWED_IMAGES, workspaceRoots: WORKSPACE_ROOTS, privilegedNodes: PRIVILEGED_NODES, log });
+const discovery = createDiscovery({ docker, store, allowedImages: ALLOWED_IMAGES, workspaceRoots: WORKSPACE_ROOTS, privilegedNodes: PRIVILEGED_NODES, hostMountRoots: HOST_MOUNT_ROOTS, log });
 const upgrade = createSelfUpgrade({ docker, store, operations, dataDir: DATA_DIR, selfId: os.hostname(), log });
 // A standby flag survives in the container's environment after a takeover, so ask the handover record first.
 if (STANDBY && (await upgrade.wasPromoted())) STANDBY = false;
@@ -187,6 +192,8 @@ async function listContainers() {
       project: probe.project,
       registered: Boolean(record),
       privileged: info.HostConfig?.Privileged === true,
+      pidHost: info.HostConfig?.PidMode === 'host',
+      hostMounts: (info.Mounts || []).filter((mount) => (mount.Destination || '').startsWith(`${HOST_MOUNT_PREFIX}/`)).map((mount) => mount.Source),
       schedule: scheduleState(record?.autoStartUntil),
       operation: operation?.phase ? { phase: operation.phase, since: operation.since } : null,
       error: operation?.error ?? null,
@@ -209,6 +216,8 @@ async function listContainers() {
       project: unknownProject(),
       registered: true,
       privileged: record.privileged === true,
+      pidHost: record.pidHost === true,
+      hostMounts: record.hostMounts ?? [],
       schedule: scheduleState(record.autoStartUntil),
       operation: operation?.phase ? { phase: operation.phase, since: operation.since } : null,
       error: operation?.error ?? null,
@@ -302,7 +311,7 @@ async function createFromRecord(record, context, pullCache) {
   if (pulled.warning) context.setWarning(pulled.warning);
   context.setPhase('creating');
   const npmRegistry = await npmRegistrySetting();
-  await docker.createContainer(record.name, createBody(record, { httpPort: nodeHttpPort(record), npmRegistry, privilegedNodes: PRIVILEGED_NODES }));
+  await docker.createContainer(record.name, createBody(record, { httpPort: nodeHttpPort(record), npmRegistry, privilegedNodes: PRIVILEGED_NODES, hostMountRoots: HOST_MOUNT_ROOTS }));
   context.setPhase('starting');
   await startContainer(record.name);
   return { warning: pulled.warning };
@@ -339,7 +348,7 @@ async function lifecycle(name, action, body = {}) {
       }
       context.setPhase('creating');
       const npmRegistry = await npmRegistrySetting();
-      await docker.createContainer(name, createBody(record, { httpPort: nodeHttpPort(record), npmRegistry, privilegedNodes: PRIVILEGED_NODES }));
+      await docker.createContainer(name, createBody(record, { httpPort: nodeHttpPort(record), npmRegistry, privilegedNodes: PRIVILEGED_NODES, hostMountRoots: HOST_MOUNT_ROOTS }));
       context.setPhase('starting');
       await startContainer(name);
       return { warning: pulled.warning };
@@ -549,7 +558,7 @@ async function serveApi(req, res, url) {
     if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'POST' });
     const body = await readJsonBody(req);
     await ensureStoreWritable();
-    validateNode(body, { allowedImages: ALLOWED_IMAGES, workspaceRoots: WORKSPACE_ROOTS, privilegedNodes: PRIVILEGED_NODES });
+    validateNode(body, { allowedImages: ALLOWED_IMAGES, workspaceRoots: WORKSPACE_ROOTS, privilegedNodes: PRIVILEGED_NODES, hostMountRoots: HOST_MOUNT_ROOTS });
     for (const network of body.networks ?? []) await ensureNetworkExists(network);
     const summaries = await labelledSummaries();
     const result = await addNodeRecord(store, body, {
@@ -557,6 +566,7 @@ async function serveApi(req, res, url) {
       workspaceRoots: WORKSPACE_ROOTS,
       containers: summaries,
       privilegedNodes: PRIVILEGED_NODES,
+      hostMountRoots: HOST_MOUNT_ROOTS,
     });
     return sendJson(res, 201, { ok: true, node: result.nodes.find((node) => node.name === body.name) });
   }
@@ -697,7 +707,7 @@ async function activate() {
     resolveContainer: inspectContainer,
     pullImage: docker.pullImage,
     createContainer: docker.createContainer,
-    createBody: async (record) => createBody(record, { httpPort: nodeHttpPort(record), npmRegistry: await npmRegistrySetting(), privilegedNodes: PRIVILEGED_NODES }),
+    createBody: async (record) => createBody(record, { httpPort: nodeHttpPort(record), npmRegistry: await npmRegistrySetting(), privilegedNodes: PRIVILEGED_NODES, hostMountRoots: HOST_MOUNT_ROOTS }),
     startContainer,
     log,
   }).catch((err) => log('startup pass failed:', err.message || err));
