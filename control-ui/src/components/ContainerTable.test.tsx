@@ -54,6 +54,29 @@ describe("ContainerTable", () => {
     expect(screen.getByRole("link", { name: "Open" })).toHaveAttribute("href", "http://127.0.0.1:43101/")
   })
 
+  it("links the port number and the site name, and does not link a node that is not created", () => {
+    vi.stubGlobal("location", { protocol: "http:", hostname: "127.0.0.1" })
+    const containers = [
+      container({ site: "docs.n.pro" }),
+      container({ name: "nd-site-b", id: "node:nd-site-b", port: 43102, state: "not created", site: "b.n.pro" }),
+    ]
+
+    render(<ContainerTable containers={containers} readOnly={false} onChanged={() => {}} />)
+
+    const rowA = screen.getByRole("row", { name: /nd-site-a/ })
+    expect(within(rowA).getByRole("link", { name: "43101" })).toHaveAttribute("href", "http://127.0.0.1:43101/")
+    expect(within(rowA).getByRole("link", { name: "docs.n.pro" })).toHaveAttribute("href", "http://docs.n.pro/")
+    const rowB = screen.getByRole("row", { name: /nd-site-b/ })
+    expect(within(rowB).queryByRole("link")).toBeNull()
+    expect(within(rowB).getByText("b.n.pro")).toBeInTheDocument()
+  })
+
+  it("shows no site line when the control node has no site for the node", () => {
+    render(<ContainerTable containers={[container()]} readOnly={false} onChanged={() => {}} />)
+
+    expect(screen.queryByTestId("site")).toBeNull()
+  })
+
   it("opens the port on the page's host, using devbox.local", () => {
     vi.stubGlobal("location", { protocol: "http:", hostname: "devbox.local" })
 

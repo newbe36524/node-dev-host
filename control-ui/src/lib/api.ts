@@ -59,6 +59,8 @@ export interface ContainerInfo {
   build: ContainerBuild
   project: ProjectInfo
   registered: boolean
+  /** The site host name of the node (for example docs.n.pro) when the control node has a CONTROL_SITES_FILE; absent or null otherwise. */
+  site?: string | null
   /** True when the container runs in Docker privileged mode, or the saved node is allowed to (see the control README). */
   privileged: boolean
   /** True when the container shares the host PID namespace, or the saved node is allowed to (see the control README). */

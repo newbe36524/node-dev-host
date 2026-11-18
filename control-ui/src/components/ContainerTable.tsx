@@ -21,6 +21,11 @@ export function openUrl(port: number, loc: LocationLike = window.location): stri
   return `${loc.protocol}//${loc.hostname}:${port}/`
 }
 
+/** Link to a node's site, a host name served by a reverse proxy, with the page's own protocol. */
+export function siteUrl(site: string, loc: LocationLike = window.location): string {
+  return `${loc.protocol}//${site}/`
+}
+
 /** A change is "recent" for this long: the dashed ring around its badge is shown, then removed. */
 const RECENT_MS = 4000
 // A row whose status carries no project metadata (an older node) renders as it did before the metadata existed.
@@ -229,6 +234,20 @@ export function ContainerTable({
                   )}
                   <TableCell className="min-w-0 flex-1 basis-[calc(100%-3.5rem)] font-medium md:basis-auto md:flex-none">
                     {c.name}
+                    {c.site &&
+                      (c.state === "not created" ? (
+                        <span className="block text-xs font-normal text-muted-foreground" data-testid="site">{c.site}</span>
+                      ) : (
+                        <a
+                          href={siteUrl(c.site)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="block text-xs font-normal text-primary hover:underline"
+                          data-testid="site"
+                        >
+                          {c.site}
+                        </a>
+                      ))}
                     {c.privileged && <PrivilegedBadge />}
                     <HostAccessBadges pidHost={c.pidHost} hostMounts={c.hostMounts} />
                     {/* Project metadata is shown only for a node whose workspace has a configuration file. */}
@@ -247,7 +266,15 @@ export function ContainerTable({
                       <span key={index} className="block w-72 max-w-full break-words text-xs text-muted-foreground" data-testid="project-warning">{warning}</span>
                     ))}
                   </TableCell>
-                  <TableCell className="tabular-nums">{c.port}</TableCell>
+                  <TableCell className="tabular-nums">
+                    {c.state === "not created" ? (
+                      c.port
+                    ) : (
+                      <a href={openUrl(c.port)} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+                        {c.port}
+                      </a>
+                    )}
+                  </TableCell>
                   <TableCell className="hidden max-w-48 truncate lg:table-cell" title={c.image}>
                     {c.image}
                   </TableCell>

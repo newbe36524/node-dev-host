@@ -19,6 +19,7 @@ import { createDockerClient, DockerUnavailable, dockerMessage, HttpError } from 
 import { addNodeRecord, assertPrivilegeAllowed, createBody, deleteNodeRecord, HOST_MOUNT_PREFIX, MAX_PORT, MIN_PORT, nextPort, parseAllowedImages, parseHostMountRoots, parsePrivilegedNodes, parseWorkspaceRoots, validateNode, validateNpmRegistry } from './nodes.mjs';
 import { createOperationTracker } from './operations.mjs';
 import { clearWindow, extendWindow, runStartupPass, scheduleState, WEEK_MS } from './schedule.mjs';
+import { readSites } from './sites.mjs';
 import { createStore } from './store.mjs';
 import { createSelfUpgrade, isLatestTag } from './upgrade.mjs';
 
@@ -41,6 +42,8 @@ const ALLOWED_HOSTS = new Set([
   '127.0.0.1', 'localhost', '[::1]',
   ...(env.CONTROL_ALLOWED_HOSTS || '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean),
 ]);
+// Optional file of node name to site host name (see sites.mjs); the dashboard turns each into a link.
+const SITES_FILE = env.CONTROL_SITES_FILE || '';
 const UI_DIR = '/usr/local/lib/dev-host/control/ui';
 const PORT_LABEL = 'node-dev-host.port';
 const CONTROL_HEADER = 'x-dev-host-control';
@@ -165,6 +168,7 @@ async function listContainers() {
   const published = await publishedHostPorts();
   const [records, persistence, settings] = await Promise.all([store.getNodes(), store.status(), store.getSettings()]);
   const byName = new Map(records.map((record) => [record.name, record]));
+  const sites = readSites(SITES_FILE);
 
   const rows = await Promise.all(summaries.map(async (c) => {
     const name = (c.Names?.[0] || '').replace(/^\//, '');
@@ -191,6 +195,7 @@ async function listContainers() {
       build: probe.build,
       project: probe.project,
       registered: Boolean(record),
+      site: sites[name] ?? null,
       privileged: info.HostConfig?.Privileged === true,
       pidHost: info.HostConfig?.PidMode === 'host',
       hostMounts: (info.Mounts || []).filter((mount) => (mount.Destination || '').startsWith(`${HOST_MOUNT_PREFIX}/`)).map((mount) => mount.Source),
@@ -215,6 +220,7 @@ async function listContainers() {
       build: { ...UNKNOWN_BUILD },
       project: unknownProject(),
       registered: true,
+      site: sites[record.name] ?? null,
       privileged: record.privileged === true,
       pidHost: record.pidHost === true,
       hostMounts: record.hostMounts ?? [],
