@@ -5,6 +5,8 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
+    /* Wide monitors: the page keeps growing here instead of leaving the sides empty. */
+    --breakpoint-3xl: 112.5rem;
     --font-heading: var(--font-sans);
     --font-sans: ui-sans-serif, system-ui, sans-serif;
     --color-sidebar-ring: var(--sidebar-ring);
@@ -216,6 +218,22 @@ time,
 /* Keyboard moves and "go to" scroll a row into view clear of the sticky toolbar and header, and the batch bar. */
 [data-row] {
   scroll-margin-block: 6.5rem 5rem;
+}
+
+/* Row actions sit beside the name. Where there is a pointer to hover with, they rest quiet and come up with the
+   row: hovered, keyboard-focused, the cursor row, or while their menu is open. They stay in the tab order and
+   on touch screens they are always visible. */
+@media (hover: hover) and (min-width: 768px) {
+  .row-actions {
+    opacity: 0;
+    transition: opacity 140ms var(--ease-out);
+  }
+  [data-row]:hover .row-actions,
+  [data-row]:focus-within .row-actions,
+  [data-row][data-selected] .row-actions,
+  .row-actions:has([aria-expanded="true"]) {
+    opacity: 1;
+  }
 }
 
 /* The batch bar rises into place once; it is the answer to a tick, so it should feel attached to it. */

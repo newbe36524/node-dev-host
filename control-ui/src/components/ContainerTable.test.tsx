@@ -131,7 +131,42 @@ describe("ContainerTable", () => {
     expect(within(endedSchedule).getByText(/Ended/)).toBeInTheDocument()
     const noWindow = screen.getByRole("row", { name: /nd-site-c/ })
     expect(within(within(noWindow).getAllByRole("cell")[7]).getByText("—")).toBeInTheDocument()
-    expect(screen.getByRole("columnheader", { name: "Auto-start" })).toHaveClass("hidden", "md:table-cell")
+    expect(screen.getByRole("columnheader", { name: "Auto-start" })).toHaveClass("hidden", "xl:table-cell")
+  })
+
+  it("puts the row actions in the Name cell beside the name on a wide viewport, with no Actions column", () => {
+    render(<ContainerTable containers={[container()]} readOnly={false} onChanged={() => {}} />)
+
+    const row = screen.getByRole("row", { name: /nd-site-a/ })
+    const nameCell = within(row).getAllByRole("cell")[0]
+    expect(within(nameCell).getByRole("button", { name: "Logs" })).toBeInTheDocument()
+    expect(within(nameCell).getByRole("button", { name: "Rebuild" })).toBeInTheDocument()
+    expect(within(nameCell).getByRole("button", { name: "Actions for nd-site-a" })).toBeInTheDocument()
+    // The long tail (Restart, Stop, Remove...) lives in the menu, not as eight buttons beside the name.
+    expect(within(nameCell).queryByRole("button", { name: "Remove container" })).toBeNull()
+    expect(screen.queryByRole("columnheader", { name: "Actions" })).toBeNull()
+  })
+
+  it("keeps the Actions column and menu on a narrow card", () => {
+    const restore = setViewport(false)
+    try {
+      render(<ContainerTable containers={[container()]} readOnly={false} onChanged={() => {}} />)
+
+      const row = screen.getByRole("row", { name: /nd-site-a/ })
+      expect(screen.getByRole("columnheader", { name: "Actions" })).toBeInTheDocument()
+      const cells = within(row).getAllByRole("cell")
+      expect(within(cells[0]).queryByRole("button")).toBeNull()
+      expect(within(cells[cells.length - 1]).getByRole("button", { name: "Actions for nd-site-a" })).toBeInTheDocument()
+    } finally {
+      restore()
+    }
+  })
+
+  it("lets long row errors wrap inside the column instead of widening the table", () => {
+    render(<ContainerTable containers={[container({ error: "x".repeat(200) })]} readOnly={false} onChanged={() => {}} />)
+
+    expect(screen.getByTestId("row-error")).toHaveClass("whitespace-normal", "break-words", "max-w-full")
+    expect(screen.getByRole("table")).toHaveClass("md:table-fixed")
   })
 
   it("keeps an unregistered row unscheduled and omits node-only actions", () => {

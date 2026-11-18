@@ -42,9 +42,14 @@ interface ContainerActionsProps {
    * rows is two hundred and fifty buttons, and a red Remove on every line.
    */
   dense?: boolean
+  /**
+   * Wide rows only: a short cluster meant to sit beside the name. Logs, the one lifecycle action the row
+   * needs next, and a menu with everything else. It never grows into the full button row.
+   */
+  inline?: boolean
 }
 
-export function ContainerActions({ container, readOnly, onChanged, onPending, onShowLogs, onStart, dense = false }: ContainerActionsProps) {
+export function ContainerActions({ container, readOnly, onChanged, onPending, onShowLogs, onStart, dense = false, inline = false }: ContainerActionsProps) {
   const [busy, setBusy] = useState(false)
   const [logsOpen, setLogsOpen] = useState(false)
   const [confirm, setConfirm] = useState<"remove" | "delete">()
@@ -89,7 +94,7 @@ export function ContainerActions({ container, readOnly, onChanged, onPending, on
 
   return (
     <>
-      {wide && !dense ? (
+      {wide && !dense && !inline ? (
         <div className="flex flex-wrap gap-1">
           {lifecycle.map((action) => (
             <Button
@@ -126,6 +131,11 @@ export function ContainerActions({ container, readOnly, onChanged, onPending, on
         {wide && (
           <Button size="sm" variant="ghost" onClick={showLogs}>
             Logs
+          </Button>
+        )}
+        {wide && inline && !dense && (
+          <Button size="sm" variant="outline" className="hidden xl:inline-flex" disabled={disabled} onClick={() => run(lifecycle[0])}>
+            {label[lifecycle[0]]}
           </Button>
         )}
         <DropdownMenu>

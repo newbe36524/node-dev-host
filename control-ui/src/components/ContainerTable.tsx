@@ -4,11 +4,12 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import type { PendingAction } from "@/hooks/useCommands"
+import { useMediaQuery } from "@/hooks/useMediaQuery"
 import { useNow } from "@/hooks/useNow"
 import type { ContainerInfo, ProjectInfo } from "@/lib/api"
 import { badgeState, relativeAge } from "@/lib/fleet"
 import { cn } from "@/lib/utils"
-import { ContainerActions } from "./ContainerActions"
+import { ContainerActions, WIDE_QUERY } from "./ContainerActions"
 import { badgeTransitionName } from "./LogsSheet"
 import { HostAccessBadges } from "./HostAccessBadges"
 import { PrivilegedBadge } from "./PrivilegedBadge"
@@ -142,6 +143,8 @@ export function ContainerTable({
   denseActions = false,
 }: ContainerTableProps) {
   const now = useNow()
+  // From md the actions sit in the Name cell, beside the name; below it the row is a card with its own Actions menu.
+  const wide = useMediaQuery(WIDE_QUERY)
   return (
     <div className="space-y-4">
       {readOnly && (
@@ -170,7 +173,7 @@ export function ContainerTable({
         // No overflow here, and none on the table's own wrapper: either would turn it into the scroll
         // container and the sticky header would stick to nothing.
         <div className="rounded-md border">
-          <Table className="block md:table" containerClassName="overflow-visible">
+          <Table className="block md:table md:table-fixed" containerClassName="overflow-visible">
             <TableHeader className="sr-only md:not-sr-only md:sticky md:top-12 md:z-10 [&_th]:bg-background [&_th]:shadow-[inset_0_-1px_0_var(--border)]">
               <TableRow className="border-b-0">
                 {checked && onTickAll && (
@@ -178,16 +181,17 @@ export function ContainerTable({
                     <TickAll ids={containers.map((c) => c.id)} checked={checked} onTickAll={onTickAll} />
                   </TableHead>
                 )}
+                {/* Fixed widths on every column but Name: the table is as wide as its frame, never as wide as its longest cell. */}
                 <TableHead>Name</TableHead>
-                <TableHead>Port</TableHead>
-                <TableHead className="hidden lg:table-cell">Image</TableHead>
-                <TableHead>State</TableHead>
-                <TableHead className="hidden md:table-cell">Health</TableHead>
-                <TableHead>Build</TableHead>
-                <TableHead className="hidden md:table-cell">Last build</TableHead>
-                <TableHead className="hidden md:table-cell">Auto-start</TableHead>
-                <TableHead>Open</TableHead>
-                <TableHead>Actions</TableHead>
+                <TableHead className="md:w-20">Port</TableHead>
+                <TableHead className="hidden 2xl:table-cell 2xl:w-56 3xl:w-80">Image</TableHead>
+                <TableHead className="md:w-28">State</TableHead>
+                <TableHead className="hidden 2xl:table-cell 2xl:w-20">Health</TableHead>
+                <TableHead className="md:w-40 xl:w-56">Build</TableHead>
+                <TableHead className="hidden lg:table-cell lg:w-28">Last build</TableHead>
+                <TableHead className="hidden xl:table-cell xl:w-44">Auto-start</TableHead>
+                <TableHead className="md:w-16">Open</TableHead>
+                {!wide && <TableHead>Actions</TableHead>}
               </TableRow>
             </TableHeader>
             <TableBody className="block md:table-row-group">
@@ -233,7 +237,23 @@ export function ContainerTable({
                     </TableCell>
                   )}
                   <TableCell className="min-w-0 flex-1 basis-[calc(100%-3.5rem)] font-medium md:basis-auto md:flex-none">
-                    {c.name}
+                    <div className="flex min-w-0 items-center gap-x-2">
+                      <span className="min-w-0 truncate" title={c.name}>{c.name}</span>
+                      {wide && (
+                        <div className="row-actions shrink-0">
+                          <ContainerActions
+                            container={c}
+                            readOnly={readOnly}
+                            onChanged={onChanged}
+                            onPending={onPending}
+                            onShowLogs={onShowLogs}
+                            onStart={onStart}
+                            dense={denseActions}
+                            inline
+                          />
+                        </div>
+                      )}
+                    </div>
                     {c.site &&
                       (c.state === "not created" ? (
                         <span className="block text-xs font-normal text-muted-foreground" data-testid="site">{c.site}</span>
@@ -260,10 +280,10 @@ export function ContainerTable({
                       </span>
                     )}
                     {configured && c.build.state === "failed" && project.configError && (
-                      <span className="block w-72 max-w-full break-words text-xs text-destructive" data-testid="config-error">Config: {project.configError}</span>
+                      <span className="block w-72 max-w-full whitespace-normal break-words md:w-auto md:max-w-none text-xs text-destructive" data-testid="config-error">Config: {project.configError}</span>
                     )}
                     {configured && project.warnings.map((warning, index) => (
-                      <span key={index} className="block w-72 max-w-full break-words text-xs text-muted-foreground" data-testid="project-warning">{warning}</span>
+                      <span key={index} className="block w-72 max-w-full whitespace-normal break-words md:w-auto md:max-w-none text-xs text-muted-foreground" data-testid="project-warning">{warning}</span>
                     ))}
                   </TableCell>
                   <TableCell className="tabular-nums">
@@ -275,13 +295,13 @@ export function ContainerTable({
                       </a>
                     )}
                   </TableCell>
-                  <TableCell className="hidden max-w-48 truncate lg:table-cell" title={c.image}>
+                  <TableCell className="hidden truncate 2xl:table-cell" title={c.image}>
                     {c.image}
                   </TableCell>
                   <TableCell>
                     <ContainerStateBadge state={c.state} />
                   </TableCell>
-                  <TableCell className="hidden md:table-cell">{c.health ?? "—"}</TableCell>
+                  <TableCell className="hidden 2xl:table-cell">{c.health ?? "—"}</TableCell>
                   <TableCell>
                     <div className="grid gap-1">
                       <div className="flex flex-wrap items-center gap-2">
@@ -299,14 +319,14 @@ export function ContainerTable({
                           </span>
                         )}
                       </div>
-                      {c.error && <span className="block w-72 max-w-full break-words text-xs text-destructive" data-testid="row-error">Fault: {c.error}</span>}
-                      {c.warning && <span className="block w-72 max-w-full break-words text-xs text-muted-foreground" data-testid="row-warning">{c.warning}</span>}
+                      {c.error && <span className="block w-72 max-w-full whitespace-normal break-words md:w-auto md:max-w-none text-xs text-destructive" data-testid="row-error">Fault: {c.error}</span>}
+                      {c.warning && <span className="block w-72 max-w-full whitespace-normal break-words md:w-auto md:max-w-none text-xs text-muted-foreground" data-testid="row-warning">{c.warning}</span>}
                     </div>
                   </TableCell>
-                  <TableCell className="hidden md:table-cell">
+                  <TableCell className="hidden lg:table-cell">
                     <BuildAge iso={c.build.finishedAt} />
                   </TableCell>
-                  <TableCell>
+                  <TableCell className="hidden xl:table-cell">
                     {c.schedule.state === "active" && c.schedule.until ? (
                       <span className="text-xs text-muted-foreground">
                         {c.schedule.daysLeft !== null && `${c.schedule.daysLeft} days left · `}
@@ -333,17 +353,19 @@ export function ContainerTable({
                       </Button>
                     )}
                   </TableCell>
-                  <TableCell>
-                    <ContainerActions
-                      container={c}
-                      readOnly={readOnly}
-                      onChanged={onChanged}
-                      onPending={onPending}
-                      onShowLogs={onShowLogs}
-                      onStart={onStart}
-                      dense={denseActions}
-                    />
-                  </TableCell>
+                  {!wide && (
+                    <TableCell>
+                      <ContainerActions
+                        container={c}
+                        readOnly={readOnly}
+                        onChanged={onChanged}
+                        onPending={onPending}
+                        onShowLogs={onShowLogs}
+                        onStart={onStart}
+                        dense={denseActions}
+                      />
+                    </TableCell>
+                  )}
                 </TableRow>
                 )
               })}

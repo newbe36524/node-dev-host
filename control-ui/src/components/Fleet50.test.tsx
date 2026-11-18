@@ -13,7 +13,7 @@ afterEach(() => {
 })
 
 function rowNames(): string[] {
-  return Array.from(document.querySelectorAll("[data-row]")).map((row) => row.querySelector("td:nth-child(2)")?.textContent ?? "")
+  return Array.from(document.querySelectorAll("[data-row]")).map((row) => row.querySelector("td:nth-child(2) > div > span")?.textContent ?? "")
 }
 
 async function open() {

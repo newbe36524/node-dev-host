@@ -279,7 +279,7 @@ function Dashboard() {
 
   return (
     // pb-28: room under the list for the batch bar, so the last rows are never behind it.
-    <main className={`mx-auto max-w-6xl space-y-4 p-4 md:p-6 ${tickedContainers.length > 0 ? "pb-28" : ""}`}>
+    <main className={`mx-auto max-w-6xl space-y-4 p-4 md:p-6 xl:max-w-[90rem] 3xl:max-w-[110rem] ${tickedContainers.length > 0 ? "pb-28" : ""}`}>
       <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
         <div className="min-w-0">
           <h1 className="text-xl font-semibold tracking-tight">Dev host control</h1>
@@ -287,7 +287,7 @@ function Dashboard() {
             {list ? countText(list.containers.length, running) : "Loading containers…"}
           </p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <Button size="sm" variant="outline" disabled={!list?.persistence?.writable || list.readOnly} onClick={() => setRegistryOpen(true)}>
             npm registry
           </Button>

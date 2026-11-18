@@ -158,15 +158,15 @@ A restrained neutral grey ramp with three signal hues. The palette is shadcn "ne
 
 ## Layout
 
-A single centred column, `max-w-6xl` (72rem), padded 16px on small screens and 24px from the `md` breakpoint (768px). Sections are stacked with a 16px rhythm. Top to bottom the order is fixed and follows the order of importance for observation:
+A single centred column that grows with the screen: `max-w-6xl` (72rem) by default, 90rem from `xl` (1280px) and 110rem from `3xl` (1800px, a theme breakpoint), padded 16px on small screens and 24px from the `md` breakpoint (768px). The header strip wraps at any width. Sections are stacked with a 16px rhythm. Top to bottom the order is fixed and follows the order of importance for observation:
 
 1. **Header strip:** title and the live count on the left; Add node, Scan, Commands, theme toggle, read-only badge and refresh indicator on the right. This strip is the panel's own health readout and wraps rather than truncates.
 2. **Alerts:** the stale-data alert, read-only alert and persistence alerts, directly above the data they qualify.
 3. **Fleet ribbon:** one band for the whole host, a segment per container, with the totals above it, faults first.
-4. **Container table:** the instrument cluster. Columns run from identity to state to action: Name, Port, Image, State, Health, Build, Last build, Auto-start, Open, Actions.
+4. **Container table:** the instrument cluster. Columns run from identity to state: Name (with its actions beside it), Port, Image, State, Health, Build, Last build, Auto-start, Open. There is no Actions column from `md`.
 5. **Session timeline:** what this tab has seen change since it was opened. It sits below the table because it is context, not the reading.
 
-Below `md` the table becomes a stack of cards. Image, Health, Last build and Auto-start drop out of view first (`hidden md:table-cell`), and the name takes a full line. State, Build, Open and Actions always stay, because they are the observation and the response. Row errors and warnings remain inside the card. The header row stays in the DOM for screen readers (`sr-only`). Row actions collapse into a menu on narrow screens so the row stays one glance tall.
+The table is `table-fixed` from `md`: every column except Name has a set width, so the table is as wide as its frame and never as wide as its longest cell. Long row errors and warnings wrap inside the Build column. Columns appear as width allows: Last build at `lg`, Auto-start at `xl`, Image and Health at `2xl`. Name takes the rest, and Image grows at `3xl`. Below `md` the table becomes a stack of cards and the name takes a full line. State, Build and Open always stay, because they are the observation; the card keeps its own Actions menu, the response. Row errors and warnings remain inside the card. The header row stays in the DOM for screen readers (`sr-only`). Row actions collapse into a menu on narrow screens so the row stays one glance tall.
 
 Data refreshes by polling every 3 seconds, scheduled after each attempt finishes so requests never pile up. The layout must not move when data refreshes: row identity is the container id, widths come from content that is stable (fixed-width figures, short state words).
 
@@ -239,7 +239,9 @@ One lane per container: a track whose segments are the states this tab has seen,
 `Ctrl K` (`Cmd K` on macOS) opens a palette: Logs, Open, Rebuild, Restart, Stop or Start, Recreate, Extend 7 days, Stop auto-start, Scan, Refresh now, and the theme. Start uses the same prompt as the row action when its window is not active. Words filter it in any order. Remove container and Delete node are left out because they need confirmation. In read-only mode commands that change a node are hidden and a line says why. Single-letter shortcuts act on the keyboard cursor row: `j` and `k` move it, `L` opens logs, `R` rebuilds, `S` starts a stopped node through the shared prompt, `Esc` clears it. They stay quiet while typing and while any dialog, menu or sheet is open.
 
 ### Container actions
-Rebuild, Restart and Stop for a running container, Start for a stopped or not-created node, Logs, Recreate, Extend 7 days, Stop auto-start, Remove container and Delete node. Quiet outline and ghost buttons so they sit behind the state. Remove container and Delete node are destructive and always ask for confirmation; Delete node says the record is deleted too. New lifecycle actions are hidden for unregistered containers and disabled in read-only mode. Failure of any action raises a toast that names the node and action.
+From `md` the actions sit in the Name cell, on the name's line, because an operator acts on a name: Logs, the next lifecycle action (Rebuild, or Start for a stopped node; from `xl`, and not on a long list) and a menu with the rest. Where a pointer can hover they rest at zero opacity and come up with the row: hovered, keyboard-focused, the cursor row, or while their menu is open. They stay in the tab order, and on touch screens they are always visible. The name truncates before the cluster moves. Below `md` the card has an Actions menu in its own cell.
+
+The full set is Rebuild, Restart and Stop for a running container, Start for a stopped or not-created node, Logs, Recreate, Extend 7 days, Stop auto-start, Remove container and Delete node. Quiet outline and ghost buttons so they sit behind the state. Remove container and Delete node are destructive and always ask for confirmation; Delete node says the record is deleted too. New lifecycle actions are hidden for unregistered containers and disabled in read-only mode. Failure of any action raises a toast that names the node and action.
 
 ### Add node dialog
 A shadcn dialog with name, workspace, port, image and environment fields. The port starts at the server's `nextPort`; the image starts at the default allowed repository. A rejected request leaves the dialog open, keeps all entered values and shows the server's validation message beside the form.
@@ -282,7 +284,7 @@ A dashed-border block with one instruction sentence: containers carrying the `no
 - **Don't** reorder rows or reflow columns when data refreshes.
 - **Don't** present the session timeline as server history, or draw it without its caption.
 - **Don't** add a second motion moment: the badge morph, the settle ring and the one-time fault ping are the whole budget.
-- **Don't** let actions outrank status. Action buttons stay quiet and sit last in the row.
+- **Don't** let actions outrank status. Action buttons stay quiet: close to the name, hidden until the row is hovered or focused, and never louder than the badges.
 - **Don't** colour the Docker container state badge. It is context, and the build badge is the signal.
 - **Don't** use a signal hue for Auto-start, a persistence warning, an operation word or a pull-fallback note.
 - **Don't** add a custom font, a second accent colour or a bespoke component where a shadcn primitive already fits.
