@@ -279,7 +279,7 @@ function Dashboard() {
 
   return (
     // pb-28: room under the list for the batch bar, so the last rows are never behind it.
-    <main className={`mx-auto max-w-6xl space-y-4 p-4 md:p-6 xl:max-w-[90rem] 3xl:max-w-[110rem] ${tickedContainers.length > 0 ? "pb-28" : ""}`}>
+    <main className={`mx-auto max-w-6xl space-y-4 p-4 md:p-6 xl:max-w-[100rem] 3xl:max-w-[120rem] ${tickedContainers.length > 0 ? "pb-28" : ""}`}>
       <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
         <div className="min-w-0">
           <h1 className="text-xl font-semibold tracking-tight">Dev host control</h1>

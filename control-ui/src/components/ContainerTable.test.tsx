@@ -51,7 +51,7 @@ describe("ContainerTable", () => {
 
     render(<ContainerTable containers={[container()]} readOnly={false} onChanged={() => {}} />)
 
-    expect(screen.getByRole("link", { name: "Open" })).toHaveAttribute("href", "http://127.0.0.1:43101/")
+    expect(screen.getByRole("link", { name: "43101" })).toHaveAttribute("href", "http://127.0.0.1:43101/")
   })
 
   it("links the port number and the site name, and does not link a node that is not created", () => {
@@ -82,7 +82,7 @@ describe("ContainerTable", () => {
 
     render(<ContainerTable containers={[container()]} readOnly={false} onChanged={() => {}} />)
 
-    expect(screen.getByRole("link", { name: "Open" })).toHaveAttribute("href", "http://devbox.local:43101/")
+    expect(screen.getByRole("link", { name: "43101" })).toHaveAttribute("href", "http://devbox.local:43101/")
   })
 
   it("builds the open URL from protocol, hostname and port", () => {
@@ -123,15 +123,15 @@ describe("ContainerTable", () => {
     )
 
     const active = screen.getByRole("row", { name: /nd-site-a/ })
-    const activeSchedule = within(active).getAllByRole("cell")[7]
+    const activeSchedule = within(active).getAllByRole("cell")[8]
     expect(within(activeSchedule).getByText(/6 days left/)).toBeInTheDocument()
     expect(within(activeSchedule).getByText(/Until/).tagName).toBe("TIME")
     const ended = screen.getByRole("row", { name: /nd-site-b/ })
-    const endedSchedule = within(ended).getAllByRole("cell")[7]
+    const endedSchedule = within(ended).getAllByRole("cell")[8]
     expect(within(endedSchedule).getByText(/Ended/)).toBeInTheDocument()
     const noWindow = screen.getByRole("row", { name: /nd-site-c/ })
-    expect(within(within(noWindow).getAllByRole("cell")[7]).getByText("—")).toBeInTheDocument()
-    expect(screen.getByRole("columnheader", { name: "Auto-start" })).toHaveClass("hidden", "xl:table-cell")
+    expect(within(within(noWindow).getAllByRole("cell")[8]).getByText("—")).toBeInTheDocument()
+    expect(screen.getByRole("columnheader", { name: "Auto-start" })).toHaveClass("hidden", "2xl:table-cell")
   })
 
   it("puts the row actions in the Name cell beside the name on a wide viewport, with no Actions column", () => {
@@ -162,6 +162,19 @@ describe("ContainerTable", () => {
     }
   })
 
+  it("has no Open column: the port is the link, and the domain has a column of its own after it", () => {
+    render(<ContainerTable containers={[container({ site: "docs.n.pro" })]} readOnly={false} onChanged={() => {}} />)
+
+    expect(screen.queryByRole("columnheader", { name: "Open" })).toBeNull()
+    expect(screen.queryByRole("link", { name: "Open" })).toBeNull()
+    const headers = screen.getAllByRole("columnheader").map((h) => h.textContent)
+    expect(headers.indexOf("Domain")).toBe(headers.indexOf("Port") + 1)
+    const row = screen.getByRole("row", { name: /nd-site-a/ })
+    const cells = within(row).getAllByRole("cell")
+    expect(within(cells[0]).queryByTestId("site")).toBeNull()
+    expect(within(cells[2]).getByTestId("site")).toHaveTextContent("docs.n.pro")
+  })
+
   it("lets long row errors wrap inside the column instead of widening the table", () => {
     render(<ContainerTable containers={[container({ error: "x".repeat(200) })]} readOnly={false} onChanged={() => {}} />)
 
@@ -173,7 +186,7 @@ describe("ContainerTable", () => {
     render(<ContainerTable containers={[container({ state: "exited" })]} readOnly={false} onChanged={() => {}} />)
 
     const row = screen.getByRole("row", { name: /nd-site-a/ })
-    expect(within(row).getByText("—")).toBeInTheDocument()
+    expect(within(within(row).getAllByRole("cell")[8]).getByText("—")).toBeInTheDocument()
     expect(within(row).queryByRole("button", { name: "Recreate" })).toBeNull()
     expect(within(row).queryByRole("button", { name: "Delete node" })).toBeNull()
   })
@@ -205,7 +218,7 @@ describe("ContainerTable", () => {
     expect(within(row).getByTestId("row-error")).toHaveTextContent("Docker refused the create")
     expect(within(row).getByTestId("row-warning")).toHaveTextContent("Latest image could not be pulled")
     expect(within(row).getByTestId("row-warning")).toHaveClass("w-72", "break-words")
-    expect(within(row).queryByRole("link", { name: "Open" })).toBeNull()
+    expect(within(row).queryByRole("link", { name: "43101" })).toBeNull()
     restoreViewport()
   })
 

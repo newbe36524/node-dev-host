@@ -184,13 +184,13 @@ export function ContainerTable({
                 {/* Fixed widths on every column but Name: the table is as wide as its frame, never as wide as its longest cell. */}
                 <TableHead>Name</TableHead>
                 <TableHead className="md:w-20">Port</TableHead>
-                <TableHead className="hidden 2xl:table-cell 2xl:w-56 3xl:w-80">Image</TableHead>
+                <TableHead className="hidden lg:table-cell lg:w-44">Domain</TableHead>
+                <TableHead className="hidden 3xl:table-cell 3xl:w-80">Image</TableHead>
                 <TableHead className="md:w-28">State</TableHead>
                 <TableHead className="hidden 2xl:table-cell 2xl:w-20">Health</TableHead>
                 <TableHead className="md:w-40 xl:w-56">Build</TableHead>
-                <TableHead className="hidden lg:table-cell lg:w-28">Last build</TableHead>
-                <TableHead className="hidden xl:table-cell xl:w-44">Auto-start</TableHead>
-                <TableHead className="md:w-16">Open</TableHead>
+                <TableHead className="hidden xl:table-cell xl:w-28">Last build</TableHead>
+                <TableHead className="hidden 2xl:table-cell 2xl:w-44">Auto-start</TableHead>
                 {!wide && <TableHead>Actions</TableHead>}
               </TableRow>
             </TableHeader>
@@ -240,7 +240,7 @@ export function ContainerTable({
                     <div className="flex min-w-0 items-center gap-x-2">
                       <span className="min-w-0 truncate" title={c.name}>{c.name}</span>
                       {wide && (
-                        <div className="row-actions shrink-0">
+                        <div className="shrink-0">
                           <ContainerActions
                             container={c}
                             readOnly={readOnly}
@@ -254,20 +254,6 @@ export function ContainerTable({
                         </div>
                       )}
                     </div>
-                    {c.site &&
-                      (c.state === "not created" ? (
-                        <span className="block text-xs font-normal text-muted-foreground" data-testid="site">{c.site}</span>
-                      ) : (
-                        <a
-                          href={siteUrl(c.site)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="block text-xs font-normal text-primary hover:underline"
-                          data-testid="site"
-                        >
-                          {c.site}
-                        </a>
-                      ))}
                     {c.privileged && <PrivilegedBadge />}
                     <HostAccessBadges pidHost={c.pidHost} hostMounts={c.hostMounts} />
                     {/* Project metadata is shown only for a node whose workspace has a configuration file. */}
@@ -295,7 +281,27 @@ export function ContainerTable({
                       </a>
                     )}
                   </TableCell>
-                  <TableCell className="hidden truncate 2xl:table-cell" title={c.image}>
+                  {/* Its own column beside Port. In a card (below md) it stays visible as a line under the name. */}
+                  <TableCell className="min-w-0 truncate text-xs md:hidden lg:table-cell">
+                    {c.site ? (
+                      c.state === "not created" ? (
+                        <span className="text-muted-foreground" data-testid="site">{c.site}</span>
+                      ) : (
+                        <a
+                          href={siteUrl(c.site)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-primary hover:underline"
+                          data-testid="site"
+                        >
+                          {c.site}
+                        </a>
+                      )
+                    ) : (
+                      "—"
+                    )}
+                  </TableCell>
+                  <TableCell className="hidden truncate 3xl:table-cell" title={c.image}>
                     {c.image}
                   </TableCell>
                   <TableCell>
@@ -323,10 +329,10 @@ export function ContainerTable({
                       {c.warning && <span className="block w-72 max-w-full whitespace-normal break-words md:w-auto md:max-w-none text-xs text-muted-foreground" data-testid="row-warning">{c.warning}</span>}
                     </div>
                   </TableCell>
-                  <TableCell className="hidden lg:table-cell">
+                  <TableCell className="hidden xl:table-cell">
                     <BuildAge iso={c.build.finishedAt} />
                   </TableCell>
-                  <TableCell className="hidden xl:table-cell">
+                  <TableCell className="hidden 2xl:table-cell">
                     {c.schedule.state === "active" && c.schedule.until ? (
                       <span className="text-xs text-muted-foreground">
                         {c.schedule.daysLeft !== null && `${c.schedule.daysLeft} days left · `}
@@ -340,17 +346,6 @@ export function ContainerTable({
                       </span>
                     ) : (
                       "—"
-                    )}
-                  </TableCell>
-                  <TableCell>
-                    {c.state === "not created" ? (
-                      "—"
-                    ) : (
-                      <Button variant="link" size="sm" asChild>
-                        <a href={openUrl(c.port)} target="_blank" rel="noopener noreferrer">
-                          Open
-                        </a>
-                      </Button>
                     )}
                   </TableCell>
                   {!wide && (

@@ -133,8 +133,8 @@ export function ContainerActions({ container, readOnly, onChanged, onPending, on
             Logs
           </Button>
         )}
-        {wide && inline && !dense && (
-          <Button size="sm" variant="outline" className="hidden xl:inline-flex" disabled={disabled} onClick={() => run(lifecycle[0])}>
+        {wide && inline && (!dense || lifecycle[0] === "start") && (
+          <Button size="sm" variant="outline" className="hidden lg:inline-flex" disabled={disabled} onClick={() => run(lifecycle[0])}>
             {label[lifecycle[0]]}
           </Button>
         )}
