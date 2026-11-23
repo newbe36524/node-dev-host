@@ -10,11 +10,12 @@ export const MIN_PORT = 43100;
 export const MAX_PORT = 43299;
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const ENV_RE = /^[A-Z0-9_]+$/;
-const USER_KEYS = new Set(['name', 'workspace', 'port', 'image', 'env', 'networks', 'writable', 'privileged', 'pidHost', 'hostMounts']);
+const USER_KEYS = new Set(['name', 'workspace', 'port', 'image', 'env', 'networks', 'writable', 'privileged', 'pidHost', 'hostMounts', 'hostMountsWritable']);
 const NETWORK_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const RESERVED_NETWORKS = new Set(['bridge', 'host', 'none']);
 const MAX_NETWORKS = 4;
-// Host access (pidHost and hostMounts): read-only paths under /host, granted by the same allowlist as privileged.
+// Host access (pidHost and hostMounts): paths under /host, read-only unless the record also lists them in hostMountsWritable.
+// Granted by the same allowlist as privileged.
 export const MAX_HOST_MOUNTS = 4;
 export const HOST_MOUNT_PREFIX = '/host';
 const MAX_HOST_MOUNT_LENGTH = 256;
@@ -163,6 +164,16 @@ export function validateNode(input, {
   // Host access is granted by the same allowlist as privileged mode, and does not need privileged: true.
   if ((pidHost || hostMounts.length > 0) && !privilegedNodes.has(input.name)) invalid(privilegeMessage(input.name));
   for (const entry of hostMounts) validateHostMount(entry, hostMountRoots);
+  // Writable host paths: each one must also be a hostMounts entry, and gets a read-write bind (see createBody).
+  const hostMountsWritable = input.hostMountsWritable ?? [];
+  if (!Array.isArray(hostMountsWritable) || hostMountsWritable.some((entry) => typeof entry !== 'string')) {
+    invalid('hostMountsWritable must be a list of host paths');
+  }
+  if (new Set(hostMountsWritable).size !== hostMountsWritable.length) invalid('hostMountsWritable lists a path more than once');
+  for (const entry of hostMountsWritable) {
+    if (!hostMounts.includes(entry)) invalid(`hostMountsWritable ${entry} must also be listed in hostMounts`);
+    validateHostMount(entry, hostMountRoots);
+  }
   if (!Number.isInteger(input.port) || input.port < MIN_PORT || input.port > MAX_PORT) {
     invalid(`port must be in ${MIN_PORT}-${MAX_PORT}`);
   }
@@ -221,6 +232,7 @@ export function validateNode(input, {
     privileged,
     pidHost,
     hostMounts: [...hostMounts],
+    hostMountsWritable: [...hostMountsWritable],
     source: input.source || 'added',
     createdAt: input.createdAt || new Date().toISOString(),
     autoStartUntil: input.autoStartUntil ?? null,
@@ -251,10 +263,12 @@ export function createBody(record, {
   if (record.workspace) binds.unshift(`${record.workspace}:/workspace:ro`);
   // A writable path is bound on top of the read-only /workspace, so only that subtree can be written.
   for (const relative of record.writable || []) binds.push(`${record.workspace}/${relative}:/workspace/${relative}:rw`);
-  // Host paths are bound read-only at /host plus the host path. Only the validated paths of an allowlisted record get here.
+  // Host paths are bound at /host plus the host path: read-only, or read-write when the record lists them in hostMountsWritable.
+  // Only the validated paths of an allowlisted record get here.
+  const writableHosts = new Set(record.hostMountsWritable || []);
   for (const source of record.hostMounts || []) {
     validateHostMount(source, hostMountRoots);
-    binds.push(`${source}:${HOST_MOUNT_PREFIX}${source}:ro`);
+    binds.push(`${source}:${HOST_MOUNT_PREFIX}${source}:${writableHosts.has(source) ? 'rw' : 'ro'}`);
   }
   const env = { ...(npmRegistry ? { [NPM_REGISTRY_ENV]: npmRegistry } : {}), ...(record.env || {}) };
   const body = {

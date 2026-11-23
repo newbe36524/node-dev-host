@@ -830,3 +830,22 @@ test('every host-access example record in the README and the node-dev-host skill
   }
   assert.equal(checked, 2);
 });
+
+test('a writable host path must be listed in hostMounts and under the roots, and is bound read-write; the other host paths stay read-only', () => {
+  const hostMountRoots = parseHostMountRoots('/home/me/.tokeneconomizer,/var/lib/steam');
+  const options = { allowedImages: ['node-dev-host'], workspaceRoots: ['/home'], privilegedNodes: new Set(['nd-my-ansible']), hostMountRoots };
+  const input = { name: 'nd-my-ansible', workspace: '/home/me/repos/site', port: 43120, image: 'node-dev-host:latest' };
+  const rejects = (extra, pattern) => assert.throws(() => validateNode({ ...input, ...extra }, options), (err) => err.status === 400 && pattern.test(err.message));
+  rejects({ hostMountsWritable: '/home/me/.tokeneconomizer' }, /hostMountsWritable must be a list of host paths/);
+  rejects({ hostMounts: ['/home/me/.tokeneconomizer'], hostMountsWritable: ['/home/me/.tokeneconomizer', '/home/me/.tokeneconomizer'] }, /hostMountsWritable lists a path more than once/);
+  rejects({ hostMounts: ['/var/lib/steam'], hostMountsWritable: ['/home/me/.tokeneconomizer'] }, /must also be listed in hostMounts/);
+  rejects({ hostMounts: ['/srv/data'], hostMountsWritable: ['/srv/data'] }, /CONTROL_HOST_MOUNT_ROOTS/);
+  const record = validateNode({ ...input, hostMounts: ['/home/me/.tokeneconomizer', '/var/lib/steam'], hostMountsWritable: ['/home/me/.tokeneconomizer'] }, options);
+  assert.deepEqual(record.hostMountsWritable, ['/home/me/.tokeneconomizer']);
+  const body = createBody(record, { privilegedNodes: options.privilegedNodes, hostMountRoots });
+  assert.deepEqual(body.HostConfig.Binds.slice(2), [
+    '/home/me/.tokeneconomizer:/host/home/me/.tokeneconomizer:rw',
+    '/var/lib/steam:/host/var/lib/steam:ro',
+  ]);
+  assert.equal(validateNode({ ...input, hostMounts: ['/var/lib/steam'] }, options).hostMountsWritable.length, 0);
+});
